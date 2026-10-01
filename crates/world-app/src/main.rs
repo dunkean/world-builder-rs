@@ -13,7 +13,7 @@ use std::{
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 use tokio::sync::{RwLock, Semaphore};
@@ -85,15 +85,54 @@ struct App {
     counter: Arc<AtomicU64>,
     tiles: Arc<RwLock<TileCache>>,
     tile_workers: Arc<Semaphore>,
+    tile_flights: Arc<tokio::sync::Mutex<TileFlights>>,
+    tile_metrics: Arc<TileMetrics>,
 }
 
+type TileFlights = HashMap<String, Weak<tokio::sync::Mutex<()>>>;
+
 #[derive(Default)]
+struct TileMetrics {
+    requests: AtomicU64,
+    memory_hits: AtomicU64,
+    disk_hits: AtomicU64,
+    computations: AtomicU64,
+    coalesced: AtomicU64,
+    queue_us: AtomicU64,
+    compute_us: AtomicU64,
+    corrupt_disk_entries: AtomicU64,
+}
+
 struct TileCache {
     entries: HashMap<String, bytes::Bytes>,
     order: VecDeque<String>,
     size: usize,
+    capacity: usize,
+    evictions: u64,
+}
+impl Default for TileCache {
+    fn default() -> Self {
+        let mib = std::env::var("WB_TILE_CACHE_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256)
+            .clamp(16, 2048);
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            size: 0,
+            capacity: mib * 1024 * 1024,
+            evictions: 0,
+        }
+    }
 }
 impl TileCache {
+    fn get(&mut self, key: &str) -> Option<bytes::Bytes> {
+        let value = self.entries.get(key)?.clone();
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_owned());
+        Some(value)
+    }
     fn insert(&mut self, key: String, value: bytes::Bytes) {
         if self.entries.contains_key(&key) {
             return;
@@ -101,10 +140,11 @@ impl TileCache {
         self.size += value.len();
         self.order.push_back(key.clone());
         self.entries.insert(key, value);
-        while self.size > 96 * 1024 * 1024 || self.entries.len() > 128 {
+        while self.size > self.capacity || self.entries.len() > 512 {
             if let Some(key) = self.order.pop_front() {
                 if let Some(value) = self.entries.remove(&key) {
                     self.size -= value.len();
+                    self.evictions += 1;
                 }
             } else {
                 break;
@@ -206,9 +246,12 @@ async fn main() -> Result<()> {
                 counter: Arc::new(AtomicU64::new(1)),
                 tiles: Default::default(),
                 tile_workers: Arc::new(Semaphore::new(4)),
+                tile_flights: Default::default(),
+                tile_metrics: Default::default(),
             };
             let router = Router::new()
                 .route("/api/health", get(|| async { Json(serde_json::json!({"ok":true,"backend":"rust","global_compute":"cpu","regional_compute":"cuda-with-cpu-fallback","generator_version":world_core::GENERATOR_VERSION,"version":env!("CARGO_PKG_VERSION")})) }))
+                .route("/api/performance", get(performance))
                 .route("/api/worlds", post(create_world))
                 .route("/api/jobs/{id}", get(get_job))
                 .route("/api/world/latest", get(latest))
@@ -493,11 +536,118 @@ impl TileFormat {
 fn default_segments() -> u32 {
     128
 }
+
+const TILE_DISK_CAPACITY: u64 = 1024 * 1024 * 1024;
+static TILE_DISK_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn tile_disk_path(data: &FsPath, key: &str) -> PathBuf {
+    let revision = format!(
+        "tile-cache-1/{}/{}/{key}",
+        world_core::GENERATOR_VERSION,
+        regions::VERSION
+    );
+    data.join("tile-cache").join(format!(
+        "{}.bin",
+        blake3::hash(revision.as_bytes()).to_hex()
+    ))
+}
+
+fn read_cached_tile(path: &FsPath, metrics: &TileMetrics) -> Option<bytes::Bytes> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < 32 || blake3::hash(&data[32..]).as_bytes() != &data[..32] {
+        metrics.corrupt_disk_entries.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    Some(bytes::Bytes::from(data).slice(32..))
+}
+
+fn write_cached_tile(path: &FsPath, value: &[u8]) -> Result<()> {
+    let _guard = TILE_DISK_WRITES
+        .lock()
+        .map_err(|_| anyhow::anyhow!("tile disk cache poisoned"))?;
+    let root = path.parent().unwrap();
+    std::fs::create_dir_all(root)?;
+    let mut data = Vec::with_capacity(32 + value.len());
+    data.extend_from_slice(blake3::hash(value).as_bytes());
+    data.extend_from_slice(value);
+    let tmp = path.with_extension("tmp");
+    // Reconstructible cache: atomic rename and content verification suffice;
+    // atlas and regional artifacts retain their separately fsynced publication.
+    std::fs::write(&tmp, data)?;
+    if cfg!(windows) && path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(tmp, path)?;
+    let mut files = disk_tile_files(root);
+    let mut size: u64 = files.iter().map(|(_, _, bytes)| bytes).sum();
+    files.sort_by_key(|(_, modified, _)| *modified);
+    for (file, _, bytes) in files {
+        if size <= TILE_DISK_CAPACITY {
+            break;
+        }
+        if std::fs::remove_file(file).is_ok() {
+            size -= bytes;
+        }
+    }
+    Ok(())
+}
+
+fn disk_tile_files(root: &FsPath) -> Vec<(PathBuf, std::time::SystemTime, u64)> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()?.to_str()? != "bin" {
+                return None;
+            }
+            let metadata = path.metadata().ok()?;
+            Some((
+                path,
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                metadata.len(),
+            ))
+        })
+        .collect()
+}
+
+async fn performance(State(app): State<App>) -> Json<serde_json::Value> {
+    let metrics = &app.tile_metrics;
+    let load = |v: &AtomicU64| v.load(Ordering::Relaxed);
+    let cache = app.tiles.read().await;
+    let tiles = serde_json::json!({
+        "requests":load(&metrics.requests),"memory_hits":load(&metrics.memory_hits),
+        "disk_hits":load(&metrics.disk_hits),"computations":load(&metrics.computations),
+        "coalesced":load(&metrics.coalesced),"queue_ms":load(&metrics.queue_us) as f64/1000.0,
+        "compute_ms":load(&metrics.compute_us) as f64/1000.0,
+        "entries":cache.entries.len(),"bytes":cache.size,"capacity_bytes":cache.capacity,
+        "evictions":cache.evictions,"corrupt_disk_entries":load(&metrics.corrupt_disk_entries),
+        "workers":4,"available_workers":app.tile_workers.available_permits()
+    });
+    drop(cache);
+    let root = app.data.join("tile-cache");
+    let disk = tokio::task::spawn_blocking(move || {
+        let files = disk_tile_files(&root);
+        serde_json::json!({"entries":files.len(),"bytes":files.iter().map(|(_,_,size)|size).sum::<u64>(),"capacity_bytes":TILE_DISK_CAPACITY})
+    }).await.unwrap_or(serde_json::Value::Null);
+    Json(serde_json::json!({"tiles":tiles,"disk":disk,"regions":regions::performance()}))
+}
+
 async fn tile(
     State(app): State<App>,
     Path((id, face, level, x, y)): Path<(String, u8, u8, u32, u32)>,
     Query(q): Query<TileQuery>,
 ) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
+    if face >= 6 || level > 24 || x >= 1u32 << level || y >= 1u32 << level {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "clé de tuile invalide".into(),
+        ));
+    }
     if !(2..=128).contains(&q.segments) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
@@ -527,73 +677,164 @@ async fn tile(
         "{id}/{face}/{level}/{x}/{y}/{}/{:?}/{generator}/{format:?}",
         q.segments, q.phase
     );
-    if let Some(bytes) = app.tiles.read().await.entries.get(&key).cloned() {
-        return Ok(tile_response(bytes, format));
+    app.tile_metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if let Some(bytes) = app.tiles.write().await.get(&key) {
+        app.tile_metrics.memory_hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(tile_response(
+            bytes,
+            format,
+            "memory",
+            0.0,
+            0.0,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
     }
-    let _permit = app
+    let gate = {
+        let mut flights = app.tile_flights.lock().await;
+        if flights.len() > 512 {
+            flights.retain(|_, gate| gate.strong_count() != 0);
+        }
+        if let Some(gate) = flights.get(&key).and_then(Weak::upgrade) {
+            gate
+        } else {
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            flights.insert(key.clone(), Arc::downgrade(&gate));
+            gate
+        }
+    };
+    let waiting = gate.try_lock().is_err();
+    if waiting {
+        app.tile_metrics.coalesced.fetch_add(1, Ordering::Relaxed);
+    }
+    let flight = gate.lock_owned().await;
+    if let Some(bytes) = app.tiles.write().await.get(&key) {
+        app.tile_metrics.memory_hits.fetch_add(1, Ordering::Relaxed);
+        app.tile_metrics
+            .queue_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        return Ok(tile_response(
+            bytes,
+            format,
+            "coalesced",
+            started.elapsed().as_secs_f64() * 1000.0,
+            0.0,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
+    }
+    let w = find_world(&app, &id).await?;
+    let permit = app
         .tile_workers
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-    let w = find_world(&app, &id).await?;
+    let queue_ms = started.elapsed().as_secs_f64() * 1000.0;
+    app.tile_metrics
+        .queue_us
+        .fetch_add((queue_ms * 1000.0) as u64, Ordering::Relaxed);
     let region_data = app.data.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let key = TileKey { face, level, x, y };
-        if contracts {
-            let mut packet = hierarchy::compile_tile(&w, key, q.segments)?;
-            if let Some(phase) = q.phase {
-                if let Some(vertices) = packet["vertices"].as_array_mut() {
-                    for vertex in vertices {
-                        let direction: [f64; 3] =
-                            serde_json::from_value(vertex["direction"].clone())?;
-                        let s = w.seasonal_sample(direction, phase);
-                        vertex["temperature_c"] = serde_json::json!(s.temperature_c);
-                        vertex["moisture"] = serde_json::json!(s.moisture);
-                        vertex["biome"] = serde_json::to_value(s.biome)?;
-                        vertex["biome_mix"] = serde_json::to_value(s.biome_mix)?;
+    let disk_path = tile_disk_path(&app.data, &key);
+    let cache = app.tiles.clone();
+    let metrics = app.tile_metrics.clone();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<(bytes::Bytes, &'static str, f64)> {
+            // Ownership outlives the HTTP future: cancelling a stale browser request
+            // must not release its worker while its CPU/CUDA computation still runs.
+            let (_flight, _permit) = (flight, permit);
+            if let Some(bytes) = read_cached_tile(&disk_path, &metrics) {
+                metrics.disk_hits.fetch_add(1, Ordering::Relaxed);
+                cache.blocking_write().insert(key, bytes.clone());
+                return Ok((bytes, "disk", 0.0));
+            }
+            let compute_started = std::time::Instant::now();
+            metrics.computations.fetch_add(1, Ordering::Relaxed);
+            let tile_key = TileKey { face, level, x, y };
+            let compile = || -> Result<Vec<u8>> {
+                if contracts {
+                    let mut packet = hierarchy::compile_tile(&w, tile_key, q.segments)?;
+                    if let Some(phase) = q.phase {
+                        if let Some(vertices) = packet["vertices"].as_array_mut() {
+                            for vertex in vertices {
+                                let direction: [f64; 3] =
+                                    serde_json::from_value(vertex["direction"].clone())?;
+                                let s = w.seasonal_sample(direction, phase);
+                                vertex["temperature_c"] = serde_json::json!(s.temperature_c);
+                                vertex["moisture"] = serde_json::json!(s.moisture);
+                                vertex["biome"] = serde_json::to_value(s.biome)?;
+                                vertex["biome_mix"] = serde_json::to_value(s.biome_mix)?;
+                            }
+                        }
+                    }
+                    return Ok(serde_json::to_vec(&packet)?);
+                }
+                let mut tile = if analytic {
+                    w.tile(tile_key, q.segments)?
+                } else {
+                    regions::compile_tile(&region_data, &w, tile_key, q.segments)?
+                };
+                if let Some(phase) = q.phase {
+                    for vertex in &mut tile.vertices {
+                        let seasonal = w.seasonal_sample(vertex.direction, phase);
+                        vertex.temperature_c = seasonal.temperature_c;
+                        vertex.moisture = seasonal.moisture;
+                        vertex.biome = seasonal.biome;
+                        vertex.biome_mix = seasonal.biome_mix;
                     }
                 }
+                match format {
+                    TileFormat::Postcard => world_core::tile_wire::encode_tile(&tile),
+                    TileFormat::Json => Ok(serde_json::to_vec(&tile)?),
+                }
+            };
+            let bytes = bytes::Bytes::from(compile()?);
+            let compute_ms = compute_started.elapsed().as_secs_f64() * 1000.0;
+            metrics
+                .compute_us
+                .fetch_add((compute_ms * 1000.0) as u64, Ordering::Relaxed);
+            if let Err(error) = write_cached_tile(&disk_path, &bytes) {
+                tracing::warn!(%error,"tile disk cache write skipped");
             }
-            return Ok(serde_json::to_vec(&packet)?);
-        }
-        let mut tile = if analytic {
-            w.tile(key, q.segments)?
-        } else {
-            regions::compile_tile(&region_data, &w, key, q.segments)?
-        };
-        if let Some(phase) = q.phase {
-            for vertex in &mut tile.vertices {
-                let seasonal = w.seasonal_sample(vertex.direction, phase);
-                vertex.temperature_c = seasonal.temperature_c;
-                vertex.moisture = seasonal.moisture;
-                vertex.biome = seasonal.biome;
-                vertex.biome_mix = seasonal.biome_mix;
-            }
-        }
-        match format {
-            TileFormat::Postcard => world_core::tile_wire::encode_tile(&tile),
-            TileFormat::Json => Ok(serde_json::to_vec(&tile)?),
-        }
-    })
-    .await
-    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let bytes = bytes::Bytes::from(result);
-    app.tiles.write().await.insert(key, bytes.clone());
-    Ok(tile_response(bytes, format))
+            cache.blocking_write().insert(key, bytes.clone());
+            Ok((bytes, "generated", compute_ms))
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(tile_response(
+        result.0,
+        format,
+        result.1,
+        queue_ms,
+        result.2,
+        started.elapsed().as_secs_f64() * 1000.0,
+    ))
 }
-fn tile_response(bytes: bytes::Bytes, format: TileFormat) -> Response {
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, format.content_type()),
-            (
-                axum::http::header::CACHE_CONTROL,
-                "private, max-age=31536000, immutable",
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
+fn tile_response(
+    bytes: bytes::Bytes,
+    format: TileFormat,
+    cache: &str,
+    queue_ms: f64,
+    compute_ms: f64,
+    total_ms: f64,
+) -> Response {
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        format.content_type().parse().unwrap(),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        "private, max-age=31536000, immutable".parse().unwrap(),
+    );
+    headers.insert("x-world-tile-cache", cache.parse().unwrap());
+    headers.insert(
+        "server-timing",
+        format!("queue;dur={queue_ms:.3}, compute;dur={compute_ms:.3}, total;dur={total_ms:.3}")
+            .parse()
+            .unwrap(),
+    );
+    response
 }
 async fn family(
     State(app): State<App>,
@@ -785,6 +1026,176 @@ fn validate_world(w: &World) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tile_cache_keeps_recently_used_entries_and_rejects_corrupt_disk_data() {
+        let mut cache = TileCache {
+            capacity: 6,
+            ..Default::default()
+        };
+        cache.insert("a".into(), bytes::Bytes::from_static(b"aaa"));
+        cache.insert("b".into(), bytes::Bytes::from_static(b"bbb"));
+        assert!(cache.get("a").is_some());
+        cache.insert("c".into(), bytes::Bytes::from_static(b"ccc"));
+        assert!(cache.get("a").is_some() && cache.get("b").is_none());
+        assert_eq!(cache.size, 6);
+        let root =
+            std::env::temp_dir().join(format!("world-cache-checksum-{}", std::process::id()));
+        let path = tile_disk_path(&root, "test-entry");
+        let metrics = TileMetrics::default();
+        write_cached_tile(&path, b"original").unwrap();
+        assert_eq!(&read_cached_tile(&path, &metrics).unwrap()[..], b"original");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[32] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_cached_tile(&path, &metrics).is_none());
+        assert_eq!(metrics.corrupt_disk_entries.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_and_disk_reuse_preserve_exact_tile_bytes() {
+        let world = Arc::new(
+            World::generate(WorldConfig {
+                seed: 239991,
+                resolution: 8,
+                erosion_steps: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let data = std::env::temp_dir().join(format!(
+            "world-cache-order-{}-{}",
+            std::process::id(),
+            world.id
+        ));
+        let app = App {
+            data: data.clone(),
+            world: Arc::new(RwLock::new(Some(world.clone()))),
+            jobs: Default::default(),
+            generation: Arc::new(Semaphore::new(1)),
+            counter: Default::default(),
+            tiles: Default::default(),
+            tile_workers: Arc::new(Semaphore::new(4)),
+            tile_flights: Default::default(),
+            tile_metrics: Default::default(),
+        };
+        async fn request(app: &App, world: &World, x: u32) -> Response {
+            tile(
+                State(app.clone()),
+                Path((world.id.clone(), 5, 2, x, 2)),
+                Query(TileQuery {
+                    segments: 32,
+                    phase: None,
+                    generator: None,
+                    format: TileFormat::Postcard,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.1))
+        }
+        let (a, b, c) = tokio::join!(
+            request(&app, &world, 3),
+            request(&app, &world, 3),
+            request(&app, &world, 3)
+        );
+        let a = axum::body::to_bytes(a.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let b = axum::body::to_bytes(b.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let c = axum::body::to_bytes(c.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(app.tile_metrics.computations.load(Ordering::Relaxed), 1);
+        assert!(app.tile_metrics.coalesced.load(Ordering::Relaxed) >= 1);
+        *app.tiles.write().await = TileCache::default();
+        let _other = request(&app, &world, 2).await;
+        let disk = request(&app, &world, 3).await;
+        assert_eq!(disk.headers()["x-world-tile-cache"], "disk");
+        let disk = axum::body::to_bytes(disk.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(a, disk);
+        *app.tiles.write().await = TileCache::default();
+        std::fs::remove_dir_all(data.join("tile-cache")).unwrap();
+        let recomputed = request(&app, &world, 3).await;
+        let recomputed = axum::body::to_bytes(recomputed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(a, recomputed); // independent request order, without either cache.
+        let Json(stats) = performance(State(app)).await;
+        assert_eq!(stats["tiles"]["computations"], 3);
+        assert_eq!(stats["tiles"]["disk_hits"], 1);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_finishes_caching_without_releasing_its_worker_early() {
+        let world = Arc::new(
+            World::generate(WorldConfig {
+                seed: 917551,
+                resolution: 8,
+                erosion_steps: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let data = std::env::temp_dir().join(format!("world-cache-cancel-{}", std::process::id()));
+        let app = App {
+            data: data.clone(),
+            world: Arc::new(RwLock::new(Some(world.clone()))),
+            jobs: Default::default(),
+            generation: Arc::new(Semaphore::new(1)),
+            counter: Default::default(),
+            tiles: Default::default(),
+            tile_workers: Arc::new(Semaphore::new(1)),
+            tile_flights: Default::default(),
+            tile_metrics: Default::default(),
+        };
+        // Hold publication to make cancellation during a running blocking job
+        // deterministic, instead of depending on how fast this machine samples.
+        let publication = TILE_DISK_WRITES.lock().unwrap();
+        let request_app = app.clone();
+        let request = tokio::spawn(async move {
+            tile(
+                State(request_app),
+                Path((world.id.clone(), 5, 2, 3, 2)),
+                Query(TileQuery {
+                    segments: 32,
+                    phase: None,
+                    generator: None,
+                    format: TileFormat::Postcard,
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.tile_metrics.computations.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        let _ = request.await;
+        assert_eq!(app.tile_workers.available_permits(), 0);
+        drop(publication);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while app.tiles.read().await.entries.is_empty()
+                || app.tile_workers.available_permits() != 1
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.tile_workers.available_permits(), 1);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
     #[tokio::test]
     async fn binary_tiles_match_json_with_seasons_and_separate_cache_entries() {
         let world = Arc::new(
@@ -803,6 +1214,8 @@ mod tests {
             counter: Arc::new(AtomicU64::new(0)),
             tiles: Arc::new(RwLock::new(TileCache::default())),
             tile_workers: Arc::new(Semaphore::new(4)),
+            tile_flights: Default::default(),
+            tile_metrics: Default::default(),
         };
         let query = |format| TileQuery {
             segments: 128,

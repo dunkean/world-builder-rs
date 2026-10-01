@@ -1,4 +1,5 @@
 import init, * as viewer from '/pkg/world_viewer.js';
+import { TileStream } from './tile-stream.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('planet');
@@ -8,8 +9,10 @@ let frameCount = 0;
 let lastFps = performance.now();
 let lastTile;
 const loadedTiles = new Map();
-let tileBusy = false;
+let tileStream;
+const renderMetrics = { frames: 0, max_render_ms: 0, render_ms: 0 };
 let generationBusy = false;
+let rendererFailed = false;
 let riverData;
 let humanData;
 let seasonPhase;
@@ -191,49 +194,27 @@ async function generate() {
   }
 }
 
-async function updateDetail() {
-  if (!activeWorld || tileBusy) return;
+function updateDetail() {
+  if (!activeWorld || !tileStream || rendererFailed) return;
   const info = JSON.parse(viewer.view_info());
   const altitude = info.altitude_m;
   $('camera').textContent = altitude >= 1000 ? `Altitude ${number(altitude / 1000, 1)} km` : `Altitude ${number(altitude)} m`;
-  if (info.level < 2) return;
   const worldId = activeWorld.id;
-  const epoch = renderEpoch;
   const phase = seasonPhase;
   const conservative = $('conservative-refinement').checked;
   const keyOf = (tile) => `${worldId}/${tile.face}/${tile.level}/${tile.x}/${tile.y}`;
-  const unique = new Map((info.requests ?? [info]).map((tile) => [keyOf(tile), tile]));
-  const priority = (tile) => tile.level === info.level ? 0 : tile.level > info.level ? 1 : 2;
-  const missing = [...unique.entries()]
-    .filter(([key]) => !loadedTiles.has(key))
-    .sort((a, b) => priority(a[1]) - priority(b[1]))
-    .slice(0, 8);
-  if (!missing.length) return;
-  tileBusy = true;
-  try {
-    const results = await Promise.allSettled(missing.map(async ([key, tile]) => {
-      const segments = 128;
-      const response = await fetch(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=${segments}&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`);
-      if (!response.ok) throw new Error(`Tuile ${response.status}`);
-      const binary = response.headers.get('content-type')?.includes('application/vnd.world-builder.tile+postcard');
-      const data = binary ? new Uint8Array(await response.arrayBuffer()) : await response.text();
-      if (activeWorld?.id !== worldId || epoch !== renderEpoch) return;
-      if (conservative && !binary) {
-        const packet = JSON.parse(data);
-        const passed = packet.hierarchy_certificate?.all_passed;
-        if (!passed) throw new Error('Le certificat de conservation des altitudes a échoué');
-        $('contract-status').textContent = `Altitude parent conservée · niveau ${tile.level}. Conservation des altitudes uniquement.`;
-      }
-      const cachedKeys = JSON.parse(binary ? viewer.add_tile_binary(data) : viewer.set_tile(data));
-      loadedTiles.clear();
-      for (const cached of cachedKeys) loadedTiles.set(keyOf(cached), true);
-    }));
-    for (const result of results) if (result.status === 'rejected') console.warn('Tuile indisponible', result.reason);
-    $('status').textContent = `Exploration · niveau ${info.level} · ${loadedTiles.size} tuiles en mémoire`;
-  } catch (error) {
-    console.warn('Tuile indisponible', error);
-  } finally {
-    tileBusy = false;
+  const priority = (tile) => tile.level === info.level ? 0 : tile.level < info.level ? 1 : 2;
+  const memoryPressure = info.cpu_bytes >= (info.cpu_budget_bytes ?? Infinity) * 0.8;
+  const requests = info.level < 2 ? [] : [...(info.requests ?? [info])]
+    .filter((tile) => !memoryPressure || tile.level === info.level || loadedTiles.has(keyOf(tile)))
+    .sort((a, b) => priority(a) - priority(b));
+  tileStream.update(requests, {
+    epoch: renderEpoch, keyOf, radius: activeWorld.config.radius_m,
+    exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
+    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=128&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`, location.origin).href,
+  });
+  if (info.level >= 2) {
+    $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;
   }
 }
 
@@ -275,7 +256,7 @@ $('conservative-refinement').addEventListener('change', () => {
   $('contract-status').textContent = 'Conservation des altitudes uniquement. Descendre pour vérifier le raffinement.';
 });
 $('exaggeration').addEventListener('input', () => { $('exaggeration-value').value = `×${$('exaggeration').value}`; });
-$('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); lastTile = undefined; });
+$('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); viewer.clear_tiles(); loadedTiles.clear(); renderEpoch += 1; lastTile = undefined; updateDetail(); });
 $('view-tilt').addEventListener('input', () => { $('view-tilt-value').value = `${$('view-tilt').value}°`; viewer.set_view_tilt(Number($('view-tilt').value)); });
 
 function frame(now) {
@@ -283,7 +264,12 @@ function frame(now) {
   const width = Math.round(canvas.clientWidth * ratio);
   const height = Math.round(canvas.clientHeight * ratio);
   if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
-  try { viewer.render(width, height); } catch (error) { message(`Rendu : ${error}`); return; }
+  const renderStarted = performance.now();
+  tileStream?.installNext();
+  try { viewer.render(width, height); } catch (error) { rendererFailed = true; tileStream?.worker.terminate(); message(`Rendu : ${error}`); return; }
+  renderMetrics.render_ms = performance.now() - renderStarted;
+  renderMetrics.max_render_ms = Math.max(renderMetrics.max_render_ms, renderMetrics.render_ms);
+  renderMetrics.frames += 1;
   frameCount += 1;
   if (now - lastFps > 1000) { $('fps').textContent = `${Math.round(frameCount * 1000 / (now - lastFps))} fps`; frameCount = 0; lastFps = now; }
   requestAnimationFrame(frame);
@@ -292,6 +278,13 @@ function frame(now) {
 try {
   await init();
   const backend = await viewer.start('planet', new URLSearchParams(location.search).get('backend') === 'webgl');
+  const worker = new Worker(new URL('./tile-worker.js', import.meta.url), { type: 'module' });
+  tileStream = new TileStream(worker, (packet) => viewer.install_prepared_tile(packet), (keys) => {
+    loadedTiles.clear();
+    for (const tile of keys) loadedTiles.set(`${activeWorld.id}/${tile.face}/${tile.level}/${tile.x}/${tile.y}`, true);
+  });
+  window.worldBuilderPerf = () => ({ ...renderMetrics, ...tileStream.metrics,
+    view: JSON.parse(viewer.view_info()), in_flight: tileStream.jobs.size, queued: tileStream.ready.length });
   $('backend').textContent = `Rust / WASM · ${backend}`;
   $('runtime-dot').classList.add('ready');
   $('generate').disabled = false;

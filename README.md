@@ -24,6 +24,10 @@ Faire glisser pour tourner, utiliser la molette pour descendre ou « Aller à…
 
 Relief et côtes combinent un atlas évolué par érosion et des bandes fractales adressées par position globale. Les lacs ont un niveau horizontal et un budget d'eau ; les chenaux suivent le drainage. Au zoom, les tuiles partagent des régions érodées et persistées aux niveaux 6 et 10. La région fine hérite du parent ; des bandes différentielles d'érosion s'ajoutent au relief analytique sans effacer ses fréquences plus fines. Leur moyenne locale est retirée pour éviter des cuvettes carrées aux frontières des régions. Le premier passage calcule les régions, les suivants les rechargent.
 
+Le navigateur prépare les maillages dans un worker WASM, conserve les buffers GPU et répartit les transitions entre les images. Il réutilise les tuiles en mémoire et dans un cache persistant ; en vue rapprochée, seuls le champ de vision et une couronne de sécurité sont dessinés. Les déplacements ne relancent pas le morph des tuiles communes.
+
+Les tuiles sont réutilisées dans un cache RAM LRU de **256 Mio** et un cache disque vérifié de **1 Gio** ; les demandes identiques partagent leur calcul. `WB_TILE_CACHE_MIB=512 ./scripts/run.sh` augmente le cache RAM. **http://localhost:8001/api/performance** et les en-têtes `Server-Timing` / `X-World-Tile-Cache` distinguent attente, calcul et réutilisation. Ces optimisations ne changent ni le relief ni l'identité du monde.
+
 ## Commandes utiles
 
 ```bash
@@ -32,6 +36,7 @@ cargo run --release -p world-app -- preview --seed 123 --resolution 64
 cargo run --release -p world-app -- validate
 cargo run --release -p world-app -- serve --port 8001
 cargo test --workspace
+node --test web/tile-stream.test.mjs
 cargo run --release -p world-core --example benchmark -- 128 1337
 ./scripts/build-web.sh
 ```
@@ -56,7 +61,7 @@ Remplacer `257` par `1025` pour une grille plus grande. RTX 3090, solveur v2, 16
 - `world-viewer` et `web` : renderer Rust/WASM, shaders, caméra et interface.
 - `world-contracts` : subdivision géométrique certifiée expérimentale, accessible par CLI/API et masquée dans l'interface courante.
 
-Les atlas, régions et checksums vivent dans `data/worlds/<id>/`. Les régions conservent aussi eau restante et sédiments suspendus. `--data <répertoire>` change le stockage. Le serveur écoute sur localhost ; `--host 0.0.0.0` autorise l'accès depuis le réseau local.
+Les atlas, régions et checksums vivent dans `data/worlds/<id>/`. Les régions conservent aussi eau restante et sédiments suspendus. `data/tile-cache/` contient seulement des paquets recalculables. `--data <répertoire>` change le stockage. Le serveur écoute sur localhost ; `--host 0.0.0.0` autorise l'accès depuis le réseau local.
 
 ## Portée
 

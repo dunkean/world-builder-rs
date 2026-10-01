@@ -171,6 +171,294 @@ struct Mesh {
     indices: Vec<u32>,
 }
 
+const BIOMES: [&str; 10] = [
+    "Ocean",
+    "Lake",
+    "Ice",
+    "Tundra",
+    "Desert",
+    "Grassland",
+    "Forest",
+    "Rainforest",
+    "Wetland",
+    "Rock",
+];
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PreparedHeader {
+    magic: [u8; 4],
+    face: u8,
+    level: u8,
+    reserved: [u8; 2],
+    x: u32,
+    y: u32,
+    radius: f64,
+    exaggeration: f64,
+    counts: [u32; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PackedSample {
+    direction: [f64; 3],
+    height: f64,
+    water: f64,
+    level: f64,
+    body: u64,
+    fields: [f32; 4],
+    mix: [f32; 10],
+    biome: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BorderNormal {
+    index: u32,
+    reserved: u32,
+    sum: [f64; 3],
+}
+
+struct PreparedTile {
+    tile: Tile,
+    mesh: Mesh,
+    borders: Vec<BorderNormal>,
+    radius: f64,
+    exaggeration: f64,
+}
+
+fn mesh_point(vertex: &Vertex) -> DVec3 {
+    DVec3::from_array(vertex.position.map(f64::from))
+        + DVec3::from_array(vertex.position_low.map(f64::from))
+}
+
+fn local_normal_sums(mesh: &Mesh, parent: bool) -> Vec<DVec3> {
+    let mut sums = vec![DVec3::ZERO; mesh.vertices.len()];
+    let position = |i: usize| {
+        let v = &mesh.vertices[i];
+        let p = mesh_point(v);
+        if parent {
+            p + DVec3::new(
+                v.normal_height[0] as f64,
+                v.normal_height[1] as f64,
+                v.normal_height[2] as f64,
+            ) * v.morph[0] as f64
+        } else {
+            p
+        }
+    };
+    for triangle in mesh.indices.chunks_exact(3) {
+        if mesh.vertices[triangle[0] as usize].color[3].round() as u32 & 1 != 0 {
+            continue;
+        }
+        let [ia, ib, ic] = [
+            triangle[0] as usize,
+            triangle[1] as usize,
+            triangle[2] as usize,
+        ];
+        let [a, b, c] = [position(ia), position(ib), position(ic)];
+        let mut normal = (b - a).cross(c - a);
+        if normal.dot(a + b + c) < 0.0 {
+            normal = -normal;
+        }
+        for i in [ia, ib, ic] {
+            sums[i] += normal;
+        }
+    }
+    sums
+}
+
+fn local_mesh_normals(mesh: &mut Mesh) {
+    for parent in [false, true] {
+        let sums = local_normal_sums(mesh, parent);
+        for (v, sum) in mesh.vertices.iter_mut().zip(sums) {
+            let normal = if sum.length_squared() > 1e-30 {
+                sum.normalize().as_vec3().to_array()
+            } else {
+                v.normal_height[..3].try_into().unwrap()
+            };
+            if parent {
+                v.parent_normal = normal;
+            } else {
+                v.shading_normal = normal;
+            }
+        }
+    }
+}
+
+fn compact_mesh(mesh: &mut Mesh, ground_vertices: usize) {
+    let mut used = vec![false; mesh.vertices.len()];
+    used[..ground_vertices].fill(true);
+    for &index in &mesh.indices {
+        used[index as usize] = true;
+    }
+    let mut mapping = vec![0u32; mesh.vertices.len()];
+    let mut compact = Vec::with_capacity(used.iter().filter(|v| **v).count());
+    for (i, &vertex) in mesh.vertices.iter().enumerate() {
+        if used[i] {
+            mapping[i] = compact.len() as u32;
+            compact.push(vertex);
+        }
+    }
+    for index in &mut mesh.indices {
+        *index = mapping[*index as usize];
+    }
+    mesh.vertices = compact;
+}
+
+fn prepare_tile(tile: Tile, radius: f64, exaggeration: f64) -> Result<Vec<u8>, String> {
+    if !radius.is_finite()
+        || radius <= 0.0
+        || !exaggeration.is_finite()
+        || !(1.0..=30.0).contains(&exaggeration)
+    {
+        return Err("Paramètres de préparation invalides".into());
+    }
+    let mut mesh = tile_mesh(&tile, radius, exaggeration)?;
+    compact_mesh(&mut mesh, tile.vertices.len());
+    let side = (tile.vertices.len() as f64).sqrt() as usize;
+    if side < 2 || side * side != tile.vertices.len() {
+        return Err("Grille de tuile invalide".into());
+    }
+    let sums = local_normal_sums(&mesh, false);
+    let borders: Vec<_> = (0..tile.vertices.len())
+        .filter(|i| i % side == 0 || i % side == side - 1 || *i < side || *i >= side * (side - 1))
+        .map(|i| BorderNormal {
+            index: i as u32,
+            reserved: 0,
+            sum: sums[i].to_array(),
+        })
+        .collect();
+    let samples: Vec<_> = tile
+        .vertices
+        .iter()
+        .map(|v| PackedSample {
+            direction: v.direction,
+            height: v.height_m,
+            water: v.water_m,
+            level: v.water_level_m.unwrap_or(f64::NAN),
+            body: v.water_body_id.unwrap_or(u64::MAX),
+            fields: [
+                v.temperature_c as f32,
+                v.moisture as f32,
+                v.discharge as f32,
+                v.river as f32,
+            ],
+            mix: v.biome_mix.map(|x| x as f32),
+            biome: BIOMES.iter().position(|name| *name == v.biome).unwrap_or(9) as u32,
+            flags: u32::from(v.ocean) | u32::from(v.lake) << 1,
+        })
+        .collect();
+    let header = PreparedHeader {
+        magic: *b"WVP1",
+        face: tile.key.face,
+        level: tile.key.level,
+        reserved: [0; 2],
+        x: tile.key.x,
+        y: tile.key.y,
+        radius,
+        exaggeration,
+        counts: [
+            samples.len() as u32,
+            mesh.vertices.len() as u32,
+            mesh.indices.len() as u32,
+            borders.len() as u32,
+            tile.indices.len() as u32,
+            0,
+        ],
+    };
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(bytemuck::bytes_of(&header));
+    bytes.extend_from_slice(bytemuck::cast_slice(&samples));
+    bytes.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
+    bytes.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
+    while bytes.len() % 8 != 0 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(bytemuck::cast_slice(&borders));
+    Ok(bytes)
+}
+
+fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
+    let hsize = std::mem::size_of::<PreparedHeader>();
+    if bytes.len() < hsize {
+        return Err("Préparation tronquée".into());
+    }
+    let header: PreparedHeader = bytemuck::pod_read_unaligned(&bytes[..hsize]);
+    if header.magic != *b"WVP1"
+        || header.face >= 6
+        || header.level > 18
+        || header.counts[0] > 263169
+        || header.counts[1] > 2_000_000
+        || header.counts[2] > 12_000_000
+        || header.counts[3] > 4096
+        || header.counts[4] > header.counts[2]
+    {
+        return Err("Préparation invalide".into());
+    }
+    let mut offset = hsize;
+    fn read<T: Pod>(bytes: &[u8], offset: &mut usize, count: usize) -> Result<Vec<T>, String> {
+        let size = count
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or("Préparation trop grande")?;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .ok_or("Préparation tronquée")?;
+        let out = bytes[*offset..end]
+            .chunks_exact(std::mem::size_of::<T>())
+            .map(bytemuck::pod_read_unaligned)
+            .collect();
+        *offset = end;
+        Ok(out)
+    }
+    let samples: Vec<PackedSample> = read(bytes, &mut offset, header.counts[0] as usize)?;
+    let vertices: Vec<Vertex> = read(bytes, &mut offset, header.counts[1] as usize)?;
+    let indices: Vec<u32> = read(bytes, &mut offset, header.counts[2] as usize)?;
+    offset = (offset + 7) & !7;
+    let borders = read(bytes, &mut offset, header.counts[3] as usize)?;
+    if offset != bytes.len() || indices.iter().any(|i| *i as usize >= vertices.len()) {
+        return Err("Indices de préparation invalides".into());
+    }
+    let terrain_indices = indices[..header.counts[4] as usize].to_vec();
+    let tile = Tile {
+        key: TileKey {
+            face: header.face,
+            level: header.level,
+            x: header.x,
+            y: header.y,
+        },
+        indices: terrain_indices,
+        vertices: samples
+            .into_iter()
+            .map(|v| Sample {
+                direction: v.direction,
+                height_m: v.height,
+                water_m: v.water,
+                water_level_m: v.level.is_finite().then_some(v.level),
+                water_body_id: (v.body != u64::MAX).then_some(v.body),
+                temperature_c: v.fields[0] as f64,
+                moisture: v.fields[1] as f64,
+                discharge: v.fields[2] as f64,
+                river: v.fields[3] as f64,
+                biome: BIOMES.get(v.biome as usize).unwrap_or(&"Rock").to_string(),
+                biome_mix: v.mix.map(f64::from),
+                ocean: v.flags & 1 != 0,
+                lake: v.flags & 2 != 0,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    Ok(PreparedTile {
+        tile,
+        mesh: Mesh { vertices, indices },
+        borders,
+        radius: header.radius,
+        exaggeration: header.exaggeration,
+    })
+}
+
 fn biome_color(biome: &str) -> [f32; 3] {
     match biome {
         "Ocean" => [0.08, 0.25, 0.40],
@@ -560,14 +848,16 @@ fn world_mesh(world: &World, exaggeration: f64) -> Result<Mesh, String> {
             }
         }
     }
-    mesh_from_samples(
+    let mut mesh = mesh_from_samples(
         &samples,
         &indices,
         0,
         None,
         world.config.radius_m,
         exaggeration,
-    )
+    )?;
+    smooth_mesh_normals(std::slice::from_mut(&mut mesh));
+    Ok(mesh)
 }
 
 fn mesh_from_samples(
@@ -609,7 +899,7 @@ fn mesh_from_samples(
             }));
     }
     append_water_geometry(&mut mesh, samples, indices, radius, exaggeration);
-    smooth_mesh_normals(std::slice::from_mut(&mut mesh));
+    local_mesh_normals(&mut mesh);
     Ok(mesh)
 }
 
@@ -772,6 +1062,69 @@ fn ray_triangle(direction: DVec3, a: DVec3, b: DVec3, c: DVec3) -> Option<f64> {
     }
     let t = inverse * e2.dot(q);
     (t > 0.0).then_some(t)
+}
+
+fn ray_triangle_detail(direction: DVec3, a: DVec3, b: DVec3, c: DVec3) -> Option<(f64, f64, f64)> {
+    let e1 = b - a;
+    let e2 = c - a;
+    let h = direction.cross(e2);
+    let determinant = e1.dot(h);
+    if determinant.abs() < 1e-24 {
+        return None;
+    }
+    let inverse = determinant.recip();
+    let q = (-a).cross(e1);
+    let u = inverse * (-a).dot(h);
+    let v = inverse * direction.dot(q);
+    if u < -1e-7 || v < -1e-7 || u + v > 1.0000001 {
+        return None;
+    }
+    let t = inverse * e2.dot(q);
+    (t > 0.0).then_some((t, u, v))
+}
+fn surface_query(
+    direction: DVec3,
+    key: TileKey,
+    side: usize,
+    at: impl Fn(usize) -> (DVec3, [f32; 3]),
+) -> Option<(f64, [f32; 3])> {
+    if side < 2 {
+        return None;
+    }
+    let b = BASES[key.face as usize];
+    let vec = |v: [i32; 3]| DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
+    let d = direction.dot(vec(b[0]));
+    if d <= 0.0 {
+        return None;
+    }
+    let count = f64::from(1u32 << key.level);
+    let x = (direction.dot(vec(b[1])) / d + 1.0) * 0.5 * count - key.x as f64;
+    let y = (direction.dot(vec(b[2])) / d + 1.0) * 0.5 * count - key.y as f64;
+    if !(-1e-9..=1.000000001).contains(&x) || !(-1e-9..=1.000000001).contains(&y) {
+        return None;
+    }
+    let i = ((x * (side - 1) as f64).floor() as usize).min(side - 2);
+    let j = ((y * (side - 1) as f64).floor() as usize).min(side - 2);
+    let a = j * side + i;
+    let b = a + 1;
+    let c = a + side;
+    let d = c + 1;
+    for indices in [[a, b, d], [a, d, c]] {
+        let [(pa, na), (pb, nb), (pc, nc)] = indices.map(&at);
+        if let Some((radius, u, v)) = ray_triangle_detail(direction, pa, pb, pc) {
+            let normal = Vec3::from_array(na) * (1.0 - u - v) as f32
+                + Vec3::from_array(nb) * u as f32
+                + Vec3::from_array(nc) * v as f32;
+            return Some((radius, normal.normalize_or_zero().to_array()));
+        }
+    }
+    None
+}
+fn normal_key(direction: DVec3) -> [i64; 3] {
+    direction
+        .normalize()
+        .to_array()
+        .map(|v| (v * 1e12).round() as i64)
 }
 
 fn surface_radius(
@@ -1046,38 +1399,153 @@ mod browser {
         face_level: [f32; 4],
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Pod, Zeroable)]
+    struct DynamicVertex {
+        morph: [f32; 4],
+        shading_normal: [f32; 3],
+        parent_normal: [f32; 3],
+    }
+    #[derive(Clone, Copy)]
+    struct SurfaceVertex {
+        direction: DVec3,
+        radius: f64,
+        depth: f32,
+        water: bool,
+    }
     struct GpuMesh {
         vertices: wgpu::Buffer,
+        dynamic_buffer: wgpu::Buffer,
         indices: wgpu::Buffer,
+        dynamic: Vec<DynamicVertex>,
+        geometry: Vec<SurfaceVertex>,
         count: u32,
+        bytes: usize,
     }
-
     impl GpuMesh {
         fn upload(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) -> Self {
-            let vertices = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("terrain vertices"),
-                size: ((mesh.vertices.len() * std::mem::size_of::<Vertex>()) as u64).max(4),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let indices = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("terrain indices"),
-                size: ((mesh.indices.len() * std::mem::size_of::<u32>()) as u64).max(4),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            if !mesh.vertices.is_empty() {
+            let dynamic = mesh
+                .vertices
+                .iter()
+                .map(|v| DynamicVertex {
+                    morph: v.morph,
+                    shading_normal: v.shading_normal,
+                    parent_normal: v.parent_normal,
+                })
+                .collect();
+            Self::upload_dynamic(device, queue, mesh, dynamic)
+        }
+        fn upload_dynamic(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            mesh: &Mesh,
+            dynamic: Vec<DynamicVertex>,
+        ) -> Self {
+            let vbytes = mesh.vertices.len() * std::mem::size_of::<Vertex>();
+            let ibytes = mesh.indices.len() * 4;
+            let dbytes = dynamic.len() * std::mem::size_of::<DynamicVertex>();
+            let buffer = |label: &'static str, size: usize, usage| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: size.max(4) as u64,
+                    usage: usage | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            };
+            let vertices = buffer("terrain vertices", vbytes, wgpu::BufferUsages::VERTEX);
+            let indices = buffer("terrain indices", ibytes, wgpu::BufferUsages::INDEX);
+            let dynamic_buffer = buffer(
+                "terrain morph and normals",
+                dbytes,
+                wgpu::BufferUsages::VERTEX,
+            );
+            if vbytes > 0 {
                 queue.write_buffer(&vertices, 0, bytemuck::cast_slice(&mesh.vertices));
             }
-            if !mesh.indices.is_empty() {
+            if ibytes > 0 {
                 queue.write_buffer(&indices, 0, bytemuck::cast_slice(&mesh.indices));
             }
+            if dbytes > 0 {
+                queue.write_buffer(&dynamic_buffer, 0, bytemuck::cast_slice(&dynamic));
+            }
+            let geometry = mesh
+                .vertices
+                .iter()
+                .map(|v| {
+                    let p = mesh_point(v);
+                    SurfaceVertex {
+                        direction: p.normalize(),
+                        radius: p.length(),
+                        depth: v.fields[3],
+                        water: v.color[3].round() as u32 & 1 != 0,
+                    }
+                })
+                .collect();
             Self {
                 vertices,
+                dynamic_buffer,
                 indices,
+                dynamic,
+                geometry,
                 count: mesh.indices.len() as u32,
+                bytes: vbytes + ibytes + dbytes,
             }
         }
+        fn update_dynamic(&mut self, queue: &wgpu::Queue, dynamic: Vec<DynamicVertex>) {
+            queue.write_buffer(&self.dynamic_buffer, 0, bytemuck::cast_slice(&dynamic));
+            self.dynamic = dynamic;
+        }
+        fn cpu_bytes(&self) -> usize {
+            self.dynamic.capacity() * std::mem::size_of::<DynamicVertex>()
+                + self.geometry.capacity() * std::mem::size_of::<SurfaceVertex>()
+        }
+    }
+    struct CachedTile {
+        key: TileKey,
+        tile: Tile,
+        prepared: Option<Mesh>,
+        borders: Vec<BorderNormal>,
+        gpu: Option<GpuMesh>,
+        last_used: u64,
+        cpu_base: usize,
+        morph_source: u64,
+    }
+    impl CachedTile {
+        fn cpu_bytes(&self) -> usize {
+            self.cpu_base
+                + self.tile.morph_offsets.capacity() * 24
+                + self.prepared.as_ref().map_or(0, |m| {
+                    m.vertices.capacity() * std::mem::size_of::<Vertex>() + m.indices.capacity() * 4
+                })
+                + self.gpu.as_ref().map_or(0, GpuMesh::cpu_bytes)
+        }
+    }
+    struct CutWork {
+        key: TileKey,
+        mesh: Option<Mesh>,
+        dynamic: Vec<DynamicVertex>,
+        geometry: Vec<SurfaceVertex>,
+        offsets: Vec<[f64; 3]>,
+        cursor: usize,
+    }
+    struct PendingCut {
+        keys: Vec<TileKey>,
+        cursor: usize,
+        work: Option<CutWork>,
+        shared: HashMap<[i64; 3], [f32; 3]>,
+        same_level: bool,
+        source_id: u64,
+    }
+    #[derive(Default)]
+    struct RenderMetrics {
+        uploads: u64,
+        upload_bytes: u64,
+        mesh_builds: u64,
+        cut_commits: u64,
+        reused_tiles: u64,
+        max_prepare_ms: f64,
+        last_prepare_ms: f64,
+        max_render_ms: f64,
     }
 
     struct Renderer {
@@ -1092,7 +1560,15 @@ mod browser {
         world: Option<World>,
         globe: Option<GpuMesh>,
         base_surfaces: [Vec<DVec3>; 2],
-        tiles: Vec<(TileKey, GpuMesh, Tile)>,
+        tiles: Vec<CachedTile>,
+        pending: Option<PendingCut>,
+        cut_dirty: bool,
+        cut_visible: bool,
+        signature: Option<[u64; 5]>,
+        cut_serial: u64,
+        morph_start: f64,
+        tick: u64,
+        metrics: RenderMetrics,
         tile_lookup: HashMap<TileKey, usize>,
         active_keys: Vec<TileKey>,
         active_set: HashSet<TileKey>,
@@ -1132,13 +1608,15 @@ mod browser {
         fn clear_cut(&mut self) {
             self.active_keys.clear();
             self.active_set.clear();
+            self.cut_visible = false;
+            self.cancel_pending();
         }
         fn rebuild_lookup(&mut self) {
             self.tile_lookup = self
                 .tiles
                 .iter()
                 .enumerate()
-                .map(|(i, (key, _, _))| (*key, i))
+                .map(|(i, tile)| (tile.key, i))
                 .collect();
         }
         fn aspect(&self) -> f64 {
@@ -1164,7 +1642,19 @@ mod browser {
         fn requests(&self) -> Vec<TileKey> {
             let level = self.detail_level();
             let mut keys = self.footprint(level);
-            keys.extend(self.footprint((level + 1).min(18)).into_iter().take(192));
+            // Prefetch the next zoom's footprint, rather than four times the
+            // current viewport at a finer level that will never all be displayed.
+            keys.extend(
+                footprint_keys(
+                    self.direction(),
+                    (level + 1).min(18),
+                    self.aspect(),
+                    self.altitude * 0.5,
+                    self.view_tilt,
+                )
+                .into_iter()
+                .take(64),
+            );
             keys.extend(self.footprint(level.saturating_sub(1)).into_iter().take(64));
             let mut seen = HashSet::new();
             keys.retain(|key| seen.insert(*key));
@@ -1188,7 +1678,7 @@ mod browser {
             let Some(world) = &self.world else {
                 return 1.0;
             };
-            if let Some(active) = self.active_keys.first() {
+            if let Some(active) = self.active_keys.first().filter(|_| self.cut_visible) {
                 if !below_level.is_some_and(|level| active.level >= level) {
                     let (face, u, v) = face_uv(direction);
                     let count = 1u32 << active.level;
@@ -1200,7 +1690,7 @@ mod browser {
                     };
                     if self.active_set.contains(&key) {
                         if let Some(&index) = self.tile_lookup.get(&key) {
-                            let tile = &self.tiles[index].2;
+                            let tile = &self.tiles[index].tile;
                             let side = (tile.vertices.len() as f64).sqrt() as usize;
                             let progress = morph_progress(time, tile.morph_start);
                             if let Some(hit) = surface_radius(direction, key, side, |index| {
@@ -1251,80 +1741,380 @@ mod browser {
                 - 1.0
         }
 
+        fn cancel_pending(&mut self) {
+            if let Some(mut pending) = self.pending.take() {
+                if let Some(work) = pending.work.take() {
+                    if let Some(mesh) = work.mesh {
+                        if let Some(&i) = self.tile_lookup.get(&work.key) {
+                            self.tiles[i].prepared = Some(mesh);
+                        }
+                    }
+                }
+            }
+        }
+        fn reference_surface(&self, direction: DVec3) -> (f64, [f32; 3]) {
+            let Some(world) = &self.world else {
+                return (1.0, direction.as_vec3().to_array());
+            };
+            let (face, u, v) = face_uv(direction);
+            if let Some(active) = self.active_keys.first() {
+                let count = 1u32 << active.level;
+                let key = TileKey {
+                    face: face as u8,
+                    level: active.level,
+                    x: (((u + 1.0) * 0.5 * count as f64) as u32).min(count - 1),
+                    y: (((v + 1.0) * 0.5 * count as f64) as u32).min(count - 1),
+                };
+                if self.active_set.contains(&key) {
+                    if let Some(&i) = self.tile_lookup.get(&key) {
+                        let tile = &self.tiles[i];
+                        if let Some(gpu) = &tile.gpu {
+                            let side = (tile.tile.vertices.len() as f64).sqrt() as usize;
+                            if let Some(hit) = surface_query(direction, key, side, |i| {
+                                let g = gpu.geometry[i];
+                                (g.direction * g.radius, gpu.dynamic[i].shading_normal)
+                            }) {
+                                return hit;
+                            }
+                        }
+                    }
+                }
+            }
+            let side = world.mesh_resolution().min(128) + 1;
+            let start = face * side * side;
+            surface_query(
+                direction,
+                TileKey {
+                    face: face as u8,
+                    ..Default::default()
+                },
+                side,
+                |i| {
+                    (
+                        self.base_surfaces[0][start + i],
+                        self.globe
+                            .as_ref()
+                            .map_or(direction.as_vec3().to_array(), |g| {
+                                g.dynamic[start + i].shading_normal
+                            }),
+                    )
+                },
+            )
+            .unwrap_or((1.0, direction.as_vec3().to_array()))
+        }
+        fn cache_bytes(&self) -> (usize, usize) {
+            (
+                self.tiles.iter().map(CachedTile::cpu_bytes).sum(),
+                self.tiles
+                    .iter()
+                    .filter_map(|t| t.gpu.as_ref())
+                    .map(|g| g.bytes)
+                    .sum(),
+            )
+        }
+        fn evict_cache(&mut self) {
+            const CPU_LIMIT: usize = 768 * 1024 * 1024;
+            const GPU_LIMIT: usize = 768 * 1024 * 1024;
+            let (cpu, gpu) = self.cache_bytes();
+            if cpu <= CPU_LIMIT && gpu <= GPU_LIMIT {
+                return;
+            }
+            let mut pinned = self.active_set.clone();
+            if let Some(p) = &self.pending {
+                pinned.extend(p.keys.iter().copied());
+            }
+            let wanted: HashSet<_> = self.requests().into_iter().collect();
+            loop {
+                let (cpu, gpu) = self.cache_bytes();
+                if cpu <= CPU_LIMIT && gpu <= GPU_LIMIT {
+                    break;
+                }
+                let victim = self
+                    .tiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| !pinned.contains(&t.key))
+                    .min_by_key(|(_, t)| (wanted.contains(&t.key), t.last_used))
+                    .map(|(i, _)| i);
+                let Some(i) = victim else {
+                    break;
+                };
+                self.tiles.swap_remove(i);
+                self.rebuild_lookup();
+            }
+        }
         fn refresh_cut(&mut self) {
+            self.tick = self.tick.wrapping_add(1);
+            let signature = [
+                self.yaw.to_bits(),
+                self.pitch.to_bits(),
+                self.altitude.to_bits(),
+                self.aspect().to_bits(),
+                self.view_tilt.to_bits(),
+            ];
+            if self.signature != Some(signature) {
+                self.signature = Some(signature);
+                self.cut_dirty = true;
+                self.cut_visible = self.active_keys.first().is_some_and(|key| {
+                    key.level <= self.detail_level()
+                        && self
+                            .footprint(key.level)
+                            .iter()
+                            .all(|k| self.active_set.contains(k))
+                });
+            }
+            if !self.cut_dirty && self.pending.is_none() {
+                return;
+            }
             let wanted = self.detail_level();
             if wanted < 2 {
                 self.clear_cut();
+                self.cut_dirty = false;
                 return;
             }
-            let mut next = None;
-            for level in (1..=wanted).rev() {
-                let keys = self.footprint(level);
-                if keys.iter().all(|key| self.tile_lookup.contains_key(key)) {
-                    next = Some(keys);
-                    break;
-                }
-            }
-            let Some(next) = next else {
-                if let Some(key) = self.active_keys.first() {
-                    let required = self.footprint(key.level);
-                    if key.level > wanted
-                        || !required.iter().all(|key| self.active_keys.contains(key))
-                    {
-                        self.clear_cut();
+            if self.cut_dirty {
+                self.cut_dirty = false;
+                let mut next = None;
+                for level in (1..=wanted).rev() {
+                    let keys = self.footprint(level);
+                    if keys.iter().all(|key| {
+                        self.tile_lookup.get(key).is_some_and(|&i| {
+                            self.tiles[i].prepared.is_some() || self.tiles[i].gpu.is_some()
+                        })
+                    }) {
+                        next = Some(keys);
+                        break;
                     }
                 }
-                return;
-            };
-            if next.len() == self.active_keys.len()
-                && next.iter().all(|key| self.active_set.contains(key))
-            {
+                if let Some(next) = next {
+                    if next.len() == self.active_keys.len()
+                        && next.iter().all(|k| self.active_set.contains(k))
+                    {
+                        self.cancel_pending();
+                        self.cut_visible = true;
+                        return;
+                    }
+                    if !self.pending.as_ref().is_some_and(|p| p.keys == next) {
+                        self.cancel_pending();
+                        let same_level = self
+                            .active_keys
+                            .first()
+                            .is_some_and(|k| k.level == next[0].level);
+                        let mut sums: HashMap<[i64; 3], DVec3> = HashMap::new();
+                        for key in &next {
+                            let tile = &self.tiles[self.tile_lookup[key]];
+                            for border in &tile.borders {
+                                let d = DVec3::from_array(
+                                    tile.tile.vertices[border.index as usize].direction,
+                                );
+                                *sums.entry(normal_key(d)).or_default() +=
+                                    DVec3::from_array(border.sum);
+                            }
+                        }
+                        let shared = sums
+                            .into_iter()
+                            .map(|(key, sum)| (key, sum.normalize_or_zero().as_vec3().to_array()))
+                            .collect();
+                        self.pending = Some(PendingCut {
+                            keys: next,
+                            cursor: 0,
+                            work: None,
+                            shared,
+                            same_level,
+                            source_id: self.cut_serial,
+                        });
+                    }
+                }
+            }
+            // A completed parent morph is a stable reference. Panning never restarts it.
+            if js_now() - self.morph_start < 0.35 {
                 return;
             }
+            self.process_cut();
+        }
+        fn process_cut(&mut self) {
+            let Some(mut pending) = self.pending.take() else {
+                return;
+            };
             let Some(world) = &self.world else {
                 return;
             };
             let radius = world.config.radius_m;
-            let start = f64::from(js_now() as f32);
-            let updates: Vec<_> = next
-                .iter()
-                .filter_map(|key| {
-                    let index = *self.tile_lookup.get(key)?;
-                    let offsets = self.tiles[index]
-                        .2
-                        .vertices
-                        .iter()
-                        .map(|sample| {
-                            let dir = DVec3::from_array(sample.direction).normalize();
-                            let ground = self.displayed_radius(dir, false, None, start);
-                            let water = self.displayed_radius(dir, true, None, start);
-                            [
-                                ground - (1.0 + sample.height_m * self.exaggeration / radius),
-                                water - (1.0 + water_height(sample) * self.exaggeration / radius),
-                                (water - ground) * radius / self.exaggeration,
-                            ]
-                        })
-                        .collect();
-                    Some((index, offsets))
-                })
-                .collect();
-            let mut meshes = Vec::new();
-            let mut indices = Vec::new();
-            for (index, offsets) in updates {
-                let (_, _, tile) = &mut self.tiles[index];
-                tile.morph_start = start;
-                tile.morph_offsets = offsets;
-                if let Ok(mesh) = tile_mesh(tile, radius, self.exaggeration) {
-                    meshes.push(mesh);
-                    indices.push(index);
+            let begin = js_now();
+            let mut uploaded = false;
+            while pending.cursor < pending.keys.len() {
+                let key = pending.keys[pending.cursor];
+                let Some(&index) = self.tile_lookup.get(&key) else {
+                    self.cut_dirty = true;
+                    break;
+                };
+                if pending.work.is_none() {
+                    let tile = &mut self.tiles[index];
+                    tile.last_used = self.tick;
+                    if pending.same_level && self.active_set.contains(&key) {
+                        // Existing geometry is resident; only boundary lighting may change.
+                        let gpu = tile.gpu.as_mut().unwrap();
+                        let mut changed = false;
+                        for border in &tile.borders {
+                            let i = border.index as usize;
+                            let key =
+                                normal_key(DVec3::from_array(tile.tile.vertices[i].direction));
+                            let normal = pending
+                                .shared
+                                .get(&key)
+                                .copied()
+                                .unwrap_or(gpu.dynamic[i].shading_normal);
+                            if gpu.dynamic[i].shading_normal != normal {
+                                gpu.dynamic[i].shading_normal = normal;
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            gpu.update_dynamic(&self.queue, gpu.dynamic.clone());
+                            self.metrics.uploads += 1;
+                            self.metrics.upload_bytes +=
+                                (gpu.dynamic.len() * std::mem::size_of::<DynamicVertex>()) as u64;
+                            uploaded = true;
+                        }
+                        self.metrics.reused_tiles += 1;
+                        pending.cursor += 1;
+                        if uploaded || js_now() - begin >= 0.004 {
+                            break;
+                        }
+                        continue;
+                    }
+                    let (mesh, dynamic, geometry) = if let Some(mesh) = tile.prepared.take() {
+                        let dynamic = mesh
+                            .vertices
+                            .iter()
+                            .map(|v| DynamicVertex {
+                                morph: v.morph,
+                                shading_normal: v.shading_normal,
+                                parent_normal: v.parent_normal,
+                            })
+                            .collect();
+                        let geometry = mesh
+                            .vertices
+                            .iter()
+                            .map(|v| {
+                                let p = mesh_point(v);
+                                SurfaceVertex {
+                                    direction: p.normalize(),
+                                    radius: p.length(),
+                                    depth: v.fields[3],
+                                    water: v.color[3].round() as u32 & 1 != 0,
+                                }
+                            })
+                            .collect();
+                        (Some(mesh), dynamic, geometry)
+                    } else if let Some(gpu) = &tile.gpu {
+                        (None, gpu.dynamic.clone(), gpu.geometry.clone())
+                    } else {
+                        self.cut_dirty = true;
+                        break;
+                    };
+                    let offsets = if pending.same_level {
+                        Vec::new()
+                    } else {
+                        vec![[0.0; 3]; tile.tile.vertices.len()]
+                    };
+                    pending.work = Some(CutWork {
+                        key,
+                        mesh,
+                        dynamic,
+                        geometry,
+                        offsets,
+                        cursor: 0,
+                    });
                 }
+                let mut work = pending.work.take().unwrap();
+                if !pending.same_level {
+                    let n = self.tiles[index].tile.vertices.len();
+                    while work.cursor < work.dynamic.len() {
+                        let i = work.cursor;
+                        let geometry = work.geometry[i];
+                        let (parent, normal) = self.reference_surface(geometry.direction);
+                        let delta = parent - geometry.radius;
+                        let depth = (geometry.radius - parent) * radius / self.exaggeration;
+                        work.dynamic[i].morph = [
+                            if geometry.water { 0.0 } else { delta as f32 },
+                            0.0,
+                            if geometry.water {
+                                depth as f32
+                            } else {
+                                geometry.depth
+                            },
+                            0.0,
+                        ];
+                        work.dynamic[i].parent_normal = if geometry.water {
+                            geometry.direction.as_vec3().to_array()
+                        } else {
+                            normal
+                        };
+                        if i < n {
+                            work.offsets[i] = [delta, 0.0, geometry.depth as f64];
+                        }
+                        work.cursor += 1;
+                        if work.cursor % 64 == 0 && js_now() - begin >= 0.004 {
+                            break;
+                        }
+                    }
+                    if work.cursor < work.dynamic.len() {
+                        pending.work = Some(work);
+                        break;
+                    }
+                }
+                for border in &self.tiles[index].borders {
+                    let i = border.index as usize;
+                    let key = normal_key(DVec3::from_array(
+                        self.tiles[index].tile.vertices[i].direction,
+                    ));
+                    if let Some(&normal) = pending.shared.get(&key) {
+                        work.dynamic[i].shading_normal = normal;
+                    }
+                    if pending.same_level {
+                        work.dynamic[i].parent_normal = work.dynamic[i].shading_normal;
+                    }
+                }
+                let tile = &mut self.tiles[index];
+                let bytes = if let Some(mesh) = work.mesh {
+                    let gpu =
+                        GpuMesh::upload_dynamic(&self.device, &self.queue, &mesh, work.dynamic);
+                    let bytes = gpu.bytes;
+                    tile.gpu = Some(gpu);
+                    bytes
+                } else {
+                    let gpu = tile.gpu.as_mut().unwrap();
+                    let bytes = work.dynamic.len() * std::mem::size_of::<DynamicVertex>();
+                    gpu.update_dynamic(&self.queue, work.dynamic);
+                    bytes
+                };
+                tile.tile.morph_offsets = work.offsets;
+                tile.morph_source = pending.source_id;
+                self.metrics.uploads += 1;
+                self.metrics.upload_bytes += bytes as u64;
+                pending.cursor += 1;
+                break;
             }
-            smooth_mesh_normals(&mut meshes);
-            for (index, mesh) in indices.into_iter().zip(meshes) {
-                self.tiles[index].1 = GpuMesh::upload(&self.device, &self.queue, &mesh);
+            let elapsed = (js_now() - begin) * 1000.0;
+            self.metrics.last_prepare_ms = elapsed;
+            self.metrics.max_prepare_ms = self.metrics.max_prepare_ms.max(elapsed);
+            if pending.cursor == pending.keys.len() {
+                if !pending.same_level {
+                    self.morph_start = f64::from(js_now() as f32);
+                    for key in &pending.keys {
+                        self.tiles[self.tile_lookup[key]].tile.morph_start = self.morph_start;
+                    }
+                }
+                self.active_set = pending.keys.iter().copied().collect();
+                self.active_keys = pending.keys;
+                self.cut_visible = true;
+                self.cut_serial = self.cut_serial.wrapping_add(1);
+                self.metrics.cut_commits += 1;
+                self.evict_cache();
+            } else {
+                self.pending = Some(pending);
             }
-            self.active_set = next.iter().copied().collect();
-            self.active_keys = next;
         }
 
         fn render(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -1336,7 +2126,9 @@ mod browser {
                 self.config.height = height;
                 self.surface.configure(&self.device, &self.config);
                 self.depth = depth_texture(&self.device, width, height);
+                self.cut_dirty = true;
             }
+            let frame_begin = js_now();
             self.refresh_cut();
             let dir = self.direction();
             let time = js_now() as f32;
@@ -1373,7 +2165,7 @@ mod browser {
                 light: inspection_light(dir, self.altitude).extend(time).to_array(),
                 options: [
                     self.mode,
-                    0.0,
+                    self.morph_start as f32,
                     if self.show_rivers { 1.0 } else { 0.0 },
                     if self.show_human { 1.0 } else { 0.0 },
                 ],
@@ -1429,22 +2221,31 @@ mod browser {
                 for mesh in self
                     .globe
                     .iter()
-                    .filter(|_| self.active_keys.is_empty())
+                    .filter(|_| !self.cut_visible)
                     .chain(
-                        self.tiles
+                        self.active_keys
                             .iter()
-                            .filter(|(key, _, _)| self.active_keys.contains(key))
-                            .map(|(_, mesh, _)| mesh),
+                            .filter(|_| self.cut_visible)
+                            .filter_map(|key| {
+                                self.tile_lookup
+                                    .get(key)
+                                    .and_then(|&i| self.tiles[i].gpu.as_ref())
+                            }),
                     )
                     .chain(self.objects.iter())
                 {
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_vertex_buffer(1, mesh.dynamic_buffer.slice(..));
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.count, 0, 0..1);
                 }
             }
             self.queue.submit(Some(encoder.finish()));
             output.present();
+            self.metrics.max_render_ms = self
+                .metrics
+                .max_render_ms
+                .max((js_now() - frame_begin) * 1000.0);
             Ok(())
         }
     }
@@ -1547,7 +2348,9 @@ mod browser {
             label: Some("planet shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x3, 7 => Float32x3];
+        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
+        let dynamic_attributes =
+            wgpu::vertex_attr_array![5 => Float32x4, 6 => Float32x3, 7 => Float32x3];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("planet"),
             layout: Some(&pipeline_layout),
@@ -1555,11 +2358,18 @@ mod browser {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attributes,
-                }],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<DynamicVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &dynamic_attributes,
+                    },
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -1610,6 +2420,14 @@ mod browser {
                 globe: None,
                 base_surfaces: [Vec::new(), Vec::new()],
                 tiles: Vec::new(),
+                pending: None,
+                cut_dirty: true,
+                cut_visible: false,
+                signature: None,
+                cut_serial: 1,
+                morph_start: 0.0,
+                tick: 0,
+                metrics: RenderMetrics::default(),
                 tile_lookup: HashMap::new(),
                 active_keys: Vec::new(),
                 active_set: HashSet::new(),
@@ -1650,99 +2468,113 @@ mod browser {
             renderer.globe = Some(GpuMesh::upload(&renderer.device, &renderer.queue, &mesh));
             renderer.base_surfaces = mesh_surfaces(&mesh, world.mesh_resolution());
             renderer.world = Some(world);
+            renderer.clear_cut();
             renderer.tiles.clear();
             renderer.tile_lookup.clear();
-            renderer.clear_cut();
+            renderer.cut_dirty = true;
+            renderer.signature = None;
+            renderer.metrics = RenderMetrics::default();
             renderer.objects = None;
             Ok(())
         })
     }
 
     #[wasm_bindgen]
+    pub fn prepare_tile_binary(
+        bytes: &[u8],
+        radius_m: f64,
+        exaggeration: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let tile = world_core::tile_wire::decode_tile(bytes)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        prepare_tile(from_core_tile(tile), radius_m, exaggeration)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+    #[wasm_bindgen]
+    pub fn prepare_tile_json(
+        json: &str,
+        radius_m: f64,
+        exaggeration: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let tile = decode_json_tile(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        prepare_tile(tile, radius_m, exaggeration).map_err(|e| JsValue::from_str(&e))
+    }
+    #[wasm_bindgen]
+    pub fn install_prepared_tile(bytes: &[u8]) -> Result<String, JsValue> {
+        let prepared = decode_prepared_tile(bytes).map_err(|e| JsValue::from_str(&e))?;
+        install_prepared(prepared)
+    }
+    #[wasm_bindgen]
     pub fn set_tile(json: &str) -> Result<String, JsValue> {
         let tile = decode_json_tile(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
         install_tile(tile)
     }
-
     #[wasm_bindgen]
     pub fn add_tile_binary(bytes: &[u8]) -> Result<String, JsValue> {
         let tile = world_core::tile_wire::decode_tile(bytes)
-            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         install_tile(from_core_tile(tile))
     }
-
-    fn install_tile(mut tile: Tile) -> Result<String, JsValue> {
+    fn install_tile(tile: Tile) -> Result<String, JsValue> {
+        let (radius, exaggeration) = RENDERER
+            .with(|state| {
+                state.borrow().as_ref().and_then(|r| {
+                    r.world
+                        .as_ref()
+                        .map(|w| (w.config.radius_m, r.exaggeration))
+                })
+            })
+            .ok_or("Monde absent")?;
+        let bytes = prepare_tile(tile, radius, exaggeration).map_err(|e| JsValue::from_str(&e))?;
+        install_prepared_tile(&bytes)
+    }
+    fn install_prepared(prepared: PreparedTile) -> Result<String, JsValue> {
         RENDERER.with(|state| {
             let mut state = state.borrow_mut();
-            let renderer = state.as_mut().ok_or("Visualiseur absent")?;
-            renderer.world.as_ref().ok_or("Monde absent")?;
-            if renderer.tile_lookup.contains_key(&tile.key) {
-                return serde_json::to_string(
-                    &renderer
-                        .tiles
+            let r = state.as_mut().ok_or("Visualiseur absent")?;
+            let world = r.world.as_ref().ok_or("Monde absent")?;
+            if prepared.radius != world.config.radius_m || prepared.exaggeration != r.exaggeration {
+                return Err(JsValue::from_str("Préparation périmée"));
+            }
+            let key = prepared.tile.key;
+            if !r.tile_lookup.contains_key(&key) {
+                let cpu_base = prepared.tile.vertices.capacity() * std::mem::size_of::<Sample>()
+                    + prepared
+                        .tile
+                        .vertices
                         .iter()
-                        .map(|(key, _, _)| key)
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|error| JsValue::from_str(&error.to_string()));
+                        .map(|s| s.biome.capacity())
+                        .sum::<usize>()
+                    + prepared.tile.indices.capacity() * 4
+                    + prepared.borders.capacity() * std::mem::size_of::<BorderNormal>();
+                r.tiles.push(CachedTile {
+                    key,
+                    tile: prepared.tile,
+                    prepared: Some(prepared.mesh),
+                    borders: prepared.borders,
+                    gpu: None,
+                    last_used: r.tick,
+                    cpu_base,
+                    morph_source: 0,
+                });
+                r.rebuild_lookup();
+                r.cut_dirty = true;
+                r.metrics.mesh_builds += 1;
+                r.evict_cache();
             }
-            if tile.vertices.is_empty()
-                || tile
-                    .indices
-                    .iter()
-                    .any(|&index| index as usize >= tile.vertices.len())
-            {
-                return Err(JsValue::from_str("Indices de tuile invalides"));
-            }
-            tile.morph_offsets.clear();
-            if let Some(index) = renderer
-                .tiles
-                .iter()
-                .position(|(key, _, _)| *key == tile.key)
-            {
-                renderer.tiles.remove(index);
-            }
-            if renderer.tiles.len() == 320 {
-                let desired = renderer.requests();
-                let remove = renderer
-                    .tiles
-                    .iter()
-                    .position(|(key, _, _)| {
-                        !renderer.active_set.contains(key) && !desired.contains(key)
-                    })
-                    .or_else(|| {
-                        renderer
-                            .tiles
-                            .iter()
-                            .position(|(key, _, _)| !renderer.active_set.contains(key))
-                    })
-                    .unwrap_or(0);
-                renderer.tiles.remove(remove);
-            }
-            renderer.tiles.push((
-                tile.key,
-                GpuMesh::upload(&renderer.device, &renderer.queue, &Mesh::default()),
-                tile,
-            ));
-            renderer.rebuild_lookup();
-            serde_json::to_string(
-                &renderer
-                    .tiles
-                    .iter()
-                    .map(|(key, _, _)| key)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|error| JsValue::from_str(&error.to_string()))
+            serde_json::to_string(&r.tiles.iter().map(|tile| tile.key).collect::<Vec<_>>())
+                .map_err(|e| JsValue::from_str(&e.to_string()))
         })
     }
-
     #[wasm_bindgen]
     pub fn clear_tiles() {
         RENDERER.with(|state| {
             if let Some(r) = state.borrow_mut().as_mut() {
+                r.clear_cut();
                 r.tiles.clear();
                 r.tile_lookup.clear();
-                r.clear_cut();
+                r.cut_dirty = true;
+                r.signature = None;
             }
         });
     }
@@ -1896,11 +2728,11 @@ mod browser {
                 r.base_surfaces = mesh_surfaces(&mesh, world.mesh_resolution());
                 r.globe = Some(GpuMesh::upload(&r.device, &r.queue, &mesh));
             }
-            for (_, gpu, tile) in &mut r.tiles {
-                tile.morph_offsets.clear();
-                *gpu = GpuMesh::upload(&r.device, &r.queue, &Mesh::default());
-            }
             r.clear_cut();
+            r.tiles.clear();
+            r.tile_lookup.clear();
+            r.cut_dirty = true;
+            r.signature = None;
             rebuild_objects(r);
             Ok(())
         })
@@ -1918,7 +2750,10 @@ mod browser {
             let x = (((u + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
             let y = (((v + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
             let requests = r.requests();
-            serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level": r.active_keys.first().map(|key|key.level), "active_tiles": r.active_keys.len(), "requests": requests }).to_string()
+            serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level": r.active_keys.first().map(|key|key.level), "active_tiles": r.active_keys.len(), "draw_tiles": if r.cut_visible {r.active_keys.len()}else{0},
+                "cpu_bytes":r.cache_bytes().0,"gpu_bytes":r.cache_bytes().1,"cpu_budget_bytes":768*1024*1024u64,"gpu_budget_bytes":768*1024*1024u64,
+                "pending_tiles":r.pending.as_ref().map_or(0,|p|p.keys.len()-p.cursor),"mesh_builds":r.metrics.mesh_builds,"uploads":r.metrics.uploads,"upload_bytes":r.metrics.upload_bytes,
+                "cut_commits":r.metrics.cut_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"requests": requests }).to_string()
         })
     }
 }
@@ -1929,6 +2764,126 @@ pub use browser::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_test_tile() -> Tile {
+        let side = 9;
+        let key = TileKey {
+            face: 4,
+            level: 6,
+            x: 30,
+            y: 30,
+        };
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        for y in 0..side {
+            for x in 0..side {
+                let u = 2.0 * (key.x as f64 + x as f64 / (side - 1) as f64) / 64.0 - 1.0;
+                let v = 2.0 * (key.y as f64 + y as f64 / (side - 1) as f64) / 64.0 - 1.0;
+                let height = (x as f64 - 4.0) * 0.7 + (y as f64 * 0.31).sin();
+                vertices.push(Sample {
+                    direction: DVec3::new(u, v, 1.0).normalize().to_array(),
+                    height_m: height,
+                    water_m: height.max(0.0),
+                    water_level_m: Some(0.0),
+                    water_body_id: Some(0),
+                    ocean: height < 0.0,
+                    biome: "Forest".into(),
+                    biome_mix: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                });
+            }
+        }
+        for y in 0..side - 1 {
+            for x in 0..side - 1 {
+                let a = (y * side + x) as u32;
+                let b = a + 1;
+                let c = a + side as u32;
+                let d = c + 1;
+                indices.extend([a, b, d, a, d, c]);
+            }
+        }
+        Tile {
+            key,
+            vertices,
+            indices,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn worker_packet_preserves_every_rendered_triangle_and_collision_sample() {
+        let tile = prepared_test_tile();
+        let expected = tile_mesh(&tile, 1_737_000.0, 1.0).unwrap();
+        let packet = prepare_tile(tile, 1_737_000.0, 1.0).unwrap();
+        let decoded = decode_prepared_tile(&packet).unwrap();
+        assert_eq!(decoded.mesh.indices.len(), expected.indices.len());
+        for (&a, &b) in expected.indices.iter().zip(&decoded.mesh.indices) {
+            assert_eq!(
+                bytemuck::bytes_of(&expected.vertices[a as usize]),
+                bytemuck::bytes_of(&decoded.mesh.vertices[b as usize])
+            );
+        }
+        let again = prepared_test_tile();
+        for (a, b) in again.vertices.iter().zip(&decoded.tile.vertices) {
+            assert_eq!(a.direction, b.direction);
+            assert_eq!(a.height_m, b.height_m);
+            assert_eq!(a.water_level_m, b.water_level_m);
+        }
+        assert_eq!(again.indices, decoded.tile.indices);
+        assert!(decoded.mesh.vertices.len() < expected.vertices.len());
+        assert!(decode_prepared_tile(&packet[..packet.len() - 1]).is_err());
+        let mut extra = packet;
+        extra.push(0);
+        assert!(decode_prepared_tile(&extra).is_err());
+    }
+    #[test]
+    fn border_normal_lookup_uses_original_direction_not_gpu_roundtrip() {
+        let direction = DVec3::new(0.1234567800015, 0.5, 0.8571805081029673);
+        let sample = Sample {
+            direction: direction.to_array(),
+            height_m: 0.00123456789,
+            ..Default::default()
+        };
+        let gpu_vertex = vertex(&sample, 1.0, 1.0, false);
+        let reconstructed = mesh_point(&gpu_vertex).normalize();
+        let canonical = normal_key(DVec3::from_array(sample.direction));
+        assert_ne!(canonical, normal_key(reconstructed));
+        let normals = HashMap::from([(canonical, [0.0, 0.0, 1.0])]);
+        assert_eq!(
+            normals.get(&normal_key(DVec3::from_array(sample.direction))),
+            Some(&[0.0, 0.0, 1.0])
+        );
+        assert!(normals.get(&normal_key(reconstructed)).is_none());
+    }
+
+    #[test]
+    fn indexed_normals_match_the_previous_single_tile_smoother() {
+        let tile = prepared_test_tile();
+        let mut mesh = tile_mesh(&tile, 1_737_000.0, 1.0).unwrap();
+        let normals: Vec<_> = mesh.vertices.iter().map(|v| v.shading_normal).collect();
+        smooth_mesh_normals(std::slice::from_mut(&mut mesh));
+        for (v, old) in mesh.vertices.iter().zip(normals) {
+            assert!((Vec3::from_array(v.shading_normal) - Vec3::from_array(old)).length() < 1e-6);
+        }
+    }
+    #[test]
+    fn parent_surface_query_matches_the_exact_collision_triangle() {
+        let tile = prepared_test_tile();
+        let mesh = tile_mesh(&tile, 1_737_000.0, 1.0).unwrap();
+        for i in [0, 5, 17, 40, 79, 80] {
+            let dir = DVec3::from_array(tile.vertices[i].direction);
+            let expected =
+                surface_radius(dir, tile.key, 9, |j| mesh_point(&mesh.vertices[j])).unwrap();
+            let hit = surface_query(dir, tile.key, 9, |j| {
+                (
+                    mesh_point(&mesh.vertices[j]),
+                    mesh.vertices[j].shading_normal,
+                )
+            })
+            .unwrap();
+            assert!((expected - hit.0).abs() < 1e-13);
+            assert!(Vec3::from_array(hit.1).is_finite());
+        }
+    }
 
     #[test]
     fn canonical_cube_corners_are_shared_by_three_faces() {

@@ -5,6 +5,7 @@
 use crate::{geometry, noise, Biome, Sample, Tile, TileKey, World};
 use anyhow::{bail, Result};
 use geometry::{direction, dot, normalize, FACE_BASES};
+use rayon::prelude::*;
 
 const RIVER_ID_BASE: u64 = 1_u64 << 52;
 
@@ -205,17 +206,24 @@ impl World {
         if key.x >= count || key.y >= count || !(2..=256).contains(&segments) {
             bail!("invalid tile coordinates or segments (2..=256)");
         }
-        let mut vertices = Vec::with_capacity(((segments + 1) * (segments + 1)) as usize);
-        for y in 0..=segments {
-            for x in 0..=segments {
-                let denominator = f64::from(count) * f64::from(segments);
-                let u = 2.0 * (f64::from(key.x) * f64::from(segments) + f64::from(x)) / denominator
-                    - 1.0;
-                let v = 2.0 * (f64::from(key.y) * f64::from(segments) + f64::from(y)) / denominator
-                    - 1.0;
-                vertices.push(self.sample(direction(key.face, u, v)));
-            }
-        }
+        let side = (segments + 1) as usize;
+        let sample_at = |index: usize| {
+            let x = (index % side) as u32;
+            let y = (index / side) as u32;
+            let denominator = f64::from(count) * f64::from(segments);
+            let u =
+                2.0 * (f64::from(key.x) * f64::from(segments) + f64::from(x)) / denominator - 1.0;
+            let v =
+                2.0 * (f64::from(key.y) * f64::from(segments) + f64::from(y)) / denominator - 1.0;
+            self.sample(direction(key.face, u, v))
+        };
+        // Indexed collection preserves the exact row-major order and each
+        // point's arithmetic. Small tiles avoid thread scheduling overhead.
+        let vertices = if segments >= 64 {
+            (0..side * side).into_par_iter().map(sample_at).collect()
+        } else {
+            (0..side * side).map(sample_at).collect()
+        };
         let mut indices = Vec::with_capacity((segments * segments * 6) as usize);
         for y in 0..segments {
             for x in 0..segments {
@@ -703,6 +711,72 @@ mod tests {
                 assert_eq!(s.height_m.is_sign_positive(), c.height_m.is_sign_positive());
             }
         }
+    }
+
+    #[test]
+    fn coastal_tiles_preserve_samples_across_threads_levels_and_request_order() {
+        let mut world = synthetic();
+        world.config.detail_m = 140.0;
+        let coast = direction(5, -19.0 / 128.0, 45.0 / 128.0);
+        for cell in &mut world.cells {
+            cell.height_m = (1200.0 * (cell.position[0] - coast[0])) as f32;
+            cell.ocean = cell.height_m <= 0.0;
+            cell.water_m = if cell.ocean { 0.0 } else { cell.height_m };
+            cell.biome = if cell.ocean {
+                Biome::Ocean
+            } else {
+                Biome::Grassland
+            };
+        }
+        let parent_key = TileKey {
+            face: 5,
+            level: 8,
+            x: 109,
+            y: 173,
+        };
+        let child_key = TileKey {
+            face: 5,
+            level: 10,
+            x: 436,
+            y: 692,
+        };
+        let fine_key = TileKey {
+            face: 5,
+            level: 14,
+            x: 6978,
+            y: 11074,
+        };
+        let serial_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let parent = serial_pool.install(|| world.tile(parent_key, 64).unwrap());
+        let (fine, child) = parallel_pool.install(|| {
+            rayon::join(
+                || world.tile(fine_key, 64).unwrap(),
+                || world.tile(child_key, 64).unwrap(),
+            )
+        });
+        let encode = |sample: &Sample| serde_json::to_vec(sample).unwrap();
+        assert_eq!(encode(&parent.vertices[0]), encode(&world.sample(coast)));
+        assert_eq!(encode(&parent.vertices[0]), encode(&child.vertices[0]));
+        assert_eq!(
+            encode(&parent.vertices[2 * 65 + 2]),
+            encode(&child.vertices[8 * 65 + 8])
+        );
+        assert_eq!(
+            encode(&parent.vertices[2 * 65 + 2]),
+            encode(&fine.vertices[0])
+        );
+        let again = parallel_pool.install(|| world.tile(parent_key, 64).unwrap());
+        assert_eq!(
+            serde_json::to_vec(&parent).unwrap(),
+            serde_json::to_vec(&again).unwrap()
+        );
     }
 
     #[test]

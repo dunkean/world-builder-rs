@@ -30,7 +30,7 @@ struct VertexOut {
 };
 @vertex fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let progress = smoothstep(0.0, 0.35, scene.light.w - v.morph.y);
+    let progress = smoothstep(0.0, 0.35, scene.light.w - scene.options.y);
     let relative = (v.position - scene.eye.xyz) + (v.position_low - scene.eye_low.xyz) + v.normal_height.xyz * v.morph.x * (1.0 - progress);
     out.clip = scene.view_projection * vec4<f32>(relative, 1.0);
     out.position = relative;
@@ -70,10 +70,6 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     } else {
         if p.z > 0.0 { face = 4u; uv = vec2<f32>(p.x, p.y) / p.z; }
         else { face = 5u; uv = vec2<f32>(-p.x, p.y) / -p.z; }
-    }
-    for (var i = 0u; i < u32(scene.options.y); i += 1u) {
-        let clip = scene.clips[i];
-        if u32(clip.face_level.x) == face && clip.face_level.y > lod && uv.x > clip.bounds.x && uv.x < clip.bounds.z && uv.y > clip.bounds.y && uv.y < clip.bounds.w { discard; }
     }
     if water && v.fields.w <= 0.01 { discard; }
     var color = v.color.rgb;

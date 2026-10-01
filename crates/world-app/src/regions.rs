@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 use world_core::{
     geometry::{direction, dot},
@@ -17,7 +20,7 @@ use world_erosion::{erode, Backend, ErosionConfig, ErosionReport, HeightField};
 const REGION_LEVELS: [u8; 2] = [6, 10];
 const SEGMENTS: u32 = 128;
 const HALO: u32 = 8;
-const VERSION: &str = "regional-finite-volume-2-multiscale6";
+pub const VERSION: &str = "regional-finite-volume-2-multiscale6";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Artifact {
@@ -32,8 +35,37 @@ pub struct Artifact {
 struct Cache {
     entries: HashMap<String, Arc<Artifact>>,
     order: VecDeque<String>,
+    flights: HashMap<String, Weak<Mutex<()>>>,
 }
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+#[derive(Default)]
+struct Metrics {
+    hits: AtomicU64,
+    disk_reads: AtomicU64,
+    builds: AtomicU64,
+    wait_us: AtomicU64,
+    build_us: AtomicU64,
+}
+static METRICS: OnceLock<Metrics> = OnceLock::new();
+
+pub fn performance() -> serde_json::Value {
+    let metrics = METRICS.get_or_init(Default::default);
+    let cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    serde_json::json!({"entries":cache.entries.len(),"capacity_entries":128,
+        "memory_hits":metrics.hits.load(Ordering::Relaxed),"disk_reads":metrics.disk_reads.load(Ordering::Relaxed),
+        "builds":metrics.builds.load(Ordering::Relaxed),"wait_ms":metrics.wait_us.load(Ordering::Relaxed) as f64/1000.0,
+        "build_ms":metrics.build_us.load(Ordering::Relaxed) as f64/1000.0})
+}
+
+impl Cache {
+    fn get(&mut self, key: &str) -> Option<Arc<Artifact>> {
+        let artifact = self.entries.get(key)?.clone();
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_owned());
+        Some(artifact)
+    }
+}
 
 pub fn compile_tile(data: &Path, world: &World, key: TileKey, segments: u32) -> Result<Tile> {
     // Lower levels omit this fine residual, as they omit subpixel relief. The
@@ -256,17 +288,54 @@ pub fn reports(data: &Path, world: &World) -> Result<Vec<ErosionReport>> {
 
 fn get(data: &Path, world: &World, key: TileKey, parents: &[RegionPatch]) -> Result<Arc<Artifact>> {
     let cache_key = format!(
-        "{}/{}/{}/{}/{}",
-        world.id, key.face, key.level, key.x, key.y
+        "{}/{}/{}/{}/{}/{}/{}",
+        data.display(),
+        VERSION,
+        world.id,
+        key.face,
+        key.level,
+        key.x,
+        key.y
     );
-    // Serialize patch construction; this also avoids duplicate CUDA work and
-    // competing writes when adjacent children arrive together.
-    let mut cache = CACHE
-        .get_or_init(Default::default)
+    let metrics = METRICS.get_or_init(Default::default);
+    let cache = CACHE.get_or_init(Default::default);
+    let gate = {
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("region cache poisoned"))?;
+        if let Some(a) = cache.get(&cache_key) {
+            metrics.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(a);
+        }
+        if cache.flights.len() > 512 {
+            cache.flights.retain(|_, gate| gate.strong_count() != 0);
+        }
+        if let Some(gate) = cache.flights.get(&cache_key).and_then(Weak::upgrade) {
+            gate
+        } else {
+            let gate = Arc::new(Mutex::new(()));
+            cache
+                .flights
+                .insert(cache_key.clone(), Arc::downgrade(&gate));
+            gate
+        }
+    };
+    // Wait only for this geographic region. A cold calculation must not block
+    // cache hits or independent regions elsewhere in the planet.
+    let waiting = std::time::Instant::now();
+    let _flight = gate
         .lock()
-        .map_err(|_| anyhow::anyhow!("region cache poisoned"))?;
-    if let Some(a) = cache.entries.get(&cache_key) {
-        return Ok(a.clone());
+        .map_err(|_| anyhow::anyhow!("region computation poisoned"))?;
+    metrics
+        .wait_us
+        .fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if let Some(a) = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("region cache poisoned"))?
+        .get(&cache_key)
+    {
+        metrics.hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(a);
     }
     let path = data
         .join("worlds")
@@ -278,9 +347,15 @@ fn get(data: &Path, world: &World, key: TileKey, parents: &[RegionPatch]) -> Res
             key.face, key.level, key.x, key.y
         ));
     let artifact = if path.exists() {
+        metrics.disk_reads.fetch_add(1, Ordering::Relaxed);
         read(&path, world)?
     } else {
+        let started = std::time::Instant::now();
+        metrics.builds.fetch_add(1, Ordering::Relaxed);
         let artifact = build(world, key, parents)?;
+        metrics
+            .build_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         std::fs::create_dir_all(path.parent().unwrap())?;
         let bytes = serde_json::to_vec(&artifact)?;
         // Reports enumerate JSON files; publish that file only after its
@@ -295,6 +370,9 @@ fn get(data: &Path, world: &World, key: TileKey, parents: &[RegionPatch]) -> Res
         artifact
     };
     let artifact = Arc::new(artifact);
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("region cache poisoned"))?;
     cache.entries.insert(cache_key.clone(), artifact.clone());
     cache.order.push_back(cache_key);
     while cache.entries.len() > 128 {
