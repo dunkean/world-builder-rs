@@ -2,7 +2,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, Vec3};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const BASES: [[[i32; 3]; 3]; 6] = [
     [[1, 0, 0], [0, 0, -1], [0, 1, 0]],
@@ -12,6 +12,8 @@ const BASES: [[[i32; 3]; 3]; 6] = [
     [[0, 0, 1], [1, 0, 0], [0, 1, 0]],
     [[0, 0, -1], [-1, 0, 0], [0, 1, 0]],
 ];
+
+const RIVER_BODY: u64 = 1 << 52;
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -26,6 +28,9 @@ struct Sample {
     direction: [f64; 3],
     height_m: f64,
     water_m: f64,
+    water_level_m: Option<f64>,
+    #[serde(alias = "lake_id")]
+    water_body_id: Option<u64>,
     temperature_c: f64,
     moisture: f64,
     discharge: f64,
@@ -39,10 +44,20 @@ struct Sample {
 #[derive(Deserialize)]
 struct World {
     config: Config,
+    #[serde(default)]
+    render_resolution: Option<usize>,
     cells: Vec<Sample>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+impl World {
+    fn mesh_resolution(&self) -> usize {
+        self.render_resolution.unwrap_or(self.config.resolution)
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 struct TileKey {
     face: u8,
     level: u8,
@@ -60,6 +75,46 @@ struct Tile {
     morph_offsets: Vec<[f64; 3]>,
     #[serde(skip)]
     morph_start: f64,
+}
+
+fn from_core_tile(tile: world_core::Tile) -> Tile {
+    Tile {
+        key: TileKey {
+            face: tile.key.face,
+            level: tile.key.level,
+            x: tile.key.x,
+            y: tile.key.y,
+        },
+        vertices: tile
+            .vertices
+            .into_iter()
+            .map(|s| Sample {
+                direction: s.direction,
+                height_m: f64::from(s.height_m),
+                water_m: f64::from(s.water_m),
+                water_level_m: s.water_level_m.map(f64::from),
+                water_body_id: s.water_body_id,
+                temperature_c: f64::from(s.temperature_c),
+                moisture: f64::from(s.moisture),
+                discharge: f64::from(s.discharge),
+                river: f64::from(s.river),
+                biome: format!("{:?}", s.biome),
+                biome_mix: s.biome_mix.map(f64::from),
+                ocean: s.ocean,
+                lake: s.lake,
+            })
+            .collect(),
+        indices: tile.indices,
+        ..Default::default()
+    }
+}
+
+fn decode_json_tile(json: &str) -> Result<Tile, serde_json::Error> {
+    // Restore native f32 field values before promoting them. Direct f64 parsing of
+    // decimal f32 JSON can shift intersections along nearly horizontal shores.
+    serde_json::from_str::<world_core::Tile>(json)
+        .map(from_core_tile)
+        .or_else(|_| serde_json::from_str(json))
 }
 
 #[derive(Default, Deserialize)]
@@ -135,7 +190,7 @@ fn biome_color(biome: &str) -> [f32; 3] {
 fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Vertex {
     let direction = DVec3::from_array(sample.direction).normalize();
     let height = if water {
-        sample.water_m
+        water_height(sample)
     } else {
         sample.height_m
     };
@@ -149,7 +204,7 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
             [0.06, 0.37, 0.45]
         }
     } else {
-        let weight: f64 = sample.biome_mix.iter().sum();
+        let weight: f64 = sample.biome_mix[2..].iter().sum();
         if weight > 0.0 {
             let names = [
                 "Ocean",
@@ -164,7 +219,7 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
                 "Rock",
             ];
             let mut result = [0.0; 3];
-            for (name, amount) in names.into_iter().zip(sample.biome_mix) {
+            for (name, amount) in names.into_iter().zip(sample.biome_mix).skip(2) {
                 let c = biome_color(name);
                 for i in 0..3 {
                     result[i] += c[i] * (amount / weight) as f32;
@@ -172,7 +227,11 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
             }
             result
         } else {
-            biome_color(&sample.biome)
+            if sample.biome == "Ocean" || sample.biome == "Lake" {
+                biome_color("Wetland")
+            } else {
+                biome_color(&sample.biome)
+            }
         }
     };
     let river = if sample.river > 0.0 {
@@ -196,9 +255,14 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
             sample.temperature_c as f32,
             sample.moisture as f32,
             river as f32,
-            (sample.water_m - sample.height_m) as f32,
+            (water_height(sample) - sample.height_m) as f32,
         ],
-        morph: [0.0, 0.0, (sample.water_m - sample.height_m) as f32, 0.0],
+        morph: [
+            0.0,
+            0.0,
+            (water_height(sample) - sample.height_m) as f32,
+            0.0,
+        ],
         shading_normal: direction.as_vec3().to_array(),
         parent_normal: direction.as_vec3().to_array(),
     }
@@ -211,127 +275,353 @@ fn cube_key(face: usize, x: usize, y: usize, resolution: usize) -> [i32; 3] {
     std::array::from_fn(|i| n[i] * resolution as i32 + u[i] * a + v[i] * b)
 }
 
-#[derive(Default)]
-struct Average {
-    count: f64,
-    height: f64,
-    water: f64,
-    temperature: f64,
-    moisture: f64,
-    river: f64,
-    color: [f64; 3],
-    ocean: bool,
+/// A hydraulic level is independent of the bed, including the dry bank samples.
+fn water_body(sample: &Sample) -> Option<(u64, f64)> {
+    if let Some(level) = sample.water_level_m.filter(|level| level.is_finite()) {
+        return Some((
+            sample.water_body_id.unwrap_or(u64::from(!sample.ocean)),
+            level,
+        ));
+    }
+    if sample.ocean {
+        Some((0, 0.0))
+    } else if sample.lake {
+        Some((sample.water_body_id.unwrap_or(1), sample.water_m))
+    } else {
+        None
+    }
 }
 
-/// Shared cube-vertex keys ensure all six faces use exactly the same boundary geometry.
+fn water_height(sample: &Sample) -> f64 {
+    water_body(sample).map_or(sample.height_m, |(_, level)| level)
+}
+
+/// Sample the preview atlas at cube vertices without deriving a mesh from its cell polygons.
+fn atlas_sample(world: &World, direction: DVec3) -> Sample {
+    let n = world.mesh_resolution();
+    let mut sample = Sample {
+        direction: direction.to_array(),
+        ..Default::default()
+    };
+    let mut candidates = Vec::with_capacity(12);
+    let mut total = 0.0;
+    for (face, basis) in BASES.iter().enumerate() {
+        let vec = |a: [i32; 3]| DVec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+        let plane = direction.dot(vec(basis[0]));
+        if plane <= 0.0 {
+            continue;
+        }
+        let u = direction.dot(vec(basis[1])) / plane;
+        let v = direction.dot(vec(basis[2])) / plane;
+        let support = (1.0 + 1.0 / n as f64 - u.abs().max(v.abs())).max(0.0);
+        if support == 0.0 {
+            continue;
+        }
+        let x = ((u + 1.0) * 0.5 * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
+        let y = ((v + 1.0) * 0.5 * n as f64 - 0.5).clamp(0.0, (n - 1) as f64);
+        let ix = x.floor() as usize;
+        let iy = y.floor() as usize;
+        let tx = x - ix as f64;
+        let ty = y - iy as f64;
+        for (dx, dy, w) in [
+            (0, 0, (1.0 - tx) * (1.0 - ty)),
+            (1, 0, tx * (1.0 - ty)),
+            (0, 1, (1.0 - tx) * ty),
+            (1, 1, tx * ty),
+        ] {
+            let i = face * n * n + (iy + dy).min(n - 1) * n + (ix + dx).min(n - 1);
+            candidates.push((i, w * support));
+            total += w * support;
+        }
+    }
+    let mut bodies: HashMap<u64, (f64, f64)> = HashMap::new();
+    let mut selected = (0.0, 0usize);
+    let names = [
+        "Ocean",
+        "Lake",
+        "Ice",
+        "Tundra",
+        "Desert",
+        "Grassland",
+        "Forest",
+        "Rainforest",
+        "Wetland",
+        "Rock",
+    ];
+    for (i, raw) in candidates {
+        let w = raw / total;
+        let cell = &world.cells[i];
+        sample.height_m += w * cell.height_m;
+        sample.temperature_c += w * cell.temperature_c;
+        sample.moisture += w * cell.moisture;
+        sample.discharge += w * cell.discharge;
+        sample.river += w * cell.river;
+        if cell.biome_mix.iter().sum::<f64>() > 0.0 {
+            for j in 0..10 {
+                sample.biome_mix[j] += w * cell.biome_mix[j];
+            }
+        } else if let Some(j) = names.iter().position(|name| *name == cell.biome) {
+            sample.biome_mix[j] += w;
+        }
+        if let Some((id, level)) = water_body(cell) {
+            // A subcell river profile cannot be expanded into a planetary water plane.
+            // Its real channel geometry is supplied by the streamed tiles.
+            if id < RIVER_BODY {
+                let entry = bodies.entry(id).or_default();
+                entry.0 += w;
+                entry.1 += w * level;
+            }
+        }
+        if w > selected.0 {
+            selected = (w, i);
+        }
+    }
+    sample.biome = world.cells[selected.1].biome.clone();
+    if let Some((id, (weight, levels))) =
+        bodies.into_iter().max_by(|a, b| a.1 .0.total_cmp(&b.1 .0))
+    {
+        let level = levels / weight;
+        sample.water_level_m = Some(level);
+        sample.water_body_id = Some(id);
+        sample.ocean = id == 0 && sample.height_m < level;
+        sample.lake = id != 0 && sample.height_m < level;
+        sample.water_m = sample.height_m.max(level);
+    } else {
+        sample.water_m = sample.height_m;
+    }
+    sample
+}
+
+fn interpolate_water_vertex(
+    a: Vertex,
+    b: Vertex,
+    t: f64,
+    level: f64,
+    radius: f64,
+    exaggeration: f64,
+) -> Vertex {
+    let mut out = a;
+    let mix = |x: f32, y: f32| (x as f64 * (1.0 - t) + y as f64 * t) as f32;
+    for i in 0..4 {
+        out.normal_height[i] = mix(a.normal_height[i], b.normal_height[i]);
+        out.color[i] = mix(a.color[i], b.color[i]);
+        out.fields[i] = mix(a.fields[i], b.fields[i]);
+        out.morph[i] = mix(a.morph[i], b.morph[i]);
+    }
+    let direction_of = |v: Vertex| {
+        (DVec3::from_array(v.position.map(f64::from))
+            + DVec3::from_array(v.position_low.map(f64::from)))
+        .normalize()
+    };
+    let da = direction_of(a);
+    let db = direction_of(b);
+    let direction = da.lerp(db, t).normalize();
+    let position = direction * (1.0 + level * exaggeration / radius);
+    let high = position.as_vec3();
+    out.position = high.to_array();
+    out.position_low = (position - high.as_dvec3()).as_vec3().to_array();
+    for i in 0..3 {
+        out.normal_height[i] = direction[i] as f32;
+    }
+    out.shading_normal = direction.as_vec3().to_array();
+    out.parent_normal = out.shading_normal;
+    out
+}
+
+/// March each terrain triangle against an independent water plane. Dry portions have no
+/// water triangles at all; lake elevations never average in the surrounding dry bed.
+fn append_water_geometry(
+    mesh: &mut Mesh,
+    samples: &[Sample],
+    terrain_indices: &[u32],
+    radius: f64,
+    exaggeration: f64,
+) {
+    let water_start = samples.len() as u32;
+    for triangle in terrain_indices.chunks_exact(3) {
+        let mut bodies: Vec<(u64, f64)> = Vec::new();
+        for &i in triangle {
+            let s = &samples[i as usize];
+            if let Some((id, level)) = water_body(s) {
+                let id = if id >= RIVER_BODY { RIVER_BODY } else { id };
+                if level - s.height_m > 0.005
+                    && (id < RIVER_BODY || s.river > 0.0)
+                    && !bodies.iter().any(|(other, _)| *other == id)
+                {
+                    bodies.push((id, level));
+                }
+            }
+        }
+        for (id, level) in bodies {
+            let flowing = id >= RIVER_BODY;
+            let mut polygon: Vec<(Vertex, f64, f64)> = triangle
+                .iter()
+                .map(|&i| {
+                    let s = &samples[i as usize];
+                    let body = water_body(s);
+                    let local_level = if flowing {
+                        body.filter(|(other, _)| *other >= RIVER_BODY)
+                            .map_or(level, |(_, h)| h)
+                    } else {
+                        level
+                    };
+                    let mut depth = local_level - s.height_m;
+                    if (flowing && (body.is_none() || s.river <= 0.0))
+                        || body.is_some_and(|(other, _)| {
+                            if flowing {
+                                other < RIVER_BODY
+                            } else {
+                                other != id
+                            }
+                        })
+                    {
+                        depth = -depth.abs() - 0.01;
+                    }
+                    let mut v = mesh.vertices[(water_start + i) as usize];
+                    v = interpolate_water_vertex(v, v, 0.0, local_level, radius, exaggeration);
+                    v.morph[2] += depth as f32 - v.fields[3];
+                    v.fields[3] = depth as f32;
+                    v.color[..3].copy_from_slice(if id == 0 {
+                        &[0.045, 0.26, 0.43]
+                    } else {
+                        &[0.06, 0.37, 0.45]
+                    });
+                    (v, depth, local_level)
+                })
+                .collect();
+            if polygon.iter().all(|(_, depth, _)| *depth > 0.005)
+                && triangle.iter().all(|&i| {
+                    if flowing {
+                        water_body(&samples[i as usize])
+                            .is_some_and(|(other, _)| other >= RIVER_BODY)
+                    } else {
+                        (water_height(&samples[i as usize]) - level).abs() < 1e-5
+                    }
+                })
+            {
+                mesh.indices
+                    .extend(triangle.iter().map(|&i| water_start + i));
+                continue;
+            }
+            let original = std::mem::take(&mut polygon);
+            for i in 0..original.len() {
+                let (a, da, la) = original[i];
+                let (b, db, lb) = original[(i + 1) % original.len()];
+                if da > 0.005 {
+                    polygon.push((a, da, la));
+                }
+                if (da > 0.005) != (db > 0.005) {
+                    let t = (da / (da - db)).clamp(0.0, 1.0);
+                    let local_level = la * (1.0 - t) + lb * t;
+                    let mut v =
+                        interpolate_water_vertex(a, b, t, local_level, radius, exaggeration);
+                    v.fields[3] = 0.0;
+                    polygon.push((v, 0.0, local_level));
+                }
+            }
+            if polygon.len() < 3 {
+                continue;
+            }
+            let start = mesh.vertices.len() as u32;
+            mesh.vertices.extend(polygon.iter().map(|(v, _, _)| *v));
+            for i in 1..polygon.len() - 1 {
+                mesh.indices
+                    .extend([start, start + i as u32, start + i as u32 + 1]);
+            }
+        }
+    }
+}
+
+/// The global visual mesh is bounded independently of the physical atlas resolution.
 fn world_mesh(world: &World, exaggeration: f64) -> Result<Mesh, String> {
-    let n = world.config.resolution;
-    if n < 2 || n > 2048 || world.cells.len() != 6 * n * n {
+    let source = world.mesh_resolution();
+    if source < 2 || source > 2048 || world.cells.len() != 6 * source * source {
         return Err("Atlas invalide : six faces de resolution² cellules sont nécessaires".into());
     }
-    let mut shared: HashMap<[i32; 3], Average> = HashMap::new();
+    let n = source.min(128);
+    let mut samples = Vec::with_capacity(6 * (n + 1) * (n + 1));
+    let mut indices = Vec::with_capacity(36 * n * n);
     for face in 0..6 {
+        let start = samples.len() as u32;
+        for y in 0..=n {
+            for x in 0..=n {
+                let key = cube_key(face, x, y, n);
+                let direction = DVec3::new(key[0] as f64, key[1] as f64, key[2] as f64).normalize();
+                samples.push(atlas_sample(world, direction));
+            }
+        }
         for y in 0..n {
             for x in 0..n {
-                let cell = &world.cells[face * n * n + y * n + x];
-                let color = biome_color(&cell.biome);
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    let average = shared.entry(cube_key(face, x + dx, y + dy, n)).or_default();
-                    average.count += 1.0;
-                    average.height += cell.height_m;
-                    average.water += cell.water_m;
-                    average.temperature += cell.temperature_c;
-                    average.moisture += cell.moisture;
-                    average.river = average.river.max(cell.river).max(
-                        if cell.discharge > 1.0 && !cell.ocean && !cell.lake {
-                            (cell.discharge.ln() / 12.0).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        },
-                    );
-                    average.ocean |= cell.ocean;
-                    for i in 0..3 {
-                        average.color[i] += color[i] as f64;
-                    }
-                }
+                let a = start + (y * (n + 1) + x) as u32;
+                let b = a + 1;
+                let c = a + (n + 1) as u32;
+                let d = c + 1;
+                indices.extend([a, b, d, a, d, c]);
             }
         }
     }
-    let mut mesh = Mesh::default();
+    mesh_from_samples(
+        &samples,
+        &indices,
+        0,
+        None,
+        world.config.radius_m,
+        exaggeration,
+    )
+}
+
+fn mesh_from_samples(
+    samples: &[Sample],
+    indices: &[u32],
+    tag: u8,
+    morph: Option<(&[[f64; 3]], f64)>,
+    radius: f64,
+    exaggeration: f64,
+) -> Result<Mesh, String> {
+    if samples.is_empty() || indices.iter().any(|&i| i as usize >= samples.len()) {
+        return Err("Indices de tuile invalides".into());
+    }
+    let mut mesh = Mesh {
+        indices: indices.to_vec(),
+        ..Default::default()
+    };
     for water in [false, true] {
-        for face in 0..6 {
-            let start = mesh.vertices.len() as u32;
-            for y in 0..=n {
-                for x in 0..=n {
-                    let key = cube_key(face, x, y, n);
-                    let a = &shared[&key];
-                    let sample = Sample {
-                        direction: DVec3::new(key[0] as f64, key[1] as f64, key[2] as f64)
-                            .normalize()
-                            .to_array(),
-                        height_m: a.height / a.count,
-                        water_m: a.water / a.count,
-                        temperature_c: a.temperature / a.count,
-                        moisture: a.moisture / a.count,
-                        river: a.river,
-                        ocean: a.ocean,
-                        ..Default::default()
-                    };
-                    let mut v = vertex(&sample, world.config.radius_m, exaggeration, water);
-                    if !water {
-                        for i in 0..3 {
-                            v.color[i] = (a.color[i] / a.count) as f32;
-                        }
+        mesh.vertices
+            .extend(samples.iter().enumerate().map(|(index, s)| {
+                let mut v = vertex(s, radius, exaggeration, water);
+                v.fields[2] = s.river as f32;
+                v.color[3] += 2.0 * f32::from(tag);
+                if let Some((offsets, start)) = morph {
+                    if let Some(offset) = offsets.get(index) {
+                        v.morph = [
+                            if water { 0.0 } else { offset[0] as f32 },
+                            start as f32,
+                            if water {
+                                v.fields[3] - (offset[0] * radius / exaggeration) as f32
+                            } else {
+                                offset[2] as f32
+                            },
+                            0.0,
+                        ];
                     }
-                    mesh.vertices.push(v);
                 }
-            }
-            for y in 0..n {
-                for x in 0..n {
-                    let a = start + (y * (n + 1) + x) as u32;
-                    let b = a + 1;
-                    let c = a + (n + 1) as u32;
-                    let d = c + 1;
-                    mesh.indices.extend([a, b, d, a, d, c]);
-                }
-            }
-        }
+                v
+            }));
     }
+    append_water_geometry(&mut mesh, samples, indices, radius, exaggeration);
     smooth_mesh_normals(std::slice::from_mut(&mut mesh));
     Ok(mesh)
 }
 
 fn tile_mesh(tile: &Tile, radius: f64, exaggeration: f64) -> Result<Mesh, String> {
-    if tile.vertices.is_empty()
-        || tile
-            .indices
-            .iter()
-            .any(|&i| i as usize >= tile.vertices.len())
-    {
-        return Err("Indices de tuile invalides".into());
-    }
-    let mut mesh = Mesh::default();
-    for water in [false, true] {
-        let start = mesh.vertices.len() as u32;
-        mesh.vertices
-            .extend(tile.vertices.iter().enumerate().map(|(index, s)| {
-                let mut v = vertex(s, radius, exaggeration, water);
-                v.fields[2] = s.river as f32;
-                v.color[3] += 2.0 * (f32::from(tile.key.level) + 1.0);
-                if let Some(offsets) = tile.morph_offsets.get(index) {
-                    v.morph = [
-                        offsets[usize::from(water)] as f32,
-                        tile.morph_start as f32,
-                        offsets[2] as f32,
-                        0.0,
-                    ];
-                }
-                v
-            }));
-        mesh.indices.extend(tile.indices.iter().map(|i| start + i));
-    }
-    smooth_mesh_normals(std::slice::from_mut(&mut mesh));
-    Ok(mesh)
+    mesh_from_samples(
+        &tile.vertices,
+        &tile.indices,
+        tile.key.level + 1,
+        Some((&tile.morph_offsets, tile.morph_start)),
+        radius,
+        exaggeration,
+    )
 }
 
 fn face_uv(direction: DVec3) -> (usize, f64, f64) {
@@ -358,7 +648,31 @@ fn morph_progress(time: f64, start: f64) -> f64 {
 }
 
 fn camera_level(altitude: f64) -> u8 {
-    ((1.0 / altitude).log2().floor() as i32).clamp(0, 18) as u8
+    ((1.0 / altitude).log2().floor() as i32 + 2).clamp(0, 18) as u8
+}
+
+/// Close inspection uses a light at 45° to the local surface, including the
+/// planetary night side. Only rendering changes; climate keeps its own forcing.
+fn inspection_light(direction: DVec3, altitude: f64) -> Vec3 {
+    let radial = direction.normalize();
+    let axis = if radial.y.abs() < 0.95 {
+        DVec3::Y
+    } else {
+        DVec3::Z
+    };
+    let north = (axis - radial * axis.dot(radial)).normalize();
+    let east = north.cross(radial).normalize();
+    let tangent = north * 0.8 + east * 0.6;
+    let local = (radial + tangent).normalize();
+    let orbital = DVec3::new(-0.45, 0.80, 0.55).normalize();
+    let t = ((altitude - 0.02) / 0.18).clamp(0.0, 1.0);
+    let weight = t * t * (3.0 - 2.0 * t);
+    let blend = local.lerp(orbital, weight);
+    if blend.length_squared() > 1e-12 {
+        blend.normalize().as_vec3()
+    } else {
+        local.as_vec3()
+    }
 }
 
 fn smooth_mesh_normals(meshes: &mut [Mesh]) {
@@ -391,6 +705,9 @@ fn smooth_mesh_normals(meshes: &mut [Mesh]) {
         let mut shared: HashMap<(bool, [i64; 3]), DVec3> = HashMap::new();
         for mesh in meshes.iter() {
             for triangle in mesh.indices.chunks_exact(3) {
+                if mesh.vertices[triangle[0] as usize].color[3].round() as u32 & 1 != 0 {
+                    continue;
+                }
                 let a = position(&mesh.vertices[triangle[0] as usize], parent);
                 let b = position(&mesh.vertices[triangle[1] as usize], parent);
                 let c = position(&mesh.vertices[triangle[2] as usize], parent);
@@ -407,6 +724,16 @@ fn smooth_mesh_normals(meshes: &mut [Mesh]) {
         }
         for mesh in meshes.iter_mut() {
             for vertex in &mut mesh.vertices {
+                if vertex.color[3].round() as u32 & 1 != 0 {
+                    let normal = [
+                        vertex.normal_height[0],
+                        vertex.normal_height[1],
+                        vertex.normal_height[2],
+                    ];
+                    vertex.shading_normal = normal;
+                    vertex.parent_normal = normal;
+                    continue;
+                }
                 let normal = shared.get(&key(vertex)).copied().unwrap_or(DVec3::ZERO);
                 let normal = if normal.length_squared() > 1e-30 {
                     normal.normalize().as_vec3().to_array()
@@ -479,8 +806,8 @@ fn surface_radius(
     ray_triangle(direction, a, b, d).or_else(|| ray_triangle(direction, a, d, c))
 }
 
-fn mesh_surfaces(mesh: &Mesh) -> [Vec<DVec3>; 2] {
-    let half = mesh.vertices.len() / 2;
+fn mesh_surfaces(mesh: &Mesh, resolution: usize) -> [Vec<DVec3>; 2] {
+    let half = 6 * (resolution.min(128) + 1).pow(2);
     std::array::from_fn(|water| {
         mesh.vertices[water * half..(water + 1) * half]
             .iter()
@@ -492,37 +819,93 @@ fn mesh_surfaces(mesh: &Mesh) -> [Vec<DVec3>; 2] {
     })
 }
 
-fn neighborhood_keys(direction: DVec3, level: u8, aspect: f64) -> Vec<TileKey> {
-    let (face, u, v) = face_uv(direction);
+fn camera_frame(
+    direction: DVec3,
+    altitude: f64,
+    tilt: f64,
+    radius: f64,
+) -> (DVec3, DVec3, DVec3, DVec3) {
+    let north = (DVec3::Y - direction * direction.y).normalize_or_zero();
+    let eye = direction * (radius + altitude) - north * altitude * tilt.tan();
+    let forward = (direction * radius - eye).normalize();
+    let right = forward.cross(DVec3::Y).normalize();
+    let up = right.cross(forward).normalize();
+    (eye, forward, right, up)
+}
+
+/// Project the viewport on the local sphere, then include a one-tile guard band.
+/// Sampling intervals are smaller than a tile; the guard also covers seam slivers
+/// and moderate elevation differences, without requesting a large unused square.
+fn footprint_keys(
+    direction: DVec3,
+    level: u8,
+    aspect: f64,
+    altitude: f64,
+    tilt: f64,
+) -> Vec<TileKey> {
     let count = 1u32 << level;
-    let step = 2.0 / f64::from(count);
-    let cx = (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1);
-    let cy = (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1);
-    let mut keys = Vec::new();
-    let b = BASES[face];
-    let vec = |a: [i32; 3]| DVec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
-    let rings = (1.5 * 22.5f64.to_radians().tan() * aspect.max(1.0))
-        .ceil()
-        .clamp(1.0, 3.0) as i32;
-    let mut offsets: Vec<_> = (-rings..=rings)
-        .flat_map(|y| (-rings..=rings).map(move |x| (x, y)))
-        .collect();
-    offsets.sort_by_key(|&(x, y)| x * x + y * y);
-    for (dx, dy) in offsets {
-        let u = -1.0 + (f64::from(cx) + f64::from(dx) + 0.5) * step;
-        let v = -1.0 + (f64::from(cy) + f64::from(dy) + 0.5) * step;
-        let (f, u, v) = face_uv((vec(b[0]) + vec(b[1]) * u + vec(b[2]) * v).normalize());
-        let key = TileKey {
-            face: f as u8,
+    let (eye, forward, right, up) = camera_frame(direction, altitude, tilt, 1.0);
+    let tangent = 22.5f64.to_radians().tan();
+    let mut hits = HashSet::new();
+    let key_at = |p: DVec3| {
+        let (face, u, v) = face_uv(p);
+        TileKey {
+            face: face as u8,
             level,
             x: (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
             y: (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
-        };
-        if !keys.contains(&key) {
-            keys.push(key);
+        }
+    };
+    for y in 0..=12 {
+        for x in 0..=12 {
+            let ray = (forward
+                + right * ((x as f64 / 6.0 - 1.0) * tangent * aspect)
+                + up * ((y as f64 / 6.0 - 1.0) * tangent))
+                .normalize();
+            let b = eye.dot(ray);
+            let discriminant = b * b - eye.length_squared() + 1.0;
+            if discriminant < 0.0 {
+                continue;
+            }
+            let t = -b - discriminant.sqrt();
+            if t > 0.0 {
+                hits.insert(key_at((eye + ray * t).normalize()));
+            }
         }
     }
+    hits.insert(key_at(direction));
+    let mut guarded = hits.clone();
+    for key in hits {
+        let b = BASES[key.face as usize];
+        let vec = |a: [i32; 3]| DVec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let u = 2.0 * (key.x as f64 + dx as f64 + 0.5) / f64::from(count) - 1.0;
+                let v = 2.0 * (key.y as f64 + dy as f64 + 0.5) / f64::from(count) - 1.0;
+                guarded.insert(key_at(
+                    (vec(b[0]) + vec(b[1]) * u + vec(b[2]) * v).normalize(),
+                ));
+            }
+        }
+    }
+    let mut keys: Vec<_> = guarded.into_iter().collect();
+    let distance = |key: &TileKey| {
+        let b = BASES[key.face as usize];
+        let vec = |a: [i32; 3]| DVec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+        let u = 2.0 * (key.x as f64 + 0.5) / f64::from(count) - 1.0;
+        let v = 2.0 * (key.y as f64 + 0.5) / f64::from(count) - 1.0;
+        -direction.dot((vec(b[0]) + vec(b[1]) * u + vec(b[2]) * v).normalize())
+    };
+    keys.sort_by(|a, b| distance(a).total_cmp(&distance(b)).then(a.cmp(b)));
     keys
+}
+
+fn footprint_level(direction: DVec3, altitude: f64, aspect: f64, tilt: f64) -> u8 {
+    let mut level = camera_level(altitude);
+    while level > 0 && footprint_keys(direction, level, aspect, altitude, tilt).len() > 64 {
+        level -= 1;
+    }
+    level
 }
 
 fn append_ribbon(
@@ -637,7 +1020,7 @@ fn object_mesh(rivers: &RiverLayer, human: &HumanLayer, radius: f64, exaggeratio
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use super::*;
-    use glam::{Mat4, Vec4};
+    use glam::Mat4;
     use std::cell::RefCell;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
@@ -673,18 +1056,22 @@ mod browser {
         fn upload(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) -> Self {
             let vertices = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("terrain vertices"),
-                size: (mesh.vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                size: ((mesh.vertices.len() * std::mem::size_of::<Vertex>()) as u64).max(4),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let indices = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("terrain indices"),
-                size: (mesh.indices.len() * std::mem::size_of::<u32>()) as u64,
+                size: ((mesh.indices.len() * std::mem::size_of::<u32>()) as u64).max(4),
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            queue.write_buffer(&vertices, 0, bytemuck::cast_slice(&mesh.vertices));
-            queue.write_buffer(&indices, 0, bytemuck::cast_slice(&mesh.indices));
+            if !mesh.vertices.is_empty() {
+                queue.write_buffer(&vertices, 0, bytemuck::cast_slice(&mesh.vertices));
+            }
+            if !mesh.indices.is_empty() {
+                queue.write_buffer(&indices, 0, bytemuck::cast_slice(&mesh.indices));
+            }
             Self {
                 vertices,
                 indices,
@@ -706,7 +1093,9 @@ mod browser {
         globe: Option<GpuMesh>,
         base_surfaces: [Vec<DVec3>; 2],
         tiles: Vec<(TileKey, GpuMesh, Tile)>,
+        tile_lookup: HashMap<TileKey, usize>,
         active_keys: Vec<TileKey>,
+        active_set: HashSet<TileKey>,
         rivers: RiverLayer,
         human: HumanLayer,
         objects: Option<GpuMesh>,
@@ -714,6 +1103,7 @@ mod browser {
         show_human: bool,
         yaw: f64,
         pitch: f64,
+        view_tilt: f64,
         altitude: f64,
         exaggeration: f64,
         mode: f32,
@@ -739,8 +1129,46 @@ mod browser {
     }
 
     impl Renderer {
+        fn clear_cut(&mut self) {
+            self.active_keys.clear();
+            self.active_set.clear();
+        }
+        fn rebuild_lookup(&mut self) {
+            self.tile_lookup = self
+                .tiles
+                .iter()
+                .enumerate()
+                .map(|(i, (key, _, _))| (*key, i))
+                .collect();
+        }
         fn aspect(&self) -> f64 {
             f64::from(self.config.width) / f64::from(self.config.height.max(1))
+        }
+        fn detail_level(&self) -> u8 {
+            footprint_level(
+                self.direction(),
+                self.altitude,
+                self.aspect(),
+                self.view_tilt,
+            )
+        }
+        fn footprint(&self, level: u8) -> Vec<TileKey> {
+            footprint_keys(
+                self.direction(),
+                level,
+                self.aspect(),
+                self.altitude,
+                self.view_tilt,
+            )
+        }
+        fn requests(&self) -> Vec<TileKey> {
+            let level = self.detail_level();
+            let mut keys = self.footprint(level);
+            keys.extend(self.footprint((level + 1).min(18)).into_iter().take(192));
+            keys.extend(self.footprint(level.saturating_sub(1)).into_iter().take(64));
+            let mut seen = HashSet::new();
+            keys.retain(|key| seen.insert(*key));
+            keys
         }
         fn direction(&self) -> DVec3 {
             DVec3::new(
@@ -760,44 +1188,48 @@ mod browser {
             let Some(world) = &self.world else {
                 return 1.0;
             };
-            let mut best: Option<(u8, f64)> = None;
-            for (key, _, tile) in &self.tiles {
-                if !self.active_keys.contains(key) {
-                    continue;
-                }
-                if below_level.is_some_and(|level| key.level >= level) {
-                    continue;
-                }
-                if best.is_some_and(|(level, _)| level > key.level) {
-                    continue;
-                }
-                let side = (tile.vertices.len() as f64).sqrt() as usize;
-                let progress = morph_progress(time, tile.morph_start);
-                let hit = surface_radius(direction, *key, side, |index| {
-                    let sample = &tile.vertices[index];
-                    let height = if water {
-                        sample.water_m
-                    } else {
-                        sample.height_m
+            if let Some(active) = self.active_keys.first() {
+                if !below_level.is_some_and(|level| active.level >= level) {
+                    let (face, u, v) = face_uv(direction);
+                    let count = 1u32 << active.level;
+                    let key = TileKey {
+                        face: face as u8,
+                        level: active.level,
+                        x: (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+                        y: (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
                     };
-                    let offset = tile
-                        .morph_offsets
-                        .get(index)
-                        .map_or(0.0, |v| v[usize::from(water)]);
-                    DVec3::from_array(sample.direction).normalize()
-                        * (1.0
-                            + height * self.exaggeration / world.config.radius_m
-                            + offset * (1.0 - progress))
-                });
-                if let Some(hit) = hit {
-                    best = Some((key.level, hit));
+                    if self.active_set.contains(&key) {
+                        if let Some(&index) = self.tile_lookup.get(&key) {
+                            let tile = &self.tiles[index].2;
+                            let side = (tile.vertices.len() as f64).sqrt() as usize;
+                            let progress = morph_progress(time, tile.morph_start);
+                            if let Some(hit) = surface_radius(direction, key, side, |index| {
+                                let sample = &tile.vertices[index];
+                                let height = if water {
+                                    water_height(sample)
+                                } else {
+                                    sample.height_m
+                                };
+                                let offset = tile.morph_offsets.get(index).map_or(0.0, |v| {
+                                    if water && water_body(sample).is_some() {
+                                        0.0
+                                    } else {
+                                        v[0]
+                                    }
+                                });
+                                DVec3::from_array(sample.direction).normalize()
+                                    * (1.0
+                                        + height * self.exaggeration / world.config.radius_m
+                                        + offset * (1.0 - progress))
+                            }) {
+                                return hit;
+                            }
+                        }
+                    }
                 }
-            }
-            if let Some((_, hit)) = best {
-                return hit;
             }
             let (face, _, _) = face_uv(direction);
-            let side = world.config.resolution + 1;
+            let side = world.mesh_resolution().min(128) + 1;
             let start = face * side * side;
             let vertices = &self.base_surfaces[usize::from(water)];
             surface_radius(
@@ -820,34 +1252,33 @@ mod browser {
         }
 
         fn refresh_cut(&mut self) {
-            let wanted = camera_level(self.altitude);
+            let wanted = self.detail_level();
             if wanted < 2 {
-                self.active_keys.clear();
+                self.clear_cut();
                 return;
             }
             let mut next = None;
             for level in (1..=wanted).rev() {
-                let keys = neighborhood_keys(self.direction(), level, self.aspect());
-                if keys
-                    .iter()
-                    .all(|key| self.tiles.iter().any(|(cached, _, _)| cached == key))
-                {
+                let keys = self.footprint(level);
+                if keys.iter().all(|key| self.tile_lookup.contains_key(key)) {
                     next = Some(keys);
                     break;
                 }
             }
             let Some(next) = next else {
                 if let Some(key) = self.active_keys.first() {
-                    let required = neighborhood_keys(self.direction(), key.level, self.aspect());
+                    let required = self.footprint(key.level);
                     if key.level > wanted
                         || !required.iter().all(|key| self.active_keys.contains(key))
                     {
-                        self.active_keys.clear();
+                        self.clear_cut();
                     }
                 }
                 return;
             };
-            if next == self.active_keys {
+            if next.len() == self.active_keys.len()
+                && next.iter().all(|key| self.active_set.contains(key))
+            {
                 return;
             }
             let Some(world) = &self.world else {
@@ -858,7 +1289,7 @@ mod browser {
             let updates: Vec<_> = next
                 .iter()
                 .filter_map(|key| {
-                    let index = self.tiles.iter().position(|(cached, _, _)| cached == key)?;
+                    let index = *self.tile_lookup.get(key)?;
                     let offsets = self.tiles[index]
                         .2
                         .vertices
@@ -869,7 +1300,7 @@ mod browser {
                             let water = self.displayed_radius(dir, true, None, start);
                             [
                                 ground - (1.0 + sample.height_m * self.exaggeration / radius),
-                                water - (1.0 + sample.water_m * self.exaggeration / radius),
+                                water - (1.0 + water_height(sample) * self.exaggeration / radius),
                                 (water - ground) * radius / self.exaggeration,
                             ]
                         })
@@ -892,6 +1323,7 @@ mod browser {
             for (index, mesh) in indices.into_iter().zip(meshes) {
                 self.tiles[index].1 = GpuMesh::upload(&self.device, &self.queue, &mesh);
             }
+            self.active_set = next.iter().copied().collect();
             self.active_keys = next;
         }
 
@@ -908,10 +1340,17 @@ mod browser {
             self.refresh_cut();
             let dir = self.direction();
             let time = js_now() as f32;
-            let eye = dir * (1.0 + self.altitude + self.ground_height(f64::from(time)));
+            let radius = 1.0 + self.ground_height(f64::from(time));
+            let (mut eye, _, _, _) = camera_frame(dir, self.altitude, self.view_tilt, radius);
+            let eye_direction = eye.normalize();
+            let ground = self
+                .displayed_radius(eye_direction, false, None, f64::from(time))
+                .max(self.displayed_radius(eye_direction, true, None, f64::from(time)));
+            eye = eye_direction * eye.length().max(ground + self.altitude * 0.25);
+            let look = (dir * radius - eye).normalize();
             let high = eye.as_vec3();
             let low = (eye - high.as_dvec3()).as_vec3();
-            let rotation = Mat4::look_to_rh(Vec3::ZERO, -dir.as_vec3(), Vec3::Y);
+            let rotation = Mat4::look_to_rh(Vec3::ZERO, look.as_vec3(), Vec3::Y);
             let projection = Mat4::perspective_infinite_reverse_rh(
                 45f32.to_radians(),
                 width as f32 / height as f32,
@@ -931,7 +1370,7 @@ mod browser {
                     )
                     .to_array(),
                 eye_low: low.extend(0.0).to_array(),
-                light: Vec4::new(-0.45, 0.80, 0.55, time).to_array(),
+                light: inspection_light(dir, self.altitude).extend(time).to_array(),
                 options: [
                     self.mode,
                     0.0,
@@ -1171,7 +1610,9 @@ mod browser {
                 globe: None,
                 base_surfaces: [Vec::new(), Vec::new()],
                 tiles: Vec::new(),
+                tile_lookup: HashMap::new(),
                 active_keys: Vec::new(),
+                active_set: HashSet::new(),
                 rivers: RiverLayer::default(),
                 human: HumanLayer::default(),
                 objects: None,
@@ -1179,6 +1620,7 @@ mod browser {
                 show_human: true,
                 yaw: 0.65,
                 pitch: 0.35,
+                view_tilt: 0.0,
                 altitude: 2.2,
                 exaggeration: 1.0,
                 mode: 0.0,
@@ -1206,10 +1648,11 @@ mod browser {
             let mesh =
                 world_mesh(&world, renderer.exaggeration).map_err(|e| JsValue::from_str(&e))?;
             renderer.globe = Some(GpuMesh::upload(&renderer.device, &renderer.queue, &mesh));
-            renderer.base_surfaces = mesh_surfaces(&mesh);
+            renderer.base_surfaces = mesh_surfaces(&mesh, world.mesh_resolution());
             renderer.world = Some(world);
             renderer.tiles.clear();
-            renderer.active_keys.clear();
+            renderer.tile_lookup.clear();
+            renderer.clear_cut();
             renderer.objects = None;
             Ok(())
         })
@@ -1217,44 +1660,41 @@ mod browser {
 
     #[wasm_bindgen]
     pub fn set_tile(json: &str) -> Result<String, JsValue> {
-        let mut tile: Tile =
-            serde_json::from_str(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let tile = decode_json_tile(json).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        install_tile(tile)
+    }
+
+    #[wasm_bindgen]
+    pub fn add_tile_binary(bytes: &[u8]) -> Result<String, JsValue> {
+        let tile = world_core::tile_wire::decode_tile(bytes)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        install_tile(from_core_tile(tile))
+    }
+
+    fn install_tile(mut tile: Tile) -> Result<String, JsValue> {
         RENDERER.with(|state| {
             let mut state = state.borrow_mut();
             let renderer = state.as_mut().ok_or("Visualiseur absent")?;
-            let radius = renderer
-                .world
-                .as_ref()
-                .ok_or("Monde absent")?
-                .config
-                .radius_m;
-            tile.morph_start = f64::from(js_now() as f32);
-            tile.morph_offsets = tile
-                .vertices
-                .iter()
-                .map(|sample| {
-                    let direction = DVec3::from_array(sample.direction).normalize();
-                    let ground = renderer.displayed_radius(
-                        direction,
-                        false,
-                        Some(tile.key.level),
-                        tile.morph_start,
-                    );
-                    let water = renderer.displayed_radius(
-                        direction,
-                        true,
-                        Some(tile.key.level),
-                        tile.morph_start,
-                    );
-                    [
-                        ground - (1.0 + sample.height_m * renderer.exaggeration / radius),
-                        water - (1.0 + sample.water_m * renderer.exaggeration / radius),
-                        (water - ground) * radius / renderer.exaggeration,
-                    ]
-                })
-                .collect();
-            let mesh = tile_mesh(&tile, radius, renderer.exaggeration)
-                .map_err(|e| JsValue::from_str(&e))?;
+            renderer.world.as_ref().ok_or("Monde absent")?;
+            if renderer.tile_lookup.contains_key(&tile.key) {
+                return serde_json::to_string(
+                    &renderer
+                        .tiles
+                        .iter()
+                        .map(|(key, _, _)| key)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| JsValue::from_str(&error.to_string()));
+            }
+            if tile.vertices.is_empty()
+                || tile
+                    .indices
+                    .iter()
+                    .any(|&index| index as usize >= tile.vertices.len())
+            {
+                return Err(JsValue::from_str("Indices de tuile invalides"));
+            }
+            tile.morph_offsets.clear();
             if let Some(index) = renderer
                 .tiles
                 .iter()
@@ -1262,36 +1702,29 @@ mod browser {
             {
                 renderer.tiles.remove(index);
             }
-            if renderer.tiles.len() == 160 {
-                let level = camera_level(renderer.altitude);
-                let desired: Vec<_> = [
-                    level.saturating_sub(1),
-                    level,
-                    level.saturating_add(1).min(18),
-                ]
-                .into_iter()
-                .flat_map(|z| neighborhood_keys(renderer.direction(), z, renderer.aspect()))
-                .collect();
+            if renderer.tiles.len() == 320 {
+                let desired = renderer.requests();
                 let remove = renderer
                     .tiles
                     .iter()
                     .position(|(key, _, _)| {
-                        !renderer.active_keys.contains(key) && !desired.contains(key)
+                        !renderer.active_set.contains(key) && !desired.contains(key)
                     })
                     .or_else(|| {
                         renderer
                             .tiles
                             .iter()
-                            .position(|(key, _, _)| !renderer.active_keys.contains(key))
+                            .position(|(key, _, _)| !renderer.active_set.contains(key))
                     })
                     .unwrap_or(0);
                 renderer.tiles.remove(remove);
             }
             renderer.tiles.push((
                 tile.key,
-                GpuMesh::upload(&renderer.device, &renderer.queue, &mesh),
+                GpuMesh::upload(&renderer.device, &renderer.queue, &Mesh::default()),
                 tile,
             ));
+            renderer.rebuild_lookup();
             serde_json::to_string(
                 &renderer
                     .tiles
@@ -1308,7 +1741,8 @@ mod browser {
         RENDERER.with(|state| {
             if let Some(r) = state.borrow_mut().as_mut() {
                 r.tiles.clear();
-                r.active_keys.clear();
+                r.tile_lookup.clear();
+                r.clear_cut();
             }
         });
     }
@@ -1402,6 +1836,7 @@ mod browser {
                 r.altitude = 2.2;
                 r.pitch = 0.35;
                 r.yaw = 0.65;
+                r.view_tilt = 0.0;
             }
         });
     }
@@ -1433,6 +1868,15 @@ mod browser {
     }
 
     #[wasm_bindgen]
+    pub fn set_view_tilt(degrees: f64) {
+        RENDERER.with(|state| {
+            if let Some(r) = state.borrow_mut().as_mut() {
+                r.view_tilt = degrees.clamp(0.0, 35.0).to_radians();
+            }
+        });
+    }
+
+    #[wasm_bindgen]
     pub fn set_mode(mode: u32) {
         RENDERER.with(|state| {
             if let Some(r) = state.borrow_mut().as_mut() {
@@ -1449,25 +1893,14 @@ mod browser {
             r.exaggeration = exaggeration.clamp(1.0, 30.0);
             if let Some(world) = &r.world {
                 let mesh = world_mesh(world, r.exaggeration).map_err(|e| JsValue::from_str(&e))?;
-                r.base_surfaces = mesh_surfaces(&mesh);
+                r.base_surfaces = mesh_surfaces(&mesh, world.mesh_resolution());
                 r.globe = Some(GpuMesh::upload(&r.device, &r.queue, &mesh));
             }
             for (_, gpu, tile) in &mut r.tiles {
                 tile.morph_offsets.clear();
-                *gpu = GpuMesh::upload(
-                    &r.device,
-                    &r.queue,
-                    &tile_mesh(
-                        tile,
-                        r.world
-                            .as_ref()
-                            .map_or(1_737_000.0, |world| world.config.radius_m),
-                        r.exaggeration,
-                    )
-                    .map_err(|e| JsValue::from_str(&e))?,
-                );
+                *gpu = GpuMesh::upload(&r.device, &r.queue, &Mesh::default());
             }
-            r.active_keys.clear();
+            r.clear_cut();
             rebuild_objects(r);
             Ok(())
         })
@@ -1480,12 +1913,12 @@ mod browser {
             let Some(r) = state.as_ref() else { return "{}".into(); };
             let (face, u, v) = face_uv(r.direction());
             let radius = r.world.as_ref().map_or(1_737_000.0, |w| w.config.radius_m);
-            let level = u32::from(camera_level(r.altitude));
+            let level = u32::from(r.detail_level());
             let count = 1u32 << level;
             let x = (((u + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
             let y = (((v + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
-            let requests: Vec<_> = [level, (level+1).min(18), level.saturating_sub(1)].into_iter().flat_map(|z| neighborhood_keys(r.direction(), z as u8, r.aspect())).collect();
-            serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "requests": requests }).to_string()
+            let requests = r.requests();
+            serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level": r.active_keys.first().map(|key|key.level), "active_tiles": r.active_keys.len(), "requests": requests }).to_string()
         })
     }
 }
@@ -1527,6 +1960,32 @@ mod tests {
     }
 
     #[test]
+    fn inspection_light_reveals_slopes_on_every_hemisphere_and_keeps_orbital_sun() {
+        for direction in [
+            DVec3::X,
+            -DVec3::X,
+            DVec3::Y,
+            -DVec3::Y,
+            DVec3::Z,
+            -DVec3::Z,
+            DVec3::ONE.normalize(),
+            DVec3::new(-0.151, -0.841, 0.519).normalize(),
+        ] {
+            for altitude in [0.000001, 0.01, 0.02, 0.05, 0.1, 0.2, 2.2] {
+                let light = inspection_light(direction, altitude).as_dvec3();
+                assert!(light.is_finite());
+                assert!((light.length() - 1.0).abs() < 1e-6);
+                if altitude <= 0.02 {
+                    assert!((light.dot(direction) - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+                }
+                if altitude >= 0.2 {
+                    assert!(light.dot(DVec3::new(-0.45, 0.8, 0.55).normalize()) > 0.999999);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn invalid_tile_indices_are_rejected() {
         assert!(tile_mesh(
             &Tile {
@@ -1539,6 +1998,229 @@ mod tests {
             1.0
         )
         .is_err());
+    }
+
+    #[test]
+    fn binary_and_json_tiles_produce_equivalent_rendered_surfaces() {
+        let world = world_core::World::generate(world_core::WorldConfig {
+            seed: 7,
+            resolution: 16,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let source = world
+            .tile(
+                world_core::geometry::TileKey {
+                    face: 4,
+                    level: 2,
+                    x: 1,
+                    y: 2,
+                },
+                4,
+            )
+            .unwrap();
+        let json = decode_json_tile(&serde_json::to_string(&source).unwrap()).unwrap();
+        let bytes = world_core::tile_wire::encode_tile(&source).unwrap();
+        let binary = from_core_tile(world_core::tile_wire::decode_tile(&bytes).unwrap());
+        let a = tile_mesh(&json, world.config.radius_m, 1.0).unwrap();
+        let b = tile_mesh(&binary, world.config.radius_m, 1.0).unwrap();
+        assert_eq!(a.indices, b.indices);
+        assert_eq!(a.vertices.len(), b.vertices.len());
+        for (a, b) in a.vertices.iter().zip(&b.vertices) {
+            let position = |v: &Vertex| {
+                DVec3::from_array(v.position.map(f64::from))
+                    + DVec3::from_array(v.position_low.map(f64::from))
+            };
+            assert!((position(a) - position(b)).length() * world.config.radius_m < 0.001);
+            for (ca, cb) in a.color.iter().zip(b.color) {
+                assert!((*ca - cb).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn lake_shore_is_clipped_against_its_level_inside_the_terrain_triangle() {
+        let samples: Vec<_> = [[0.0, 0.0, 1.0], [0.001, 0.0, 1.0], [0.0, 0.001, 1.0]]
+            .into_iter()
+            .zip([-10.0, 10.0, 10.0])
+            .map(|(direction, height_m)| Sample {
+                direction,
+                height_m,
+                water_m: height_m.max(2.0),
+                water_level_m: Some(2.0),
+                water_body_id: Some(7),
+                lake: height_m < 2.0,
+                ..Default::default()
+            })
+            .collect();
+        let radius = 2_000_000.0;
+        let mesh = mesh_from_samples(&samples, &[0, 1, 2], 3, None, radius, 1.0).unwrap();
+        let water_indices = &mesh.indices[3..];
+        assert_eq!(water_indices.len(), 3);
+        let mut shore_count = 0;
+        for &i in water_indices {
+            let v = mesh.vertices[i as usize];
+            let position = DVec3::from_array(v.position.map(f64::from))
+                + DVec3::from_array(v.position_low.map(f64::from));
+            assert!(((position.length() - 1.0) * radius - 2.0).abs() < 1e-5);
+            assert!(v.fields[3] >= 0.0);
+            if v.fields[3] == 0.0 {
+                shore_count += 1;
+                assert!((f64::from(v.normal_height[3]) * 1000.0 - 2.0).abs() < 1e-5);
+            }
+            let normal = DVec3::from_array(v.shading_normal.map(f64::from));
+            assert!(normal.normalize().dot(position.normalize()) > 0.9999999);
+        }
+        assert_eq!(shore_count, 2);
+        let mut dry = samples.clone();
+        for s in &mut dry {
+            s.height_m = 3.0;
+        }
+        let dry_mesh = mesh_from_samples(&dry, &[0, 1, 2], 3, None, radius, 1.0).unwrap();
+        assert_eq!(dry_mesh.indices, [0, 1, 2]);
+    }
+
+    #[test]
+    fn river_water_does_not_flood_vertices_outside_its_hydraulic_domain() {
+        let mut samples = vec![
+            Sample {
+                direction: [0.0, 0.0, 1.0],
+                height_m: 8.0,
+                water_m: 10.0,
+                water_level_m: Some(10.0),
+                water_body_id: Some(RIVER_BODY + 1),
+                river: 1.0,
+                ..Default::default()
+            },
+            Sample {
+                direction: [0.001, 0.0, 1.0],
+                height_m: 5.0,
+                water_m: 5.0,
+                ..Default::default()
+            },
+            Sample {
+                direction: [0.0, 0.001, 1.0],
+                height_m: 5.0,
+                water_m: 5.0,
+                ..Default::default()
+            },
+        ];
+        for dry_support in [false, true] {
+            if dry_support {
+                samples[1].water_level_m = Some(10.0);
+                samples[1].water_body_id = Some(RIVER_BODY + 1);
+            }
+            let mesh = mesh_from_samples(&samples, &[0, 1, 2], 4, None, 2_000_000.0, 1.0).unwrap();
+            let water_indices = &mesh.indices[3..];
+            assert_eq!(water_indices.len(), 3);
+            // Both outside vertices are lower than the river, but outside its wet section.
+            assert!(!water_indices.contains(&4));
+            assert!(!water_indices.contains(&5));
+            let mut boundaries = 0;
+            for &index in water_indices {
+                let vertex = mesh.vertices[index as usize];
+                assert!(vertex.normal_height[0].abs() < 0.0003);
+                assert!(vertex.normal_height[1].abs() < 0.0003);
+                if vertex.fields[3] == 0.0 {
+                    boundaries += 1;
+                }
+            }
+            assert_eq!(boundaries, 2);
+        }
+    }
+
+    #[test]
+    fn visual_resolution_is_independent_of_the_physical_atlas() {
+        let mut cells = Vec::new();
+        for face in 0..6 {
+            let b = BASES[face];
+            for y in 0..2 {
+                for x in 0..2 {
+                    let vec = |a: [i32; 3]| DVec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
+                    cells.push(Sample {
+                        direction: (vec(b[0])
+                            + vec(b[1]) * (x as f64 - 0.5)
+                            + vec(b[2]) * (y as f64 - 0.5))
+                            .normalize()
+                            .to_array(),
+                        height_m: 100.0,
+                        water_m: 100.0,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        let world = World {
+            config: Config {
+                radius_m: 2_000_000.0,
+                resolution: 512,
+            },
+            render_resolution: Some(2),
+            cells,
+        };
+        let mesh = world_mesh(&world, 1.0).unwrap();
+        assert_eq!(mesh.indices.len(), 6 * 2 * 2 * 6);
+        let surfaces = mesh_surfaces(&mesh, world.mesh_resolution());
+        assert_eq!(surfaces[0].len(), 6 * 3 * 3);
+        assert_eq!(surfaces[1].len(), 6 * 3 * 3);
+    }
+
+    #[test]
+    fn planetary_interpolation_does_not_expand_a_river_profile_into_a_lake() {
+        let world = World {
+            config: Config {
+                radius_m: 2_000_000.0,
+                resolution: 2,
+            },
+            render_resolution: None,
+            cells: vec![
+                Sample {
+                    height_m: 100.0,
+                    water_m: 102.0,
+                    water_level_m: Some(102.0),
+                    water_body_id: Some(RIVER_BODY + 12),
+                    river: 0.8,
+                    ..Default::default()
+                };
+                24
+            ],
+        };
+        let sample = atlas_sample(&world, DVec3::Z);
+        assert_eq!(sample.water_level_m, None);
+        assert_eq!(sample.water_m, sample.height_m);
+        assert_eq!(sample.river, 0.8);
+        let mesh = world_mesh(&world, 1.0).unwrap();
+        assert_eq!(mesh.indices.len(), 6 * 2 * 2 * 6);
+    }
+
+    #[test]
+    fn river_surface_keeps_its_downstream_gradient_during_lod_morph() {
+        let samples: Vec<_> = [[0.0, 0.0, 1.0], [0.001, 0.0, 1.0], [0.0, 0.001, 1.0]]
+            .into_iter()
+            .zip([14.0, 12.0, 10.0])
+            .map(|(direction, level)| Sample {
+                direction,
+                height_m: level - 4.0,
+                water_m: level,
+                water_level_m: Some(level),
+                water_body_id: Some(RIVER_BODY + 4),
+                river: 1.0,
+                ..Default::default()
+            })
+            .collect();
+        let offsets = [[0.0001, 0.0002, 4.0]; 3];
+        let radius = 2_000_000.0;
+        let mesh =
+            mesh_from_samples(&samples, &[0, 1, 2], 3, Some((&offsets, 1.0)), radius, 1.0).unwrap();
+        assert_eq!(mesh.indices.len(), 6);
+        for (i, sample) in samples.iter().enumerate() {
+            let v = mesh.vertices[3 + i];
+            let point = DVec3::from_array(v.position.map(f64::from))
+                + DVec3::from_array(v.position_low.map(f64::from));
+            assert!(((point.length() - 1.0) * radius - sample.water_m).abs() < 1e-5);
+            assert_eq!(v.morph[0], 0.0);
+        }
     }
 
     #[test]
@@ -1608,8 +2290,9 @@ mod tests {
         let direction = DVec3::ONE.normalize();
         let altitude = 1900.0 / 2_000_000.0;
         let level = camera_level(altitude);
-        assert_eq!(level, 10);
-        let keys = neighborhood_keys(direction, level, 3.0);
+        assert_eq!(level, 12);
+        let level = footprint_level(direction, altitude, 3.0, 0.0);
+        let keys = footprint_keys(direction, level, 3.0, altitude, 0.0);
         let eye = direction * (1.0 + altitude);
         let right = (-direction).cross(DVec3::Y).normalize();
         let up = right.cross(-direction);
@@ -1639,6 +2322,49 @@ mod tests {
                     x,
                     y
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn inclined_cut_covers_wide_viewports_at_every_cube_corner() {
+        for signs in [
+            DVec3::ONE,
+            DVec3::new(-1.0, 1.0, 1.0),
+            DVec3::new(1.0, -1.0, -1.0),
+        ] {
+            for aspect in [1.6, 3.0, 4.0] {
+                for altitude in [1900.0 / 2_000_000.0, 5.0 / 2_000_000.0] {
+                    let direction = signs.normalize();
+                    let tilt = 35f64.to_radians();
+                    let level = footprint_level(direction, altitude, aspect, tilt);
+                    let keys = footprint_keys(direction, level, aspect, altitude, tilt);
+                    assert!(keys.len() <= 64);
+                    let (eye, forward, right, up) = camera_frame(direction, altitude, tilt, 1.0);
+                    for y in -20..=20 {
+                        for x in -40..=40 {
+                            let ray = (forward
+                                + right * (x as f64 / 40.0 * aspect * 22.5f64.to_radians().tan())
+                                + up * (y as f64 / 20.0 * 22.5f64.to_radians().tan()))
+                            .normalize();
+                            let b = eye.dot(ray);
+                            let t = -b - (b * b - eye.length_squared() + 1.0).sqrt();
+                            let p = (eye + ray * t).normalize();
+                            let (face, u, v) = face_uv(p);
+                            let count = 1u32 << level;
+                            let key = TileKey {
+                                face: face as u8,
+                                level,
+                                x: (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+                                y: (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+                            };
+                            assert!(
+                                keys.contains(&key),
+                                "missing {key:?} at aspect {aspect} and altitude {altitude}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

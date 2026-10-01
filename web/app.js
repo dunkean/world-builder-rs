@@ -2,6 +2,7 @@ import init, * as viewer from '/pkg/world_viewer.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('planet');
+$('conservative-refinement').checked = false;
 let activeWorld;
 let frameCount = 0;
 let lastFps = performance.now();
@@ -49,13 +50,19 @@ function loadWorld(world) {
   $('destination').replaceChildren(new Option('Choisir un lieu', ''));
   let peak;
   let river;
+  let barePeak;
+  let coast;
   for (const cell of world.cells) {
     if (!cell.ocean && !cell.lake) {
       if (!peak || cell.height_m > peak.height_m) peak = cell;
+      if (cell.biome !== 'Ice' && (!barePeak || cell.height_m > barePeak.height_m)) barePeak = cell;
       if (!river || cell.discharge > river.discharge) river = cell;
+      if (cell.biome !== 'Ice' && cell.water_body_id === 0 && cell.height_m >= 0 && (!coast || cell.height_m < coast.height_m)) coast = cell;
     }
   }
   if (peak) addDestination('peak', 'Sommet · continent', peak.position ?? peak.direction);
+  if (barePeak) addDestination('relief', 'Relief · sans glace', barePeak.position ?? barePeak.direction);
+  if (coast) addDestination('coast', 'Côte', coast.position ?? coast.direction);
   if (river && river.discharge > 0) addDestination('river', 'Grande rivière', river.position ?? river.direction);
   lastTile = undefined;
   loadedTiles.clear();
@@ -69,7 +76,7 @@ function loadWorld(world) {
   viewer.set_human('{"settlements":[],"roads":[]}');
   loadOverlays(world.id);
   $('world-name').textContent = `Planète ${world.config.seed}`;
-  $('world-meta').textContent = `${number(world.config.radius_m / 1000)} km · ${number(world.cells.length)} cellules d'atlas`;
+  $('world-meta').textContent = `${number(world.config.radius_m / 1000)} km · ${number(world.stats?.cells ?? 6 * world.config.resolution ** 2)} cellules d'atlas`;
   $('seed').value = world.config.seed;
   $('radius').value = world.config.radius_m / 1000;
   $('resolution').value = world.config.resolution;
@@ -77,6 +84,8 @@ function loadWorld(world) {
   if (world.config.relief_m !== undefined) $('relief').value = world.config.relief_m;
   if (world.config.gravity_m_s2 !== undefined) $('gravity').value = world.config.gravity_m_s2;
   if (world.config.axial_tilt_deg !== undefined) $('tilt').value = world.config.axial_tilt_deg;
+  $('erosion-steps').value = world.config.erosion_steps ?? 24;
+  $('geological-years').value = world.config.geological_years ?? 2000000;
   $('stats').replaceChildren();
   addMetric('Identifiant', String(world.id).slice(0, 16));
   addMetric('Rayon', `${number(world.config.radius_m / 1000)} km`);
@@ -85,7 +94,7 @@ function loadWorld(world) {
   for (const [key, label, unit] of [
     ['ocean_fraction', 'Surface océanique', '%'], ['land_fraction', 'Terres émergées', '%'],
     ['min_height_m', 'Altitude minimale', 'm'], ['max_height_m', 'Altitude maximale', 'm'],
-    ['river_cells', 'Cellules de rivière', ''], ['lake_cells', 'Cellules de lac', ''],
+    ['river_cells', 'Cellules de rivière', ''], ['lake_count', 'Lacs', ''], ['lake_cells', 'Cellules de lac', ''],
     ['max_discharge_m3_s', 'Débit maximal', 'm³/s'], ['total_runoff_m3_s', 'Ruissellement total', 'm³/s'],
   ]) {
     if (typeof stats[key] === 'number') addMetric(label, `${number(unit === '%' ? stats[key] * 100 : stats[key], unit === '%' ? 1 : 0)} ${unit}`.trim());
@@ -102,7 +111,21 @@ function addDestination(id, label, direction) {
 
 async function loadOverlays(worldId) {
   const results = await Promise.allSettled([
-    api(`/api/worlds/${worldId}/rivers`).then((data) => { if (activeWorld?.id === worldId) { riverData = JSON.stringify(data); viewer.set_rivers(riverData); } }),
+    api(`/api/worlds/${worldId}/rivers`).then((data) => {
+      if (activeWorld?.id !== worldId) return;
+      riverData = JSON.stringify(data); viewer.set_rivers(riverData);
+      const river = data.segments?.filter((s) => s.start_height_m > 80 && s.end_height_m > 20 && s.end_height_m < s.start_height_m)
+        .sort((a, b) => b.discharge_m3_s - a.discharge_m3_s)[0];
+      if (river) addDestination('river', 'Grande rivière', river.start);
+      const valley = data.segments?.filter((s) => s.discharge_m3_s > 1000 && s.end_height_m > 20 && s.start_height_m > s.end_height_m)
+        .sort((a, b) => (b.start_height_m - b.end_height_m) - (a.start_height_m - a.end_height_m))[0];
+      if (valley) addDestination('valley', 'Vallée fluviale', valley.start);
+    }),
+    api(`/api/worlds/${worldId}/lakes`).then((data) => {
+      if (activeWorld?.id !== worldId) return;
+      const lake = data.lakes?.filter((l) => l.volume_m3 > 0).sort((a, b) => b.area_m2 - a.area_m2)[0];
+      if (lake) addDestination('lake', 'Grand lac', lake.direction);
+    }),
     api(`/api/worlds/${worldId}/human`).then((data) => {
       if (activeWorld?.id !== worldId) return;
       humanData = JSON.stringify(data);
@@ -121,7 +144,7 @@ async function changeSeason() {
   const month = Number($('season').value);
   const worldId = activeWorld.id;
   try {
-    const world = await api(month === 0 ? `/api/worlds/${worldId}` : `/api/worlds/${worldId}/season?phase=${(month - 1) / 12}`);
+    const world = await api(month === 0 ? `/api/worlds/${worldId}/preview?resolution=128` : `/api/worlds/${worldId}/preview?resolution=128&phase=${(month - 1) / 12}`);
     if (activeWorld?.id !== worldId || Number($('season').value) !== month) return;
     viewer.set_world(JSON.stringify(world));
     if (riverData) viewer.set_rivers(riverData);
@@ -139,7 +162,7 @@ async function generate() {
   $('generate').disabled = true;
   $('generate').firstElementChild.textContent = 'Calcul en cours…';
   message('');
-  const config = { seed: Number($('seed').value), resolution: Number($('resolution').value), radius_m: Number($('radius').value) * 1000, ocean_fraction: Number($('ocean-fraction').value) / 100, relief_m: Number($('relief').value), gravity_m_s2: Number($('gravity').value), axial_tilt_deg: Number($('tilt').value) };
+  const config = { seed: Number($('seed').value), resolution: Number($('resolution').value), radius_m: Number($('radius').value) * 1000, ocean_fraction: Number($('ocean-fraction').value) / 100, relief_m: Number($('relief').value), gravity_m_s2: Number($('gravity').value), axial_tilt_deg: Number($('tilt').value), erosion_steps: Number($('erosion-steps').value), geological_years: Number($('geological-years').value) };
   try {
     $('status').textContent = 'Compilation native : relief, climat et hydrologie…';
     const result = await api('/api/worlds', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(config) });
@@ -153,7 +176,7 @@ async function generate() {
         $('status').textContent = job.message ?? (job.status === 'queued' ? 'Génération dans la file…' : 'Compilation native du monde…');
         if (job.status === 'failed') throw new Error(job.error ?? 'La génération a échoué');
         if (job.status === 'ready' || job.status === 'complete' || job.status === 'completed') {
-          loadWorld(await api(job.world_id ? `/api/worlds/${job.world_id}` : '/api/world/latest'));
+          loadWorld(await api(job.world_id ? `/api/worlds/${job.world_id}/preview?resolution=128` : '/api/world/latest/preview?resolution=128'));
           break;
         }
       }
@@ -189,18 +212,19 @@ async function updateDetail() {
   tileBusy = true;
   try {
     const results = await Promise.allSettled(missing.map(async ([key, tile]) => {
-      const segments = 64;
-      const response = await fetch(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=${segments}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`);
+      const segments = 128;
+      const response = await fetch(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=${segments}&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`);
       if (!response.ok) throw new Error(`Tuile ${response.status}`);
-      const data = await response.text();
+      const binary = response.headers.get('content-type')?.includes('application/vnd.world-builder.tile+postcard');
+      const data = binary ? new Uint8Array(await response.arrayBuffer()) : await response.text();
       if (activeWorld?.id !== worldId || epoch !== renderEpoch) return;
-      if (conservative) {
+      if (conservative && !binary) {
         const packet = JSON.parse(data);
         const passed = packet.hierarchy_certificate?.all_passed;
         if (!passed) throw new Error('Le certificat de conservation des altitudes a échoué');
         $('contract-status').textContent = `Altitude parent conservée · niveau ${tile.level}. Conservation des altitudes uniquement.`;
       }
-      const cachedKeys = JSON.parse(viewer.set_tile(data));
+      const cachedKeys = JSON.parse(binary ? viewer.add_tile_binary(data) : viewer.set_tile(data));
       loadedTiles.clear();
       for (const cached of cachedKeys) loadedTiles.set(keyOf(cached), true);
     }));
@@ -228,7 +252,11 @@ canvas.addEventListener('wheel', (event) => { event.preventDefault(); viewer.zoo
 $('generator').addEventListener('submit', (event) => { event.preventDefault(); generate(); });
 $('randomize').addEventListener('click', () => { $('seed').value = crypto.getRandomValues(new Uint32Array(1))[0]; });
 $('ocean-fraction').addEventListener('input', () => { $('ocean-value').value = `${$('ocean-fraction').value} %`; });
-$('reset').addEventListener('click', () => { viewer.reset_view(); });
+$('reset').addEventListener('click', () => {
+  viewer.reset_view();
+  $('view-tilt').value = '0';
+  $('view-tilt-value').value = '0°';
+});
 $('fly').addEventListener('click', () => {
   const direction = destinations.get($('destination').value);
   if (!direction) return;
@@ -248,6 +276,7 @@ $('conservative-refinement').addEventListener('change', () => {
 });
 $('exaggeration').addEventListener('input', () => { $('exaggeration-value').value = `×${$('exaggeration').value}`; });
 $('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); lastTile = undefined; });
+$('view-tilt').addEventListener('input', () => { $('view-tilt-value').value = `${$('view-tilt').value}°`; viewer.set_view_tilt(Number($('view-tilt').value)); });
 
 function frame(now) {
   const ratio = Math.min(devicePixelRatio || 1, 2);
@@ -268,7 +297,7 @@ try {
   $('generate').disabled = false;
   requestAnimationFrame(frame);
   setInterval(updateDetail, 100);
-  try { loadWorld(await api('/api/world/latest')); } catch { await generate(); }
+  try { loadWorld(await api('/api/world/latest/preview?resolution=128')); } catch { await generate(); }
 } catch (error) {
   $('backend').textContent = 'Moteur indisponible';
   $('status').textContent = 'Initialisation impossible';

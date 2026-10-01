@@ -1,10 +1,16 @@
 //! Deterministic prototype planet compiler: global spherical drainage, persistent
 //! atlas and continuous spatial detail. This is a reduced model, not a climate GCM.
 
+pub mod erosion;
 pub mod geometry;
+pub mod hydrology;
+mod regions;
+mod sampler;
+pub mod tile_wire;
+pub use regions::RegionPatch;
 
 use anyhow::{bail, Context, Result};
-use geometry::{cell_area, cell_index, cross, direction, dot, neighbours, normalize, FACE_BASES};
+use geometry::{cell_area, cross, direction, dot, normalize};
 pub use geometry::{CubeFace, TileKey};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -13,7 +19,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.4";
+pub const GENERATOR_VERSION: &str = "prototype-0.6.4";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -28,6 +34,13 @@ pub struct WorldConfig {
     pub gravity_m_s2: f64,
     /// Alternative to ocean_fraction: total ocean water volume in cubic metres.
     pub water_volume_m3: Option<f64>,
+    pub erosion_steps: u32,
+    pub geological_years: f64,
+    pub uplift_m_per_year: f64,
+    /// K for m=0.5,n=1 with drainage area in m²: units 1/year.
+    pub stream_power_k_per_year: f64,
+    pub hillslope_diffusivity_m2_per_year: f64,
+    pub lake_fill_years: f64,
 }
 
 impl Default for WorldConfig {
@@ -35,13 +48,19 @@ impl Default for WorldConfig {
         Self {
             seed: 42,
             radius_m: 1_737_000.0,
-            resolution: 96,
+            resolution: 128,
             ocean_fraction: 0.58,
             relief_m: 6_000.0,
             detail_m: 140.0,
             axial_tilt_deg: 23.4,
             gravity_m_s2: 3.0,
             water_volume_m3: None,
+            erosion_steps: 24,
+            geological_years: 2_000_000.0,
+            uplift_m_per_year: 0.00015,
+            stream_power_k_per_year: 0.000008,
+            hillslope_diffusivity_m2_per_year: 0.8,
+            lake_fill_years: 25.0,
         }
     }
 }
@@ -72,6 +91,35 @@ impl WorldConfig {
         if let Some(volume) = self.water_volume_m3 {
             if !volume.is_finite() || volume <= 0.0 {
                 bail!("water_volume_m3 must be finite and positive");
+            }
+        }
+        if self.erosion_steps > 256 {
+            bail!("erosion_steps must be between 0 and 256");
+        }
+        for (name, value, min, max) in [
+            (
+                "geological_years",
+                self.geological_years,
+                1.0,
+                100_000_000.0,
+            ),
+            ("uplift_m_per_year", self.uplift_m_per_year, 0.0, 0.01),
+            (
+                "stream_power_k_per_year",
+                self.stream_power_k_per_year,
+                0.0,
+                0.01,
+            ),
+            (
+                "hillslope_diffusivity_m2_per_year",
+                self.hillslope_diffusivity_m2_per_year,
+                0.0,
+                1000.0,
+            ),
+            ("lake_fill_years", self.lake_fill_years, 0.01, 10000.0),
+        ] {
+            if !value.is_finite() || value < min || value > max {
+                bail!("{name} must be finite and in {min}..={max}");
             }
         }
         Ok(())
@@ -134,6 +182,17 @@ pub struct Cell {
     pub area_m2: f64,
     pub ocean: bool,
     pub lake: bool,
+    #[serde(default)]
+    pub lake_id: Option<u64>,
+    /// Potential spill surface used for analysis; never the rendered water surface.
+    #[serde(default)]
+    pub routing_height_m: f32,
+    #[serde(default)]
+    pub bedrock_m: f32,
+    #[serde(default)]
+    pub sediment_m: f32,
+    #[serde(default)]
+    pub uplift_m_per_year: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -151,6 +210,16 @@ pub struct WorldStats {
     pub outlet_discharge_m3_s: f64,
     pub ocean_volume_m3: f64,
     pub water_balance_relative_error: f64,
+    #[serde(default)]
+    pub lake_count: u64,
+    #[serde(default)]
+    pub lake_storage_m3: f64,
+    #[serde(default)]
+    pub lake_evaporation_m3_s: f64,
+    #[serde(default)]
+    pub lake_infiltration_m3_s: f64,
+    #[serde(default)]
+    pub lake_storage_change_m3_s: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +233,10 @@ pub struct World {
     /// Presentation phase, not a geological revision. None means annual atlas.
     #[serde(default)]
     pub seasonal_phase: Option<f64>,
+    #[serde(default)]
+    pub lakes: Vec<hydrology::Lake>,
+    #[serde(default)]
+    pub erosion: erosion::ErosionReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +244,12 @@ pub struct Sample {
     pub direction: [f64; 3],
     pub height_m: f32,
     pub water_m: f32,
+    /// Canonical hydraulic level, also supplied on dry banks for shoreline clipping.
+    #[serde(default)]
+    pub water_level_m: Option<f32>,
+    /// 0 = ocean, low IDs = lakes, bit 52 = river reaches (exact in JSON).
+    #[serde(default)]
+    pub water_body_id: Option<u64>,
     pub temperature_c: f32,
     pub moisture: f32,
     pub discharge: f32,
@@ -269,6 +348,21 @@ fn fbm(seed: u64, p: [f64; 3], frequency: f64, octaves: u32) -> f64 {
     value
 }
 
+fn atlas_fbm(seed: u64, p: [f64; 3], frequency: f64, octaves: u32, resolution: u32) -> f64 {
+    let cutoff = f64::from(resolution) * 0.35;
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = frequency;
+    for octave in 0..octaves {
+        let weight = (1.0 - (frequency / cutoff).powi(4)).max(0.0);
+        value +=
+            amplitude * weight * noise(seed.wrapping_add(u64::from(octave) * 97), p, frequency);
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    value
+}
+
 fn plates(seed: u64) -> Vec<Plate> {
     (0..14)
         .map(|i| {
@@ -321,11 +415,38 @@ fn raw_height(config: &WorldConfig, plates: &[Plate], p: [f64; 3]) -> f64 {
     let boundary = (-((nearest[0].0 - nearest[1].0) / 0.065).powi(2)).exp();
     let continent =
         1.4 * (continental / weights - 0.5) + 0.8 * fbm(config.seed ^ 0xabc1, p, 2.8, 4);
-    let texture = fbm(config.seed ^ 0x9832, p, 18.0, 4);
-    let mountain =
-        convergence.max(0.0) * boundary * (0.35 + 0.65 * (texture + 0.5).clamp(0.0, 1.0));
+    // The global atlas must not sample detail below its Nyquist scale: doing so
+    // created isolated one-cell pits that were subsequently mistaken for lakes.
+    let texture = atlas_fbm(config.seed ^ 0x9832, p, 18.0, 4, config.resolution);
+    let ridge = (1.0 - noise(config.seed ^ 0x3729, p, 23.0).abs()).powi(3);
+    let mountain = convergence.max(0.0) * boundary * (0.30 + 0.70 * ridge);
     let trench = convergence.min(0.0) * boundary * 0.25;
     config.relief_m * (continent + 0.65 * mountain + trench + 0.10 * texture)
+}
+
+fn tectonic_uplift(config: &WorldConfig, plates: &[Plate], p: [f64; 3]) -> f32 {
+    let mut nearest = [(f64::NEG_INFINITY, 0usize); 2];
+    for (i, plate) in plates.iter().enumerate() {
+        let score = dot(p, plate.site);
+        if score > nearest[0].0 {
+            nearest[1] = nearest[0];
+            nearest[0] = (score, i);
+        } else if score > nearest[1].0 {
+            nearest[1] = (score, i);
+        }
+    }
+    let a = plates[nearest[0].1];
+    let b = plates[nearest[1].1];
+    let va = cross(a.omega, p);
+    let vb = cross(b.omega, p);
+    let normal = normalize([
+        b.site[0] - a.site[0],
+        b.site[1] - a.site[1],
+        b.site[2] - a.site[2],
+    ]);
+    let convergence = dot([va[0] - vb[0], va[1] - vb[1], va[2] - vb[2]], normal).max(0.0);
+    let boundary = (-((nearest[0].0 - nearest[1].0) / 0.065).powi(2)).exp();
+    (config.uplift_m_per_year * (0.12 + 3.0 * convergence * boundary)) as f32
 }
 
 fn choose_sea_level(cells: &[Cell], config: &WorldConfig) -> f32 {
@@ -344,7 +465,7 @@ fn choose_sea_level(cells: &[Cell], config: &WorldConfig) -> f32 {
         index: start,
     });
     while let Some(FloodEntry { level, index }) = heap.pop() {
-        for next in neighbours(index, config.resolution) {
+        for next in hydrology::neighbours8(index, config.resolution) {
             if visited[next] {
                 continue;
             }
@@ -420,65 +541,6 @@ impl PartialOrd for FloodEntry {
     }
 }
 
-/// Identify the connected marine component, then fill-and-spill land depressions.
-/// Flood parents are a topological witness: every land receiver was visited first.
-fn drainage(cells: &mut [Cell], n: u32) -> Vec<usize> {
-    for cell in cells.iter_mut() {
-        cell.ocean = false;
-        cell.lake = false;
-        cell.receiver = None;
-    }
-    let start = (0..cells.len())
-        .min_by(|&a, &b| {
-            cells[a]
-                .height_m
-                .total_cmp(&cells[b].height_m)
-                .then(a.cmp(&b))
-        })
-        .unwrap();
-    let mut queue = VecDeque::from([start]);
-    cells[start].ocean = true;
-    while let Some(i) = queue.pop_front() {
-        for j in neighbours(i, n) {
-            if !cells[j].ocean && cells[j].height_m <= 0.0 {
-                cells[j].ocean = true;
-                queue.push_back(j);
-            }
-        }
-    }
-    let mut heap = BinaryHeap::new();
-    let mut visited = vec![false; cells.len()];
-    let mut order = Vec::with_capacity(cells.len());
-    for (i, cell) in cells.iter_mut().enumerate() {
-        if cell.ocean {
-            cell.water_m = 0.0;
-            visited[i] = true;
-            heap.push(FloodEntry {
-                level: 0.0,
-                index: i,
-            });
-        }
-    }
-    while let Some(FloodEntry { level, index }) = heap.pop() {
-        order.push(index);
-        for next in neighbours(index, n) {
-            if visited[next] {
-                continue;
-            }
-            visited[next] = true;
-            let cell = &mut cells[next];
-            cell.receiver = Some(index);
-            cell.water_m = cell.height_m.max(level);
-            cell.lake = cell.water_m - cell.height_m > 0.5;
-            heap.push(FloodEntry {
-                level: cell.water_m,
-                index: next,
-            });
-        }
-    }
-    order
-}
-
 fn daily_insolation(latitude: f64, declination: f64) -> f64 {
     let h = (-latitude.tan() * declination.tan())
         .clamp(-1.0, 1.0)
@@ -515,35 +577,6 @@ fn climate(cells: &mut [Cell], config: &WorldConfig) {
         cell.temperature_c = temperature as f32;
         cell.moisture = precipitation.clamp(0.01, 1.0) as f32;
     }
-}
-
-fn accumulate(cells: &mut [Cell], order: &[usize]) -> (f64, f64) {
-    let mut discharge = vec![0.0f64; cells.len()];
-    let mut total = 0.0;
-    for (i, cell) in cells.iter().enumerate() {
-        if !cell.ocean {
-            // Annual runoff depth: 1.6 m maximum, reduced by evapotranspiration.
-            let evap = (f64::from(cell.temperature_c) / 45.0).clamp(0.0, 0.75);
-            let runoff_m_s = f64::from(cell.moisture).powi(2) * 1.6 * (1.0 - evap) / 31_557_600.0;
-            discharge[i] = cell.area_m2 * runoff_m_s;
-            total += discharge[i];
-        }
-    }
-    for &i in order.iter().rev() {
-        if let Some(receiver) = cells[i].receiver {
-            discharge[receiver] += discharge[i];
-        }
-    }
-    let outlet = cells
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.ocean)
-        .map(|(i, _)| discharge[i])
-        .sum();
-    for (cell, q) in cells.iter_mut().zip(discharge) {
-        cell.discharge = q as f32;
-    }
-    (total, outlet)
 }
 
 fn classify(cell: &Cell) -> Biome {
@@ -595,6 +628,9 @@ impl World {
                 }
                 let receiver = cell.receiver?;
                 let next = &self.cells[receiver];
+                if next.height_m > cell.height_m + 0.02 {
+                    return None;
+                }
                 Some(RiverSegment {
                     id: format!("{}-river-{i}", self.id),
                     from: i,
@@ -717,32 +753,38 @@ impl World {
                     area_m2: cell_area(face, x, y, n, config.radius_m),
                     ocean: false,
                     lake: false,
+                    lake_id: None,
+                    routing_height_m: height,
+                    bedrock_m: height,
+                    sediment_m: 0.0,
+                    uplift_m_per_year: tectonic_uplift(&config, &plate_sites, p),
                 }
             })
             .collect();
-        let sea_level_m = choose_sea_level(&cells, &config);
+        let mut sea_level_m = choose_sea_level(&cells, &config);
         for cell in &mut cells {
             cell.height_m -= sea_level_m;
+            cell.bedrock_m = cell.height_m;
         }
-        let order = drainage(&mut cells, n);
+        hydrology::route_potential(&mut cells, n);
         climate(&mut cells, &config);
-        accumulate(&mut cells, &order);
-        // Bounded synthetic incision; a second global solve updates lake spill levels.
+        let erosion = erosion::evolve(&mut cells, &config);
+        let datum_shift = choose_sea_level(&cells, &config);
+        sea_level_m += datum_shift;
         for cell in &mut cells {
-            if !cell.ocean && !cell.lake {
-                let incision = (cell.discharge / 180.0).sqrt().min(1.5)
-                    * config.relief_m as f32
-                    * 0.012
-                    * cell.erodability;
-                cell.height_m -= incision.min(cell.height_m.max(0.0) * 0.15);
-            }
+            cell.height_m -= datum_shift;
+            cell.bedrock_m -= datum_shift;
         }
-        let order = drainage(&mut cells, n);
+        hydrology::route_potential(&mut cells, n);
         climate(&mut cells, &config);
-        let (total_runoff, outlet_discharge) = accumulate(&mut cells, &order);
+        let (lakes, total_runoff, outlet_discharge) =
+            hydrology::physical_water(&mut cells, &config);
+        let lake_evaporation: f64 = lakes.iter().map(|l| l.evaporation_m3_s).sum();
+        let lake_infiltration: f64 = lakes.iter().map(|l| l.infiltration_m3_s).sum();
+        let lake_storage_change: f64 = lakes.iter().map(|l| l.storage_change_m3_s).sum();
         for cell in &mut cells {
             cell.biome = classify(cell);
-            if !cell.ocean && cell.height_m < 220.0 && cell.discharge > 1500.0 {
+            if cell.sediment_m > 2.0 {
                 cell.material = Material::Alluvium;
             }
             if cell.biome == Biome::Ice {
@@ -778,8 +820,18 @@ impl World {
                 .filter(|c| c.ocean)
                 .map(|c| -f64::from(c.height_m) * c.area_m2)
                 .sum(),
-            water_balance_relative_error: (total_runoff - outlet_discharge).abs()
+            water_balance_relative_error: (total_runoff
+                - outlet_discharge
+                - lake_evaporation
+                - lake_infiltration
+                - lake_storage_change)
+                .abs()
                 / total_runoff.max(1.0),
+            lake_count: lakes.len() as u64,
+            lake_storage_m3: lakes.iter().map(|l| l.volume_m3).sum(),
+            lake_evaporation_m3_s: lake_evaporation,
+            lake_infiltration_m3_s: lake_infiltration,
+            lake_storage_change_m3_s: lake_storage_change,
         };
         let world = Self {
             config,
@@ -788,6 +840,8 @@ impl World {
             sea_level_m,
             stats,
             seasonal_phase: None,
+            lakes,
+            erosion,
         };
         world.validate()?;
         Ok(world)
@@ -802,6 +856,22 @@ impl World {
         }
         let mut indegrees = vec![0usize; expected];
         let mut recomputed = vec![0.0f64; expected];
+        let mut losses = vec![0.0f64; expected];
+        for lake in &self.lakes {
+            if lake.control_cell >= expected {
+                bail!("invalid lake control");
+            }
+            let residual = lake.inflow_m3_s
+                - lake.outflow_m3_s
+                - lake.evaporation_m3_s
+                - lake.infiltration_m3_s
+                - lake.storage_change_m3_s;
+            if residual.abs() > 1e-6 * lake.inflow_m3_s.max(1.0) {
+                bail!("lake {} water budget did not close", lake.id);
+            }
+            losses[lake.control_cell] +=
+                lake.evaporation_m3_s + lake.infiltration_m3_s + lake.storage_change_m3_s;
+        }
         let annual_cells = if self.seasonal_phase.is_some() {
             let mut cells = self.cells.clone();
             climate(&mut cells, &self.config);
@@ -833,15 +903,30 @@ impl World {
                 if receiver >= expected || receiver == i {
                     bail!("invalid receiver at cell {i}");
                 }
-                if !neighbours(i, self.config.resolution).contains(&receiver) {
+                if !hydrology::neighbours8(i, self.config.resolution).contains(&receiver) {
                     bail!("nonadjacent receiver at cell {i}");
                 }
-                if self.cells[receiver].water_m > c.water_m + 0.002 {
-                    bail!("uphill water routing at cell {i}");
+                if self.cells[receiver].routing_height_m > c.routing_height_m + 0.002 {
+                    bail!("uphill potential routing at cell {i}");
                 }
                 indegrees[receiver] += 1;
-            } else if !c.ocean {
+            } else if !c.ocean
+                && !self
+                    .lakes
+                    .iter()
+                    .any(|l| l.control_cell == i && l.outlet.is_none())
+            {
                 bail!("land cell {i} has no outlet");
+            }
+            if c.lake {
+                let Some(lake) = self.lakes.iter().find(|l| Some(l.id) == c.lake_id) else {
+                    bail!("missing lake identity at {i}");
+                };
+                if (c.water_m - lake.level_m).abs() > 0.002 || c.water_m < c.height_m {
+                    bail!("lake surface is not its shared level at {i}");
+                }
+            } else if !c.ocean && c.water_m != c.height_m {
+                bail!("dry cell has artificial spill water at {i}");
             }
         }
         let mut queue: VecDeque<usize> = indegrees
@@ -853,6 +938,7 @@ impl World {
         let mut visited = 0;
         while let Some(i) = queue.pop_front() {
             visited += 1;
+            recomputed[i] = (recomputed[i] - losses[i]).max(0.0);
             let residual = (recomputed[i] - f64::from(self.cells[i].discharge)).abs();
             if residual > 1e-5 * recomputed[i].max(1.0) {
                 bail!(
@@ -878,182 +964,19 @@ impl World {
         if self.stats.water_balance_relative_error > 1e-8 {
             bail!("water budget did not close");
         }
+        let sediment: f64 = self
+            .cells
+            .iter()
+            .map(|c| f64::from(c.sediment_m) * c.area_m2 * 1700.0)
+            .sum();
+        if (sediment - self.erosion.sediment_stored_kg).abs()
+            / self.erosion.sediment_stored_kg.max(1.0)
+            > 1e-6
+            || self.erosion.mass_balance_relative_error > 1e-9
+        {
+            bail!("sediment mass budget did not close");
+        }
         Ok(())
-    }
-
-    /// Bilinear atlas interpolation with a continuous partition at cube seams. Fine noise is
-    /// addressed by position, never by camera, tile seed, cache or request order.
-    pub fn sample(&self, p: [f64; 3]) -> Sample {
-        let p = normalize(p);
-        let n = self.config.resolution;
-        let mut candidates = [(0usize, 0.0f64); 12];
-        let mut candidate_count = 0;
-        let mut total_weight = 0.0;
-        for (face, [normal, basis_u, basis_v]) in FACE_BASES.iter().enumerate() {
-            let plane = dot(p, *normal);
-            if plane <= 0.0 {
-                continue;
-            }
-            let u = dot(p, *basis_u) / plane;
-            let v = dot(p, *basis_v) / plane;
-            let face_weight = (1.0 + 1.0 / f64::from(n) - u.abs().max(v.abs())).max(0.0);
-            if face_weight == 0.0 {
-                continue;
-            }
-            let fx = ((u + 1.0) * 0.5 * f64::from(n) - 0.5).clamp(0.0, f64::from(n - 1));
-            let fy = ((v + 1.0) * 0.5 * f64::from(n) - 0.5).clamp(0.0, f64::from(n - 1));
-            let ix = fx.floor() as u32;
-            let iy = fy.floor() as u32;
-            let tx = fx - f64::from(ix);
-            let ty = fy - f64::from(iy);
-            for (dx, dy, w) in [
-                (0, 0, (1.0 - tx) * (1.0 - ty)),
-                (1, 0, tx * (1.0 - ty)),
-                (0, 1, (1.0 - tx) * ty),
-                (1, 1, tx * ty),
-            ] {
-                let index = cell_index(face as u8, (ix + dx).min(n - 1), (iy + dy).min(n - 1), n);
-                candidates[candidate_count] = (index, w * face_weight);
-                candidate_count += 1;
-                total_weight += w * face_weight;
-            }
-        }
-        let mut height = 0.0;
-        let mut temperature = 0.0;
-        let mut moisture = 0.0;
-        let mut discharge = 0.0;
-        let mut lake_fraction = 0.0;
-        let mut ocean_fraction = 0.0;
-        let mut water_depth = 0.0;
-        let mut erodability = 0.0;
-        let mut selected = 0usize;
-        let mut max_weight = -1.0;
-        let mut river = 0.0f64;
-        let mut biome_mix = [0.0f32; 10];
-        for &(index, raw_weight) in &candidates[..candidate_count] {
-            let w = raw_weight / total_weight;
-            let cell = &self.cells[index];
-            height += w * f64::from(cell.height_m);
-            temperature += w * f64::from(cell.temperature_c);
-            moisture += w * f64::from(cell.moisture);
-            discharge += w * f64::from(cell.discharge);
-            lake_fraction += w * f64::from(u8::from(cell.lake));
-            ocean_fraction += w * f64::from(u8::from(cell.ocean));
-            water_depth += w * f64::from((cell.water_m - cell.height_m).max(0.0));
-            erodability += w * f64::from(cell.erodability);
-            biome_mix[cell.biome as usize] += w as f32;
-            if w > max_weight {
-                selected = index;
-                max_weight = w;
-            }
-            if cell.discharge >= 120.0 && !cell.ocean && !cell.lake {
-                if let Some(receiver) = cell.receiver {
-                    let end = &self.cells[receiver];
-                    let a = cell.position;
-                    let b = end.position;
-                    let segment = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                    let delta = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-                    let t = (dot(delta, segment) / dot(segment, segment)).clamp(0.0, 1.0);
-                    let closest = normalize([
-                        a[0] + t * segment[0],
-                        a[1] + t * segment[1],
-                        a[2] + t * segment[2],
-                    ]);
-                    let distance =
-                        (2.0 * (1.0 - dot(p, closest)).max(0.0)).sqrt() * self.config.radius_m;
-                    let width = self.channel_width(cell.discharge);
-                    // Fade candidates as their interpolation support vanishes,
-                    // preventing segments from disappearing at atlas-cell boundaries.
-                    let support = (w * 8.0).clamp(0.0, 1.0);
-                    let influence = (1.0 - distance / (width * 2.0)).clamp(0.0, 1.0) * support;
-                    if influence > river {
-                        river = influence;
-                    }
-                }
-            }
-        }
-        let cell = &self.cells[selected];
-        let coast_envelope = (height.abs() / 180.0).min(1.0);
-        let river_taper = river * river * (3.0 - 2.0 * river);
-        let detail = fbm(self.config.seed ^ 0x44281, p, f64::from(n) * 1.2, 14)
-            * self.config.detail_m
-            * coast_envelope
-            * (1.0 - river_taper)
-            * (1.0 - 0.92 * lake_fraction)
-            * (1.3 - 0.4 * erodability).clamp(0.3, 1.4);
-        let coarse_height = height;
-        height += detail;
-        // The atlas bed cannot be imposed on an independently interpolated fine
-        // surface: doing so introduced cliffs as soon as river became positive.
-        // This visual channel has a bounded depth and a C1 bank taper instead.
-        let channel_depth = (0.8 + discharge.max(1.0).log10() * 2.2).clamp(1.0, 20.0);
-        height -= channel_depth * river_taper;
-        let ocean = ocean_fraction > 0.0 && height <= 0.0;
-        let lake = !ocean && lake_fraction > 0.0 && water_depth > 0.5;
-        let water = if ocean {
-            0.0
-        } else if lake {
-            coarse_height + water_depth
-        } else {
-            height + river * 1.5
-        };
-        let mut biome = cell.biome;
-        if river > 0.1 && matches!(biome, Biome::Desert | Biome::Grassland) {
-            biome = Biome::Wetland;
-        }
-        Sample {
-            direction: p,
-            height_m: height as f32,
-            water_m: water.max(height) as f32,
-            temperature_c: temperature as f32,
-            moisture: moisture as f32,
-            discharge: discharge as f32,
-            biome,
-            biome_mix,
-            material: cell.material,
-            erodability: erodability as f32,
-            ocean,
-            lake,
-            river: river as f32,
-        }
-    }
-
-    pub fn tile(&self, key: TileKey, segments: u32) -> Result<Tile> {
-        if key.face >= 6 || key.level > 24 {
-            bail!("invalid tile face or level");
-        }
-        let count = 1u32 << key.level;
-        if key.x >= count || key.y >= count || !(2..=256).contains(&segments) {
-            bail!("invalid tile coordinates or segments (2..=256)");
-        }
-        let mut vertices = Vec::with_capacity(((segments + 1) * (segments + 1)) as usize);
-        for y in 0..=segments {
-            for x in 0..=segments {
-                // The integer numerator makes shared dyadic edges identically addressed.
-                let denominator = f64::from(count) * f64::from(segments);
-                let u = 2.0 * (f64::from(key.x) * f64::from(segments) + f64::from(x)) / denominator
-                    - 1.0;
-                let v = 2.0 * (f64::from(key.y) * f64::from(segments) + f64::from(y)) / denominator
-                    - 1.0;
-                vertices.push(self.sample(direction(key.face, u, v)));
-            }
-        }
-        let mut indices = Vec::with_capacity((segments * segments * 6) as usize);
-        for y in 0..segments {
-            for x in 0..segments {
-                let a = y * (segments + 1) + x;
-                let b = a + 1;
-                let c = a + segments + 1;
-                let d = c + 1;
-                indices.extend_from_slice(&[a, b, d, a, d, c]);
-            }
-        }
-        Ok(Tile {
-            key,
-            segments,
-            vertices,
-            indices,
-        })
     }
 }
 
@@ -1252,5 +1175,43 @@ mod tests {
             max_jump < 1.0,
             "fine river bank jumped {max_jump}m over 20cm"
         );
+    }
+
+    #[test]
+    fn geological_evolution_changes_terrain_and_conserves_solid_mass() {
+        let config = WorldConfig {
+            resolution: 32,
+            erosion_steps: 16,
+            ..Default::default()
+        };
+        let evolved = World::generate(config.clone()).unwrap();
+        let prior = World::generate(WorldConfig {
+            erosion_steps: 0,
+            ..config
+        })
+        .unwrap();
+        assert!(evolved.erosion.rms_height_change_m > 10.0);
+        assert!(evolved.erosion.bedrock_eroded_kg > 1e12);
+        assert!(evolved.erosion.incised_cells > 100);
+        assert!(evolved.erosion.mass_balance_relative_error < 1e-10);
+        let independently_stored: f64 = evolved
+            .cells
+            .iter()
+            .map(|c| f64::from(c.sediment_m) * c.area_m2 * 1700.0)
+            .sum();
+        assert!(
+            (independently_stored + evolved.erosion.sediment_exported_kg
+                - evolved.erosion.bedrock_eroded_kg)
+                .abs()
+                / evolved.erosion.bedrock_eroded_kg
+                < 1e-6
+        );
+        assert_eq!(prior.erosion.bedrock_eroded_kg, 0.0);
+        assert_ne!(prior.id, evolved.id);
+        assert!(evolved
+            .cells
+            .iter()
+            .filter(|c| !c.ocean && !c.lake)
+            .all(|c| c.water_m == c.height_m));
     }
 }

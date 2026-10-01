@@ -12,6 +12,7 @@ path = "src/main.rs"
 world-core = { path = "../world-core" }
 world-contracts = { path = "../world-contracts" }
 world-human = { path = "../world-human" }
+world-erosion = { path = "../world-erosion" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,3 +24,4 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
+rayon.workspace = true

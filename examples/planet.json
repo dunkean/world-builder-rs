@@ -1,10 +1,13 @@
 {
   "seed": 42,
   "radius_m": 1737000.0,
-  "resolution": 64,
+  "resolution": 128,
   "ocean_fraction": 0.58,
   "relief_m": 6000.0,
   "detail_m": 120.0,
   "axial_tilt_deg": 23.5,
-  "gravity_m_s2": 3.0
+  "gravity_m_s2": 3.0,
+  "erosion_steps": 24,
+  "geological_years": 2000000.0,
+  "lake_fill_years": 25.0
 }

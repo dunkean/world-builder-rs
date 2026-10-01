@@ -96,6 +96,11 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     let ambient = 0.33;
     let light = ambient + 0.72 * diffuse;
     var result = color * light;
+    if !water {
+        // Contrast the real surface slope relative to the local planetary normal.
+        let slope_light = diffuse - max(0.0, dot(radial, normalize(scene.light.xyz)));
+        result *= clamp(1.0 + 2.5 * slope_light, 0.65, 1.25);
+    }
     if water {
         let eye_dir = normalize(-v.position);
         let reflection = reflect(-normalize(scene.light.xyz), radial);

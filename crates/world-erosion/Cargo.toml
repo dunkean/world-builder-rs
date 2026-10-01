@@ -1,0 +1,17 @@
+[package]
+name = "world-erosion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"] }
+
+[dev-dependencies]
+serde_json.workspace = true

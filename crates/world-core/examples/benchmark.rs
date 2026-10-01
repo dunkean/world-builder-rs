@@ -55,6 +55,66 @@ fn main() -> Result<()> {
     tile_times.sort_by(f64::total_cmp);
     let percentile =
         |fraction: f64| tile_times[((tile_times.len() - 1) as f64 * fraction).round() as usize];
+    let peak = world
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.ocean && !c.lake)
+        .max_by(|(_, a), (_, b)| a.height_m.total_cmp(&b.height_m))
+        .map(|(i, _)| i);
+    let lake = world
+        .lakes
+        .iter()
+        .max_by(|a, b| a.area_m2.total_cmp(&b.area_m2))
+        .and_then(|l| {
+            l.cells
+                .iter()
+                .copied()
+                .filter(|&i| world.cells[i].lake)
+                .max_by(|&a, &b| {
+                    (world.cells[a].water_m - world.cells[a].height_m)
+                        .total_cmp(&(world.cells[b].water_m - world.cells[b].height_m))
+                })
+        });
+    let river = world
+        .rivers()
+        .into_iter()
+        .filter(|r| r.start_height_m > 100.0)
+        .max_by(|a, b| a.discharge_m3_s.total_cmp(&b.discharge_m3_s))
+        .map(|r| r.from);
+    let coast = world
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            !c.ocean
+                && c.temperature_c > 4.0
+                && world.sample(c.position).height_m > 5.0
+                && !c.lake
+                && world_core::geometry::neighbours(*i, resolution)
+                    .into_iter()
+                    .any(|j| world.cells[j].ocean)
+        })
+        .min_by(|(_, a), (_, b)| a.height_m.abs().total_cmp(&b.height_m.abs()))
+        .map(|(i, _)| i);
+    let point = |index: Option<usize>| {
+        index.map(|i| {let sample=world.sample(world.cells[i].position);serde_json::json!({"index":i,"direction":world.cells[i].position,"height_m":world.cells[i].height_m,"water_m":world.cells[i].water_m,"discharge_m3_s":world.cells[i].discharge,"sample_height_m":sample.height_m,"sample_water_m":sample.water_m,"sample_river":sample.river,"water_body_id":sample.water_body_id})})
+    };
+    let mut basin_histogram = [0usize; 4];
+    let mut wet_histogram = [0usize; 4];
+    let mut depths = Vec::new();
+    for l in &world.lakes {
+        let wet = l.cells.iter().filter(|&&i| world.cells[i].lake).count();
+        basin_histogram[l.cells.len().clamp(1, 4) - 1] += 1;
+        wet_histogram[wet.clamp(1, 4) - 1] += 1;
+        depths.push(
+            l.cells
+                .iter()
+                .map(|&i| (l.level_m - world.cells[i].height_m).max(0.0))
+                .fold(0.0, f32::max),
+        );
+    }
+    depths.sort_by(f32::total_cmp);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -65,6 +125,9 @@ fn main() -> Result<()> {
             "tile_count": tile_times.len(), "tile_segments": 64,
             "tile_p50_ms": percentile(0.50), "tile_p95_ms": percentile(0.95),
             "stats": world.stats
+            ,"world_id":world.id,"erosion":world.erosion,
+            "lake_distribution":{"basin_cells_1_2_3_4plus":basin_histogram,"wet_cells_1_2_3_4plus":wet_histogram,"median_depth_m":depths.get(depths.len()/2),"max_depth_m":depths.last()},
+            "qa_points":{"mountain":point(peak),"coast":point(coast),"lake":point(lake),"river":point(river)}
         }))?
     );
     Ok(())

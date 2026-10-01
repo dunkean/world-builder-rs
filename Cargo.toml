@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/world-core", "crates/world-contracts", "crates/world-human", "crates/world-app", "crates/world-viewer"]
+members = ["crates/world-core", "crates/world-contracts", "crates/world-human", "crates/world-app", "crates/world-viewer", "crates/world-erosion"]
 default-members = ["crates/world-core", "crates/world-contracts", "crates/world-human", "crates/world-app"]
 resolver = "2"
 

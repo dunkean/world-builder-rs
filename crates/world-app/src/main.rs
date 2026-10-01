@@ -22,6 +22,8 @@ use world_core::{TileKey, World, WorldConfig};
 
 mod families;
 mod hierarchy;
+mod preview;
+mod regions;
 
 #[derive(Parser)]
 #[command(
@@ -99,7 +101,7 @@ impl TileCache {
         self.size += value.len();
         self.order.push_back(key.clone());
         self.entries.insert(key, value);
-        while self.size > 64 * 1024 * 1024 || self.entries.len() > 128 {
+        while self.size > 96 * 1024 * 1024 || self.entries.len() > 128 {
             if let Some(key) = self.order.pop_front() {
                 if let Some(value) = self.entries.remove(&key) {
                     self.size -= value.len();
@@ -206,17 +208,21 @@ async fn main() -> Result<()> {
                 tile_workers: Arc::new(Semaphore::new(4)),
             };
             let router = Router::new()
-                .route("/api/health", get(|| async { Json(serde_json::json!({"ok":true,"backend":"rust-cpu","version":env!("CARGO_PKG_VERSION")})) }))
+                .route("/api/health", get(|| async { Json(serde_json::json!({"ok":true,"backend":"rust","global_compute":"cpu","regional_compute":"cuda-with-cpu-fallback","generator_version":world_core::GENERATOR_VERSION,"version":env!("CARGO_PKG_VERSION")})) }))
                 .route("/api/worlds", post(create_world))
                 .route("/api/jobs/{id}", get(get_job))
                 .route("/api/world/latest", get(latest))
+                .route("/api/world/latest/preview", get(latest_preview))
                 .route("/api/worlds/{id}", get(by_id))
+                .route("/api/worlds/{id}/preview", get(world_preview))
                 .route("/api/worlds/{id}/manifest", get(manifest))
                 .route("/api/worlds/{id}/season", get(season))
                 .route("/api/worlds/{id}/tiles/{face}/{level}/{x}/{y}", get(tile))
                 .route("/api/worlds/{id}/families/{face}/{level}/{x}/{y}", get(family))
                 .route("/api/worlds/{id}/sample", get(sample))
                 .route("/api/worlds/{id}/rivers", get(rivers))
+                .route("/api/worlds/{id}/lakes", get(lakes))
+                .route("/api/worlds/{id}/regions/reports", get(region_reports))
                 .route("/api/worlds/{id}/human", get(human))
                 .route("/api/worlds/{id}/reports", get(report))
                 .fallback_service(ServeDir::new(web).append_index_html_on_directories(true))
@@ -424,13 +430,38 @@ async fn latest(State(app): State<App>) -> Result<Json<World>, ApiError> {
 async fn by_id(State(app): State<App>, Path(id): Path<String>) -> Result<Json<World>, ApiError> {
     Ok(Json((*find_world(&app, &id).await?).clone()))
 }
+async fn latest_preview(
+    State(app): State<App>,
+    Query(query): Query<preview::PreviewQuery>,
+) -> Result<Json<preview::WorldPreview>, ApiError> {
+    let world = current(&app).await?;
+    compile_preview(world, query).await
+}
+async fn world_preview(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(query): Query<preview::PreviewQuery>,
+) -> Result<Json<preview::WorldPreview>, ApiError> {
+    let world = find_world(&app, &id).await?;
+    compile_preview(world, query).await
+}
+async fn compile_preview(
+    world: Arc<World>,
+    query: preview::PreviewQuery,
+) -> Result<Json<preview::WorldPreview>, ApiError> {
+    let preview = tokio::task::spawn_blocking(move || preview::build(&world, query))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(preview))
+}
 async fn manifest(
     State(app): State<App>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let w = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":32,"max_tile_level":22,"numeric_profile":"cpu-f64-v1"}),
+        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":128,"max_tile_level":18,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[6,10]}),
     ))
 }
 #[derive(Deserialize)]
@@ -439,9 +470,28 @@ struct TileQuery {
     segments: u32,
     phase: Option<f64>,
     generator: Option<String>,
+    #[serde(default)]
+    format: TileFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TileFormat {
+    #[default]
+    Json,
+    Postcard,
+}
+
+impl TileFormat {
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Json => "application/json",
+            Self::Postcard => world_core::tile_wire::CONTENT_TYPE,
+        }
+    }
 }
 fn default_segments() -> u32 {
-    32
+    128
 }
 async fn tile(
     State(app): State<App>,
@@ -458,19 +508,27 @@ async fn tile(
         return Err(ApiError(StatusCode::BAD_REQUEST, "phase invalide".into()));
     }
     let generator = q.generator.as_deref().unwrap_or("spatial");
-    if !["spatial", "contracts"].contains(&generator) {
+    if !["spatial", "analytic", "contracts"].contains(&generator) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "générateur inconnu".into(),
         ));
     }
     let contracts = generator == "contracts";
+    let analytic = generator == "analytic";
+    let format = q.format;
+    if contracts && matches!(format, TileFormat::Postcard) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Postcard est disponible pour le générateur spatial uniquement".into(),
+        ));
+    }
     let key = format!(
-        "{id}/{face}/{level}/{x}/{y}/{}/{:?}/{generator}",
+        "{id}/{face}/{level}/{x}/{y}/{}/{:?}/{generator}/{format:?}",
         q.segments, q.phase
     );
     if let Some(bytes) = app.tiles.read().await.entries.get(&key).cloned() {
-        return Ok(tile_response(bytes));
+        return Ok(tile_response(bytes, format));
     }
     let _permit = app
         .tile_workers
@@ -478,37 +536,56 @@ async fn tile(
         .await
         .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
     let w = find_world(&app, &id).await?;
-    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+    let region_data = app.data.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let key = TileKey { face, level, x, y };
-        let mut packet = if contracts {
-            hierarchy::compile_tile(&w, key, q.segments)?
-        } else {
-            serde_json::to_value(w.tile(key, q.segments)?)?
-        };
-        if let Some(phase) = q.phase {
-            if let Some(vertices) = packet["vertices"].as_array_mut() {
-                for vertex in vertices {
-                    let direction: [f64; 3] = serde_json::from_value(vertex["direction"].clone())?;
-                    let s = w.seasonal_sample(direction, phase);
-                    vertex["temperature_c"] = serde_json::json!(s.temperature_c);
-                    vertex["moisture"] = serde_json::json!(s.moisture);
-                    vertex["biome"] = serde_json::to_value(s.biome)?;
+        if contracts {
+            let mut packet = hierarchy::compile_tile(&w, key, q.segments)?;
+            if let Some(phase) = q.phase {
+                if let Some(vertices) = packet["vertices"].as_array_mut() {
+                    for vertex in vertices {
+                        let direction: [f64; 3] =
+                            serde_json::from_value(vertex["direction"].clone())?;
+                        let s = w.seasonal_sample(direction, phase);
+                        vertex["temperature_c"] = serde_json::json!(s.temperature_c);
+                        vertex["moisture"] = serde_json::json!(s.moisture);
+                        vertex["biome"] = serde_json::to_value(s.biome)?;
+                        vertex["biome_mix"] = serde_json::to_value(s.biome_mix)?;
+                    }
                 }
             }
+            return Ok(serde_json::to_vec(&packet)?);
         }
-        Ok(packet)
+        let mut tile = if analytic {
+            w.tile(key, q.segments)?
+        } else {
+            regions::compile_tile(&region_data, &w, key, q.segments)?
+        };
+        if let Some(phase) = q.phase {
+            for vertex in &mut tile.vertices {
+                let seasonal = w.seasonal_sample(vertex.direction, phase);
+                vertex.temperature_c = seasonal.temperature_c;
+                vertex.moisture = seasonal.moisture;
+                vertex.biome = seasonal.biome;
+                vertex.biome_mix = seasonal.biome_mix;
+            }
+        }
+        match format {
+            TileFormat::Postcard => world_core::tile_wire::encode_tile(&tile),
+            TileFormat::Json => Ok(serde_json::to_vec(&tile)?),
+        }
     })
     .await
     .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let bytes = bytes::Bytes::from(serde_json::to_vec(&result).map_err(anyhow::Error::from)?);
+    let bytes = bytes::Bytes::from(result);
     app.tiles.write().await.insert(key, bytes.clone());
-    Ok(tile_response(bytes))
+    Ok(tile_response(bytes, format))
 }
-fn tile_response(bytes: bytes::Bytes) -> Response {
+fn tile_response(bytes: bytes::Bytes, format: TileFormat) -> Response {
     (
         [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CONTENT_TYPE, format.content_type()),
             (
                 axum::http::header::CACHE_CONTROL,
                 "private, max-age=31536000, immutable",
@@ -596,6 +673,29 @@ async fn rivers(
         serde_json::json!({"world_id":world.id,"segments":world.rivers(),"discharge_model":"annual mean runoff"}),
     ))
 }
+async fn lakes(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let world = find_world(&app, &id).await?;
+    let lakes=world.lakes.iter().map(|lake|serde_json::json!({
+        "id":lake.id,"level_m":lake.level_m,"area_m2":lake.area_m2,"volume_m3":lake.volume_m3,
+        "inflow_m3_s":lake.inflow_m3_s,"outflow_m3_s":lake.outflow_m3_s,
+        "direction":world.cells[lake.control_cell].position,"cell_count":lake.cells.len()
+    })).collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({"world_id":world.id,"lakes":lakes})))
+}
+async fn region_reports(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let world = find_world(&app, &id).await?;
+    let data = app.data.clone();
+    let reports = tokio::task::spawn_blocking(move || regions::reports(&data, &world))
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(serde_json::json!({"reports":reports})))
+}
 async fn human(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -636,7 +736,7 @@ fn validate_world(w: &World) -> Result<serde_json::Value> {
                 r < w.cells.len() && r != i,
                 "récepteur invalide cellule {i}"
             );
-            if c.water_m + 0.02 < w.cells[r].water_m {
+            if c.routing_height_m + 0.02 < w.cells[r].routing_height_m {
                 uphill += 1;
             }
         } else {
@@ -666,19 +766,119 @@ fn validate_world(w: &World) -> Result<serde_json::Value> {
     }
     anyhow::ensure!(
         uphill == 0,
-        "{uphill} récepteurs remontent la surface d'eau"
+        "{uphill} récepteurs remontent le potentiel de drainage"
     );
     let runoff = w.stats.total_runoff_m3_s;
-    let relative = (outlets - runoff).abs() / runoff.abs().max(1.0);
+    let losses = w
+        .lakes
+        .iter()
+        .map(|l| l.evaporation_m3_s + l.infiltration_m3_s + l.storage_change_m3_s)
+        .sum::<f64>();
+    let relative = (outlets + losses - runoff).abs() / runoff.abs().max(1.0);
     anyhow::ensure!(relative < 1e-4, "bilan de débit non conservé ({relative})");
     Ok(
-        serde_json::json!({"valid":true,"cells":w.cells.len(),"drainage_cycles":0,"uphill_receivers":uphill,"runoff_m3_s":runoff,"outlets_m3_s":outlets,"water_relative_residual":relative,"scope":"atlas; détails locaux et climat simplifiés"}),
+        serde_json::json!({"valid":true,"cells":w.cells.len(),"drainage_cycles":0,"uphill_potential_receivers":uphill,"runoff_m3_s":runoff,"outlets_m3_s":outlets,"lake_losses_and_storage_m3_s":losses,"water_relative_residual":relative,"erosion":w.erosion,"lake_count":w.lakes.len(),"scope":"atlas physique; érosion fluviale, transport sédimentaire et réservoirs; climat simplifié"}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn binary_tiles_match_json_with_seasons_and_separate_cache_entries() {
+        let world = Arc::new(
+            World::generate(WorldConfig {
+                resolution: 8,
+                erosion_steps: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let app = App {
+            data: std::env::temp_dir(),
+            world: Arc::new(RwLock::new(Some(world.clone()))),
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            generation: Arc::new(Semaphore::new(1)),
+            counter: Arc::new(AtomicU64::new(0)),
+            tiles: Arc::new(RwLock::new(TileCache::default())),
+            tile_workers: Arc::new(Semaphore::new(4)),
+        };
+        let query = |format| TileQuery {
+            segments: 128,
+            phase: Some(0.25),
+            generator: None,
+            format,
+        };
+        let binary = tile(
+            State(app.clone()),
+            Path((world.id.clone(), 4, 0, 0, 0)),
+            Query(query(TileFormat::Postcard)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert_eq!(
+            binary.headers()[axum::http::header::CONTENT_TYPE],
+            world_core::tile_wire::CONTENT_TYPE
+        );
+        let binary = axum::body::to_bytes(binary.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decoded = world_core::tile_wire::decode_tile(&binary).unwrap();
+        let seasonal = world.seasonal_sample(decoded.vertices[0].direction, 0.25);
+        assert_eq!(decoded.vertices[0].temperature_c, seasonal.temperature_c);
+        assert_eq!(decoded.vertices[0].biome_mix, seasonal.biome_mix);
+        let json = tile(
+            State(app.clone()),
+            Path((world.id.clone(), 4, 0, 0, 0)),
+            Query(query(TileFormat::Json)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert_eq!(
+            json.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let json = axum::body::to_bytes(json.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut decoded_json: world_core::Tile = serde_json::from_slice(&json).unwrap();
+        for (json_sample, binary_sample) in decoded_json.vertices.iter_mut().zip(&decoded.vertices)
+        {
+            // JSON's decimal f64 parser may change the final bit. Postcard
+            // preserves the original direction exactly; compare geometric
+            // agreement before normalizing those parser-only differences.
+            for i in 0..3 {
+                assert!((json_sample.direction[i] - binary_sample.direction[i]).abs() < 1e-14);
+            }
+            json_sample.direction = binary_sample.direction;
+        }
+        assert!(
+            world_core::tile_wire::encode_tile(&decoded_json)
+                .unwrap()
+                .as_slice()
+                == &binary[..]
+        );
+        assert_eq!(app.tiles.read().await.entries.len(), 2);
+        assert!(binary.len() * 3 < json.len());
+        eprintln!(
+            "128-segment tile: JSON {} bytes, Postcard {} bytes",
+            json.len(),
+            binary.len()
+        );
+        let mut contracts = query(TileFormat::Postcard);
+        contracts.generator = Some("contracts".into());
+        let Err(error) = tile(
+            State(app),
+            Path((world.id.clone(), 4, 0, 0, 0)),
+            Query(contracts),
+        )
+        .await
+        else {
+            panic!("binary contracts must be rejected");
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
 
     #[test]
     fn stored_world_round_trip_and_corruption_detection() {

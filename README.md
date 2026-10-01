@@ -1,6 +1,6 @@
 # World Builder Rust
 
-Prototype de monde procédural sphérique, généré en Rust et exploré avec un visualiseur Rust/WebAssembly. Projet indépendant des anciennes tentatives dans `world_builder`.
+Prototype de planète sphérique : génération Rust locale, érosion globale CPU, érosion régionale CUDA ou CPU, exploration Rust/WebAssembly dans le navigateur. Projet indépendant des anciennes tentatives dans `world_builder`. Aucun entraînement n'est obligatoire.
 
 ## Démarrer
 
@@ -10,40 +10,54 @@ Installer [Rust avec rustup](https://rustup.rs), puis :
 ./scripts/run.sh
 ```
 
-Ouvrir **http://localhost:8001** dans Chrome ou Edge récent. Le premier lancement compile le serveur et le WASM, installe `wasm-bindgen-cli` et prépare la graine 42. Les lancements suivants réutilisent les binaires et le monde enregistré. WebGPU est prioritaire ; **http://localhost:8001/?backend=webgl** force le repli WebGL2. Le calcul global tourne côté serveur local, le rendu côté navigateur : aucun abonnement GPU ou entraînement n'est requis.
+Ouvrir **http://localhost:8001** dans Chrome ou Edge récent. Le premier lancement compile le serveur et le WASM, installe `wasm-bindgen-cli` et prépare la graine 42. Les suivants réutilisent les binaires et le monde enregistré. Après une mise à jour du générateur, régénérer le monde depuis l'interface pour bénéficier du nouvel algorithme.
 
-Sous Windows : `powershell -ExecutionPolicy Bypass -File scripts/run.ps1`. Sous WSL : lancer le script Linux et ouvrir l'URL dans le navigateur Windows. Le rendu utilise ainsi le GPU du navigateur sans dépendre de Vulkan dans WSL. Rust, les scripts et leurs dépendances sont requis localement.
+Sous Windows : `powershell -ExecutionPolicy Bypass -File scripts/run.ps1`. Sous WSL : lancer le script Linux et ouvrir l'URL dans le navigateur Windows. Le calcul régional peut utiliser CUDA dans WSL, tandis que le rendu utilise le GPU du navigateur Windows. WebGPU est prioritaire ; **http://localhost:8001/?backend=webgl** force WebGL2.
 
-## Utilisation
+CUDA requiert le pilote NVIDIA et NVRTC, fourni par le CUDA Toolkit. Le script Linux ajoute `/usr/lib/wsl/lib` et `/usr/local/cuda/lib64` au chemin des bibliothèques. Sous Windows, rendre le dossier `bin` du Toolkit accessible dans `PATH`, par exemple avec `$env:Path = "$env:CUDA_PATH\bin;$env:Path"`. Sans CUDA/NVRTC, le serveur revient automatiquement au CPU ; le rapport régional indique le backend et la raison du repli. Le benchmark CUDA explicite échoue si CUDA est absent.
 
-L'interface permet de changer graine, résolution, rayon, fraction océanique, gravité, obliquité et relief. Faire glisser pour tourner, utiliser la molette pour zoomer, ou choisir un sommet, une rivière ou une localité dans « Aller à… ». Les saisons actualisent le climat et les biomes sans régénérer le terrain ; les débits restent annuels. Rivières, villes et routes peuvent être masquées.
+## Explorer et régler le monde
 
-La case **Raffinement conservatif** active une descente dans les parents déjà raffinés, avec conservation des moments d'altitude et certificats à chaque niveau. Ce mode expérimental ne garantit pas encore le drainage ou les côtes. Le mode spatial par défaut privilégie le relief continu et les chenaux de l'atlas. Les mouvements de caméra ne changent pas l'identité du monde.
+L'interface expose graine, résolution d'atlas, rayon, fraction océanique, gravité, obliquité, relief, pas d'érosion et durée géologique. Commencer avec un atlas 64 ou 128 par face. L'API accepte jusqu'à 1024, avec un coût CPU, RAM et stockage croissant. Le maillage d'aperçu reste plafonné à 128 par face, indépendamment de l'atlas physique.
+
+Faire glisser pour tourner, utiliser la molette pour descendre ou « Aller à… » pour rejoindre un relief sans glace, une côte, un lac, une rivière ou une vallée fluviale. Incliner la vue jusqu’à 35° pour observer les pentes. Les saisons actualisent climat et biomes simplifiés ; les débits restent annuels. Rivières, villes et routes peuvent être masquées. Le relief ×1 garde ses dimensions physiques.
+
+Relief et côtes combinent un atlas évolué par érosion et des bandes fractales adressées par position globale. Les lacs ont un niveau horizontal et un budget d'eau ; les chenaux suivent le drainage. Au zoom, les tuiles partagent des régions érodées et persistées aux niveaux 6 et 10. La région fine hérite du parent ; des bandes différentielles d'érosion s'ajoutent au relief analytique sans effacer ses fréquences plus fines. Leur moyenne locale est retirée pour éviter des cuvettes carrées aux frontières des régions. Le premier passage calcule les régions, les suivants les rechargent.
+
+## Commandes utiles
 
 ```bash
 cargo run --release -p world-app -- generate --config examples/planet.json
 cargo run --release -p world-app -- preview --seed 123 --resolution 64
 cargo run --release -p world-app -- validate
-cargo run --release -p world-app -- refine-demo
 cargo run --release -p world-app -- serve --port 8001
 cargo test --workspace
-cargo run --release -p world-core --example benchmark -- 128 42
-./scripts/build-web.sh             # recompiler le visualiseur
+cargo run --release -p world-core --example benchmark -- 128 1337
+./scripts/build-web.sh
 ```
 
-Les atlas et leurs checksums sont sauvegardés dans `data/worlds/<id>/`. Le serveur recharge le dernier monde au redémarrage. `--data <répertoire>` change l'emplacement. Le serveur écoute sur localhost ; `--host 0.0.0.0` permet un accès depuis le réseau local.
+`generate` compile et sauvegarde ; `preview` choisit rapidement une graine ; `validate` vérifie le dernier atlas ; `serve` lance l'API et le visualiseur. `build-web.sh` recompile le WASM après une modification du renderer.
 
-## Organisation
+Comparer explicitement CUDA à la référence CPU sous WSL :
 
-- `world-core` : sphère, atlas, relief, eau, drainage, climat et biomes simplifiés, échantillonnage et tuiles.
-- `world-contracts` : expérience de subdivision conservatrice avec certificat numérique.
-- `world-app` : commandes, persistance vérifiée et API HTTP ; une génération à la fois.
-- `world-human` : localités agrariennes, allocation de population et routes sur l'atlas.
-- `world-viewer` : renderer Rust/WASM, shaders WGSL et caméra.
-- `web` : interface et chargement du WASM ; aucune génération de planète en JavaScript.
+```bash
+LD_LIBRARY_PATH="/usr/lib/wsl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
+  cargo run --release -p world-erosion --example compare -- 257
+```
 
-## Portée du prototype
+Remplacer `257` par `1025` pour une grille plus grande. RTX 3090, solveur v2, 160 pas, après initialisation : **257² en 5,93 ms CUDA / 1 149 ms CPU** ; **1025² en 82,75 ms / 23 441 ms**. Le rapport donne différence CPU/CUDA, conductivité effective et bilans d'eau et de solides. Les conditions figurent dans [l'état d'implémentation](docs/IMPLEMENTATION.md).
 
-L'[architecture complète](docs/DESIGN_MONDE_MULTIECHELLE.md) est l'objectif de recherche, **pas la description de toutes les capacités actuelles**. Le prototype privilégie un parcours génération → stockage → exploration. Le climat est paramétrique, les lacs sont des dépressions au niveau de débordement, et les modes de détail local restent des approximations. La descente conservatrice est intégrée au service et au visualiseur ; elle ne certifie pas encore le drainage de toutes les tuiles métriques.
+## Organisation et données
 
-Les backends de calcul CUDA/WGSL, le climat saisonnier conservatif, l'érosion physique complète et le mode natif restent à développer. Le modèle appris est facultatif. Aucun objectif de réalisme géologique n'est présenté comme déjà atteint. Voir [l'état d'implémentation](docs/IMPLEMENTATION.md) pour les mesures et limites constatées.
+- `world-core` : sphère, atlas, érosion globale, drainage, réservoirs, climat, biomes et échantillonnage continu.
+- `world-erosion` : solveur régional de ruissellement, transport, érosion/dépôt ; CPU et CUDA/NVRTC.
+- `world-app` : commandes, stockage vérifié, régions persistantes et API HTTP.
+- `world-human` : localités agrariennes, population et routes sur l'atlas.
+- `world-viewer` et `web` : renderer Rust/WASM, shaders, caméra et interface.
+- `world-contracts` : subdivision géométrique certifiée expérimentale, accessible par CLI/API et masquée dans l'interface courante.
+
+Les atlas, régions et checksums vivent dans `data/worlds/<id>/`. Les régions conservent aussi eau restante et sédiments suspendus. `--data <répertoire>` change le stockage. Le serveur écoute sur localhost ; `--host 0.0.0.0` autorise l'accès depuis le réseau local.
+
+## Portée
+
+L'[architecture de recherche](docs/DESIGN_MONDE_MULTIECHELLE.md) dépasse les capacités actuelles. Les bilans sont mesurables, mais lois et coefficients restent simplifiés. L'érosion régionale simule une pluie finie ; son horloge n'est pas calibrée sur l'histoire géologique. Climat paramétrique, réservoirs sans hiérarchie Fill–Spill–Merge complète et absence de restriction conservatrice exacte entre niveaux restent des limites explicites. Le mode natif et le modèle appris ne sont pas implémentés.
