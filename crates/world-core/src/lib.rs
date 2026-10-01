@@ -13,7 +13,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.3";
+pub const GENERATOR_VERSION: &str = "prototype-0.4";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -175,6 +175,9 @@ pub struct Sample {
     pub moisture: f32,
     pub discharge: f32,
     pub biome: Biome,
+    /// Continuous biome mixture, in enum order, for seamless terrain shading.
+    #[serde(default)]
+    pub biome_mix: [f32; 10],
     pub material: Material,
     pub erodability: f32,
     pub ocean: bool,
@@ -926,7 +929,7 @@ impl World {
         let mut selected = 0usize;
         let mut max_weight = -1.0;
         let mut river = 0.0f64;
-        let mut river_bed = f64::INFINITY;
+        let mut biome_mix = [0.0f32; 10];
         for &(index, raw_weight) in &candidates[..candidate_count] {
             let w = raw_weight / total_weight;
             let cell = &self.cells[index];
@@ -938,6 +941,7 @@ impl World {
             ocean_fraction += w * f64::from(u8::from(cell.ocean));
             water_depth += w * f64::from((cell.water_m - cell.height_m).max(0.0));
             erodability += w * f64::from(cell.erodability);
+            biome_mix[cell.biome as usize] += w as f32;
             if w > max_weight {
                 selected = index;
                 max_weight = w;
@@ -958,28 +962,32 @@ impl World {
                     let distance =
                         (2.0 * (1.0 - dot(p, closest)).max(0.0)).sqrt() * self.config.radius_m;
                     let width = self.channel_width(cell.discharge);
-                    let influence = (1.0 - distance / (width * 2.0)).clamp(0.0, 1.0);
+                    // Fade candidates as their interpolation support vanishes,
+                    // preventing segments from disappearing at atlas-cell boundaries.
+                    let support = (w * 8.0).clamp(0.0, 1.0);
+                    let influence = (1.0 - distance / (width * 2.0)).clamp(0.0, 1.0) * support;
                     if influence > river {
                         river = influence;
-                        river_bed =
-                            (1.0 - t) * f64::from(cell.height_m) + t * f64::from(end.height_m);
                     }
                 }
             }
         }
         let cell = &self.cells[selected];
         let coast_envelope = (height.abs() / 180.0).min(1.0);
-        let detail = fbm(self.config.seed ^ 0x44281, p, f64::from(n) * 1.2, 8)
+        let river_taper = river * river * (3.0 - 2.0 * river);
+        let detail = fbm(self.config.seed ^ 0x44281, p, f64::from(n) * 1.2, 14)
             * self.config.detail_m
             * coast_envelope
-            * (1.0 - river)
+            * (1.0 - river_taper)
             * (1.0 - 0.92 * lake_fraction)
             * (1.3 - 0.4 * erodability).clamp(0.3, 1.4);
         let coarse_height = height;
         height += detail;
-        if river > 0.0 && river_bed.is_finite() {
-            height = height.min(river_bed + (1.0 - river) * 40.0 - river * 2.0);
-        }
+        // The atlas bed cannot be imposed on an independently interpolated fine
+        // surface: doing so introduced cliffs as soon as river became positive.
+        // This visual channel has a bounded depth and a C1 bank taper instead.
+        let channel_depth = (0.8 + discharge.max(1.0).log10() * 2.2).clamp(1.0, 20.0);
+        height -= channel_depth * river_taper;
         let ocean = ocean_fraction > 0.0 && height <= 0.0;
         let lake = !ocean && lake_fraction > 0.0 && water_depth > 0.5;
         let water = if ocean {
@@ -1001,6 +1009,7 @@ impl World {
             moisture: moisture as f32,
             discharge: discharge as f32,
             biome,
+            biome_mix,
             material: cell.material,
             erodability: erodability as f32,
             ocean,
@@ -1199,5 +1208,49 @@ mod tests {
         summer.validate().unwrap();
         winter.validate().unwrap();
         assert!(world.seasonal_world(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn fine_river_banks_do_not_jump_to_incompatible_atlas_beds() {
+        let world = World::generate(WorldConfig {
+            resolution: 32,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut max_jump = 0.0f32;
+        let mut checked = 0;
+        for river in world.rivers().into_iter().take(1000) {
+            assert!(river.end_height_m <= river.start_height_m + 0.002);
+            let center = normalize([
+                river.start[0] + river.end[0],
+                river.start[1] + river.end[1],
+                river.start[2] + river.end[2],
+            ]);
+            let along = [
+                river.end[0] - river.start[0],
+                river.end[1] - river.start[1],
+                river.end[2] - river.start[2],
+            ];
+            let side = normalize(cross(center, along));
+            let bank_angle = 2.0 * f64::from(river.width_m) / world.config.radius_m;
+            let offset = 0.10 / world.config.radius_m;
+            for sign in [-1.0, 1.0] {
+                let point = |angle: f64| {
+                    normalize(std::array::from_fn(|i| {
+                        center[i] * angle.cos() + side[i] * sign * angle.sin()
+                    }))
+                };
+                let before = world.sample(point(bank_angle - offset));
+                let after = world.sample(point(bank_angle + offset));
+                max_jump = max_jump.max((before.height_m - after.height_m).abs());
+                assert!((before.biome_mix.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
+        assert!(
+            max_jump < 1.0,
+            "fine river bank jumped {max_jump}m over 20cm"
+        );
     }
 }

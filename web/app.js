@@ -180,12 +180,16 @@ async function updateDetail() {
   const conservative = $('conservative-refinement').checked;
   const keyOf = (tile) => `${worldId}/${tile.face}/${tile.level}/${tile.x}/${tile.y}`;
   const unique = new Map((info.requests ?? [info]).map((tile) => [keyOf(tile), tile]));
-  const missing = [...unique.entries()].filter(([key]) => !loadedTiles.has(key)).slice(0, 4);
+  const priority = (tile) => tile.level === info.level ? 0 : tile.level > info.level ? 1 : 2;
+  const missing = [...unique.entries()]
+    .filter(([key]) => !loadedTiles.has(key))
+    .sort((a, b) => priority(a[1]) - priority(b[1]))
+    .slice(0, 8);
   if (!missing.length) return;
   tileBusy = true;
   try {
     const results = await Promise.allSettled(missing.map(async ([key, tile]) => {
-      const segments = tile.level === info.level ? 64 : 32;
+      const segments = 64;
       const response = await fetch(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=${segments}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`);
       if (!response.ok) throw new Error(`Tuile ${response.status}`);
       const data = await response.text();
@@ -196,9 +200,9 @@ async function updateDetail() {
         if (!passed) throw new Error('Le certificat de conservation des altitudes a échoué');
         $('contract-status').textContent = `Altitude parent conservée · niveau ${tile.level}. Conservation des altitudes uniquement.`;
       }
-      viewer.set_tile(data);
-      loadedTiles.set(key, true);
-      if (loadedTiles.size > 32) loadedTiles.delete(loadedTiles.keys().next().value);
+      const cachedKeys = JSON.parse(viewer.set_tile(data));
+      loadedTiles.clear();
+      for (const cached of cachedKeys) loadedTiles.set(keyOf(cached), true);
     }));
     for (const result of results) if (result.status === 'rejected') console.warn('Tuile indisponible', result.reason);
     $('status').textContent = `Exploration · niveau ${info.level} · ${loadedTiles.size} tuiles en mémoire`;
@@ -263,7 +267,7 @@ try {
   $('runtime-dot').classList.add('ready');
   $('generate').disabled = false;
   requestAnimationFrame(frame);
-  setInterval(updateDetail, 350);
+  setInterval(updateDetail, 100);
   try { loadWorld(await api('/api/world/latest')); } catch { await generate(); }
 } catch (error) {
   $('backend').textContent = 'Moteur indisponible';

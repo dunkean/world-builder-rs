@@ -305,6 +305,13 @@ fn load_world(data: &FsPath, id: Option<&str>) -> Result<World> {
     );
     let world: World = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(world.id == id, "identifiant atlas différent du répertoire");
+    let mut identity = blake3::Hasher::new();
+    identity.update(world_core::GENERATOR_VERSION.as_bytes());
+    identity.update(&serde_json::to_vec(&world.config)?);
+    anyhow::ensure!(
+        world.id == identity.finalize().to_hex()[..20],
+        "ce monde provient d'une ancienne version du générateur; régénérez la même graine pour créer une nouvelle révision"
+    );
     Ok(world)
 }
 

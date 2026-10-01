@@ -15,6 +15,9 @@ struct VertexIn {
     @location(2) normal_height: vec4<f32>,
     @location(3) color: vec4<f32>,
     @location(4) fields: vec4<f32>,
+    @location(5) morph: vec4<f32>,
+    @location(6) shading_normal: vec3<f32>,
+    @location(7) parent_normal: vec3<f32>,
 };
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -22,15 +25,21 @@ struct VertexOut {
     @location(1) normal_height: vec4<f32>,
     @location(2) color: vec4<f32>,
     @location(3) fields: vec4<f32>,
+    @location(4) @interpolate(flat) flags: u32,
+    @location(5) shading_normal: vec3<f32>,
 };
 @vertex fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let relative = (v.position - scene.eye.xyz) + (v.position_low - scene.eye_low.xyz);
+    let progress = smoothstep(0.0, 0.35, scene.light.w - v.morph.y);
+    let relative = (v.position - scene.eye.xyz) + (v.position_low - scene.eye_low.xyz) + v.normal_height.xyz * v.morph.x * (1.0 - progress);
     out.clip = scene.view_projection * vec4<f32>(relative, 1.0);
-    out.position = v.position;
+    out.position = relative;
     out.normal_height = v.normal_height;
     out.color = v.color;
     out.fields = v.fields;
+    out.fields.w = mix(v.morph.z, v.fields.w, progress);
+    out.flags = u32(v.color.a + 0.5);
+    out.shading_normal = normalize(mix(v.parent_normal, v.shading_normal, progress));
     return out;
 }
 
@@ -39,16 +48,17 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
-    if v.color.a >= 99.0 {
-        if v.color.a < 101.0 && scene.options.z < 0.5 { discard; }
-        if v.color.a >= 101.0 && scene.options.w < 0.5 { discard; }
-        let facing = dot(normalize(v.normal_height.xyz), normalize(scene.eye.xyz - v.position));
+    if v.flags >= 99u {
+        if v.flags < 101u && scene.options.z < 0.5 { discard; }
+        if v.flags < 101u && scene.eye.w < 10000.0 { discard; }
+        if v.flags >= 101u && scene.options.w < 0.5 { discard; }
+        let facing = dot(normalize(v.normal_height.xyz), normalize(-v.position));
         if facing < 0.0 { discard; }
         return vec4(v.color.rgb, 1.0);
     }
-    let lod = floor(v.color.a / 2.0);
-    let water = fract(v.color.a / 2.0) > 0.25;
-    let p = normalize(v.position);
+    let lod = f32(v.flags / 2u);
+    let water = (v.flags & 1u) == 1u;
+    let p = normalize(v.normal_height.xyz);
     let a = abs(p);
     var face = 0u;
     var uv = vec2<f32>(-p.z, p.y) / p.x;
@@ -67,6 +77,9 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     }
     if water && v.fields.w <= 0.01 { discard; }
     var color = v.color.rgb;
+    if scene.options.x < 0.5 && lod > 0.0 && scene.options.z > 0.5 {
+        color = mix(color, vec3(0.05, 0.34, 0.44), smoothstep(0.6, 0.9, v.fields.z));
+    }
     let mode = u32(scene.options.x);
     if mode == 1u {
         color = ramp((v.normal_height.w + 2.0) / 8.0, vec3(0.08, 0.20, 0.34), vec3(0.96, 0.91, 0.75));
@@ -77,20 +90,18 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     } else if mode == 4u {
         color = mix(vec3(0.22, 0.25, 0.27), vec3(0.10, 0.77, 0.97), clamp(v.fields.z, 0.0, 1.0));
     }
-    var geometric = normalize(cross(dpdx(v.position), dpdy(v.position)));
     let radial = normalize(v.normal_height.xyz);
-    if dot(geometric, radial) < 0.0 { geometric = -geometric; }
-    let normal = normalize(mix(radial, geometric, 0.70));
+    let normal = normalize(v.shading_normal);
     let diffuse = max(0.0, dot(normal, normalize(scene.light.xyz)));
     let ambient = 0.33;
     let light = ambient + 0.72 * diffuse;
     var result = color * light;
     if water {
-        let eye_dir = normalize(scene.eye.xyz - v.position);
+        let eye_dir = normalize(-v.position);
         let reflection = reflect(-normalize(scene.light.xyz), radial);
         result += vec3(0.55, 0.75, 0.85) * pow(max(0.0, dot(reflection, eye_dir)), 65.0) * 0.55;
     }
-    let limb = pow(1.0 - max(0.0, dot(radial, normalize(scene.eye.xyz - v.position))), 5.0);
+    let limb = pow(1.0 - max(0.0, dot(radial, normalize(-v.position))), 5.0);
     result = mix(result, vec3(0.29, 0.52, 0.70), limb * 0.23);
     return vec4(result, 1.0);
 }
