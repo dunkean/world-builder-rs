@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b121a">
+  <title>World Builder — laboratoire planétaire</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <canvas id="planet" aria-label="Explorateur de planète en trois dimensions"></canvas>
+  <header class="topbar">
+    <div class="brand"><span class="brand-icon">◉</span><div>WORLD BUILDER <small>Laboratoire de mondes procéduraux</small></div></div>
+    <div class="runtime"><span id="runtime-dot" class="dot"></span><span id="backend">Chargement du moteur Rust…</span></div>
+  </header>
+  <aside class="panel">
+    <div class="panel-title"><span>01 / PLANÈTE</span><span class="badge">PROTOTYPE</span></div>
+    <h1>Une graine.<br>Tout un monde.</h1>
+    <p class="intro">Relief, bassins versants et saisons sur une sphère continue. Calcul natif, exploration WebAssembly.</p>
+    <form id="generator">
+      <label for="seed">Graine</label>
+      <div class="seed-row"><input id="seed" name="seed" value="42" type="number" min="0" max="9007199254740991" required><button type="button" id="randomize" aria-label="Nouvelle graine">↻</button></div>
+      <div class="field-pair">
+        <div><label for="resolution">Atlas / face</label><select id="resolution"><option value="32">32 × 32 · rapide</option><option value="64" selected>64 × 64 · aperçu</option><option value="96">96 × 96 · intermédiaire</option><option value="128">128 × 128 · fin</option><option value="256">256 × 256 · détaillé</option></select></div>
+        <div><label for="radius">Rayon (km)</label><input id="radius" type="number" value="1737" min="10" max="20000" step="1"></div>
+      </div>
+      <label class="slider-label" for="ocean-fraction">Surface océanique visée <output id="ocean-value">58 %</output></label>
+      <input id="ocean-fraction" type="range" min="5" max="95" value="58">
+      <details class="advanced"><summary>Paramètres physiques</summary>
+        <div class="field-pair"><div><label for="relief">Relief (m)</label><input id="relief" type="number" value="6000" min="100" max="30000" step="100"></div><div><label for="gravity">Gravité (m/s²)</label><input id="gravity" type="number" value="3" min="0.1" max="50" step="0.1"></div></div>
+        <label for="tilt">Inclinaison axiale (°)</label><input id="tilt" type="number" value="23.4" min="0" max="90" step="0.1">
+      </details>
+      <button class="primary" id="generate" type="submit" disabled><span>Générer la planète</span><span>↗</span></button>
+    </form>
+    <div class="divider"></div>
+    <div class="panel-title"><span>02 / EXPLORATION</span></div>
+    <label for="layer">Champ visible</label>
+    <select id="layer"><option value="0">Biomes et eaux</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage et rivières</option></select>
+    <label class="slider-label" for="season">Saison <output id="season-value">Moyenne annuelle</output></label>
+    <input id="season" type="range" min="0" max="12" value="0" step="1">
+    <div class="overlay-options"><label><input id="show-rivers" type="checkbox" checked> Rivières</label><label><input id="show-human" type="checkbox" checked> Villes et routes</label></div>
+    <label class="contract-option"><input id="conservative-refinement" type="checkbox"> Raffinement conservatif <span>expérimental</span></label>
+    <p id="contract-status" class="hint" hidden>Conservation des altitudes uniquement.</p>
+    <label class="slider-label" for="exaggeration">Relief visuel <output id="exaggeration-value">×12</output></label>
+    <input id="exaggeration" type="range" min="1" max="30" value="12">
+    <button class="secondary" id="reset" type="button">Revenir à la vue orbitale</button>
+    <label for="destination">Aller à…</label>
+    <div class="destination-row"><select id="destination"><option value="">Choisir un lieu</option></select><button class="destination-button" id="fly" type="button" aria-label="Explorer le lieu choisi">↗</button></div>
+    <p class="hint">Glisser pour tourner · Molette pour descendre<br>Le relief ×1 conserve les dimensions physiques.<br>Débits annuels · Routes et villes : symboles.</p>
+    <details id="metrics"><summary>Mesures du monde</summary><div id="stats">Aucune planète chargée.</div></details>
+  </aside>
+  <div class="world-label"><span class="eyebrow">MONDE ACTIF</span><strong id="world-name">Prêt à explorer</strong><span id="world-meta">La géographie précède les détails.</span></div>
+  <footer class="statusbar"><span id="status">Initialisation…</span><span id="camera">Orbite</span><span id="fps">— fps</span></footer>
+  <div id="message" role="status" aria-live="polite" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[package]
+name = "world-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "worldctl"
+path = "src/main.rs"
+
+[dependencies]
+world-core = { path = "../world-core" }
+world-contracts = { path = "../world-contracts" }
+world-human = { path = "../world-human" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "compression-gzip", "trace"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"

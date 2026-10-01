@@ -1,0 +1,7 @@
+/target/
+/data/
+/web/pkg/
+/artifacts/
+/.playwright-cli/
+/output/
+*.tmp
