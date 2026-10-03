@@ -1,0 +1,168 @@
+{
+  "atlas_id": "32ede09abc580c1b3049",
+  "world_config": {
+    "axial_tilt_deg": 23.4,
+    "coast_detail_ratio": 0.16,
+    "coast_reference_spacing_m": 1.0,
+    "detail_m": 140.0,
+    "erosion_steps": 25,
+    "geological_years": 2000001.0,
+    "gravity_m_s2": 3.0,
+    "hillslope_diffusivity_m2_per_year": 0.8,
+    "lake_fill_years": 25.0,
+    "lake_min_basin_depth_m": 8.0,
+    "ocean_fraction": 0.58,
+    "radius_m": 1737000.0,
+    "relief_m": 6000.0,
+    "resolution": 512,
+    "seed": 2386084681,
+    "stream_power_k_per_year": 8e-06,
+    "uplift_m_per_year": 0.00015,
+    "water_volume_m3": null
+  },
+  "note": "Fixed neighbourhoods that exposed river overlap discontinuities before the 0.7 correction. Use only with this atlas/configuration; indices belong to the 512-square atlas.",
+  "rivers": {
+    "mismatch_cases": [
+      {
+        "canonical_level_m": 764.6474338672015,
+        "direction": [
+          0.1573942884772785,
+          -0.7672649608364221,
+          0.621716589635032
+        ],
+        "from": 1023284,
+        "river": 0.5566728711128235,
+        "sample_body_id": 4503599628394806,
+        "sample_level_m": 762.6719360351562,
+        "t": 0.9375,
+        "to": 1023796
+      },
+      {
+        "canonical_level_m": 763.6596949277489,
+        "direction": [
+          0.15735442621809556,
+          -0.7672324601022626,
+          0.621766786436043
+        ],
+        "from": 1023284,
+        "river": 0.9680200815200806,
+        "sample_body_id": 4503599628394806,
+        "sample_level_m": 762.6719360351562,
+        "t": 0.96875,
+        "to": 1023796
+      },
+      {
+        "canonical_level_m": 133.2830941491215,
+        "direction": [
+          0.3626840144538349,
+          -0.3699297367657727,
+          0.85534337871761
+        ],
+        "from": 1122668,
+        "river": 0.2012108862400055,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.78125,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 130.58317087717376,
+        "direction": [
+          0.3626972589934801,
+          -0.3698421988652561,
+          0.8553756170578682
+        ],
+        "from": 1122668,
+        "river": 0.7157891392707825,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.8125,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 126.90115187631231,
+        "direction": [
+          0.36270532952953705,
+          -0.36975588471776066,
+          0.8554095099117476
+        ],
+        "from": 1122668,
+        "river": 0.9603984951972961,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.84375,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 126.90115187631231,
+        "direction": [
+          0.3627077130483393,
+          -0.3696709151660773,
+          0.8554452228959599
+        ],
+        "from": 1122668,
+        "river": 0.9999572038650513,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.875,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 124.79482788614361,
+        "direction": [
+          0.36270389650586476,
+          -0.3695874110219283,
+          0.8554829215557557
+        ],
+        "from": 1122668,
+        "river": 0.9937946200370789,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.90625,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 122.67276132039915,
+        "direction": [
+          0.36269336681488296,
+          -0.3695054930529527,
+          0.8555227713346847
+        ],
+        "from": 1122668,
+        "river": 0.9955459833145142,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.9375,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 120.55069475465466,
+        "direction": [
+          0.3626756108310037,
+          -0.3694252819685789,
+          0.8555649375417359
+        ],
+        "from": 1122668,
+        "river": 0.9994146823883057,
+        "sample_body_id": 4503599628493164,
+        "sample_level_m": 118.42862701416016,
+        "t": 0.96875,
+        "to": 1123180
+      },
+      {
+        "canonical_level_m": 314.678845356176,
+        "direction": [
+          0.4969082070148428,
+          -0.3746163989685276,
+          0.7827801654520554
+        ],
+        "from": 1116579,
+        "river": 0.7639431953430176,
+        "sample_body_id": 4503599628488099,
+        "sample_level_m": 313.95208740234375,
+        "t": 0.96875,
+        "to": 1117090
+      }
+    ]
+  }
+}

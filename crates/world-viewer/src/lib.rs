@@ -15,6 +15,34 @@ const BASES: [[[i32; 3]; 3]; 6] = [
 ];
 
 const RIVER_BODY: u64 = 1 << 52;
+const MAX_TILE_LEVEL: u8 = 24;
+const STREAM_SEGMENTS: usize = 64;
+// Halving a tile's grid requires twice the tile frequency for the same
+// physical vertex spacing, hence up to four times as many visible leaves.
+const MAX_VISIBLE_TILES: usize = 256;
+const MORPH_DURATION_SECONDS: f64 = 0.16;
+
+fn shader_source() -> String {
+    format!(
+        "const MORPH_DURATION_SECONDS: f32 = {MORPH_DURATION_SECONDS};\n{}",
+        include_str!("shader.wgsl")
+    )
+}
+
+fn canonical_tile_vertex_count(key: TileKey, root_segments: usize) -> usize {
+    let segments = if key.level == 0 {
+        root_segments
+    } else {
+        STREAM_SEGMENTS
+    };
+    (segments + 1).pow(2)
+}
+
+fn cut_prepare_budget(motion_age: f64, render_ms: f64, prepare_ms: f64) -> f64 {
+    let target_ms: f64 = if motion_age < 0.15 { 4.0 } else { 8.0 };
+    let other_ms = (render_ms - prepare_ms).max(0.0);
+    target_ms.min((16.0 - other_ms - 2.0).max(4.0)) * 0.001
+}
 
 #[derive(Clone, Deserialize)]
 struct Config {
@@ -294,7 +322,7 @@ fn local_mesh_normals(mesh: &mut Mesh) {
     for parent in [false, true] {
         let sums = local_normal_sums(mesh, parent);
         for (v, sum) in mesh.vertices.iter_mut().zip(sums) {
-            let normal = if sum.length_squared() > 1e-30 {
+            let normal = if sum.length_squared() > 1e-60 {
                 sum.normalize().as_vec3().to_array()
             } else {
                 v.normal_height[..3].try_into().unwrap()
@@ -409,7 +437,7 @@ fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
     let header: PreparedHeader = bytemuck::pod_read_unaligned(&bytes[..hsize]);
     if header.magic != *b"WVP1"
         || header.face >= 6
-        || header.level > 18
+        || header.level > MAX_TILE_LEVEL
         || header.counts[0] > 263169
         || header.counts[1] > 2_000_000
         || header.counts[2] > 12_000_000
@@ -813,6 +841,11 @@ fn append_water_geometry(
                     }
                 })
             {
+                if flowing {
+                    for &i in triangle {
+                        mesh.vertices[(water_start + i) as usize].fields[2] = -2.0;
+                    }
+                }
                 mesh.indices
                     .extend(triangle.iter().map(|&i| water_start + i));
                 continue;
@@ -961,6 +994,28 @@ fn transition_neighbors(parent: TileKey, cut: &HashSet<TileKey>, coarsening: boo
     neighbors
 }
 
+/// Include every source and edge job in the exclusion region of a transition.
+/// Disjoint regions can share a morph epoch without rewriting a neighbor twice.
+fn transition_footprint(
+    parent: TileKey,
+    cut: &HashSet<TileKey>,
+    coarsening: bool,
+    affected: &[TileKey],
+) -> HashSet<TileKey> {
+    let children = lod::children(parent);
+    let mut keys = HashSet::from([parent]);
+    keys.extend(children);
+    keys.extend(affected.iter().copied());
+    for source in if coarsening {
+        children.to_vec()
+    } else {
+        vec![parent]
+    } {
+        keys.extend(tile_neighbors(source, cut));
+    }
+    keys
+}
+
 /// Request the next usable partition change, never the history of a target leaf.
 fn frontier_keys(
     cut: &HashSet<TileKey>,
@@ -1003,6 +1058,21 @@ fn frontier_keys(
     }
     out.extend(parents.into_iter().flat_map(lod::children));
     out
+}
+
+/// Under pressure, only the reserved quartet can survive until its siblings
+/// arrive. Fetching later quartets would immediately evict and request them again.
+fn pressure_frontier(
+    keys: Vec<TileKey>,
+    cut: &HashSet<TileKey>,
+    staged: Option<TileKey>,
+) -> Vec<TileKey> {
+    keys.into_iter()
+        .filter(|key| {
+            staged.is_some_and(|parent| lod::parent(*key) == Some(parent))
+                || lod::children(*key).iter().all(|child| cut.contains(child))
+        })
+        .collect()
 }
 
 fn root_tiles(world: &World) -> Result<Vec<Tile>, String> {
@@ -1206,7 +1276,7 @@ fn face_uv(direction: DVec3) -> (usize, f64, f64) {
 }
 
 fn morph_progress(time: f64, start: f64) -> f64 {
-    let t = ((time - start) / 0.35).clamp(0.0, 1.0);
+    let t = ((time - start) / MORPH_DURATION_SECONDS).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
@@ -1231,7 +1301,7 @@ fn epoch_progress(raw: f32, time: f64, epochs: &[MorphEpoch; 32]) -> f64 {
 }
 
 fn camera_level(altitude: f64) -> u8 {
-    ((1.0 / altitude).log2().floor() as i32 + 2).clamp(0, 18) as u8
+    ((1.0 / altitude).log2().floor() as i32 + 3).clamp(0, i32::from(MAX_TILE_LEVEL)) as u8
 }
 
 /// Close inspection uses a light at 45° to the local surface, including the
@@ -1318,7 +1388,7 @@ fn smooth_mesh_normals(meshes: &mut [Mesh]) {
                     continue;
                 }
                 let normal = shared.get(&key(vertex)).copied().unwrap_or(DVec3::ZERO);
-                let normal = if normal.length_squared() > 1e-30 {
+                let normal = if normal.length_squared() > 1e-60 {
                     normal.normalize().as_vec3().to_array()
                 } else {
                     [
@@ -1645,7 +1715,9 @@ fn footprint_keys(
 
 fn footprint_level(direction: DVec3, altitude: f64, aspect: f64, tilt: f64) -> u8 {
     let mut level = camera_level(altitude);
-    while level > 0 && footprint_keys(direction, level, aspect, altitude, tilt).len() > 64 {
+    while level > 0
+        && footprint_keys(direction, level, aspect, altitude, tilt).len() > MAX_VISIBLE_TILES
+    {
         level -= 1;
     }
     level
@@ -1668,9 +1740,14 @@ fn append_ribbon(
     if tangent.length_squared() < 1e-20 {
         return;
     }
+    // River descriptors already contain curved, resampled chords. Subdividing
+    // every short chord eight more times multiplies orbital geometry needlessly.
+    let steps = (start.angle_between(end) * radius / 2000.0)
+        .ceil()
+        .clamp(1.0, 8.0) as u32;
     let first = mesh.vertices.len() as u32;
-    for i in 0..=8 {
-        let t = f64::from(i) / 8.0;
+    for i in 0..=steps {
+        let t = f64::from(i) / f64::from(steps);
         let direction = start.lerp(end, t).normalize();
         let side = direction.cross(tangent).normalize() * (width * 0.5 / radius);
         let sample = Sample {
@@ -1689,7 +1766,7 @@ fn append_ribbon(
             v.color = [color[0], color[1], color[2], tag];
             mesh.vertices.push(v);
         }
-        if i < 8 {
+        if i < steps {
             let a = first + i * 2;
             mesh.indices.extend([a, a + 1, a + 2, a + 1, a + 3, a + 2]);
         }
@@ -1698,7 +1775,16 @@ fn append_ribbon(
 
 fn object_mesh(rivers: &RiverLayer, human: &HumanLayer, radius: f64, exaggeration: f64) -> Mesh {
     let mut mesh = Mesh::default();
-    for river in &rivers.segments {
+    // This layer is an orbital locator, not the fine physical water mesh.
+    // Bound untrusted/legacy responses; local channels remain in terrain tiles.
+    let mut selected: Vec<_> = rivers.segments.iter().collect();
+    const ORBITAL_RIVER_CHORDS: usize = 32_768;
+    if selected.len() > ORBITAL_RIVER_CHORDS {
+        selected
+            .select_nth_unstable_by(ORBITAL_RIVER_CHORDS, |a, b| b.width_m.total_cmp(&a.width_m));
+        selected.truncate(ORBITAL_RIVER_CHORDS);
+    }
+    for river in selected {
         append_ribbon(
             &mut mesh,
             river.start,
@@ -1828,6 +1914,16 @@ mod browser {
         bound_radius: f64,
         morph_pad: f64,
     }
+    impl Drop for GpuMesh {
+        fn drop(&mut self) {
+            // wgpu's web handle Drop leaves GPU allocation to JavaScript GC.
+            // Explicit destruction makes eviction release its GPU resources.
+            self.vertices.destroy();
+            self.dynamic_buffer.destroy();
+            self.indices.destroy();
+        }
+    }
+
     impl GpuMesh {
         fn upload(device: &wgpu::Device, queue: &wgpu::Queue, mesh: &Mesh) -> Self {
             let dynamic = mesh.vertices.iter().map(dynamic_vertex).collect();
@@ -1838,6 +1934,15 @@ mod browser {
             queue: &wgpu::Queue,
             mesh: &Mesh,
             dynamic: Vec<DynamicVertex>,
+        ) -> Self {
+            Self::upload_with_geometry(device, queue, mesh, dynamic, None)
+        }
+        fn upload_with_geometry(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            mesh: &Mesh,
+            dynamic: Vec<DynamicVertex>,
+            geometry: Option<Vec<SurfaceVertex>>,
         ) -> Self {
             let static_vertices: Vec<_> = mesh
                 .vertices
@@ -1877,7 +1982,8 @@ mod browser {
             if dbytes > 0 {
                 queue.write_buffer(&dynamic_buffer, 0, bytemuck::cast_slice(&dynamic));
             }
-            let geometry: Vec<SurfaceVertex> = mesh.vertices.iter().map(surface_vertex).collect();
+            let geometry =
+                geometry.unwrap_or_else(|| mesh.vertices.iter().map(surface_vertex).collect());
             let ocean_start = geometry.iter().position(|g| g.ocean);
             let (mut low, mut high) =
                 (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
@@ -1913,6 +2019,22 @@ mod browser {
                 .map(|d| d.morph[0].abs().max(d.morph[3].abs()) as f64)
                 .fold(0.0, f64::max);
             self.dynamic = dynamic;
+        }
+        fn update_edges(
+            &mut self,
+            queue: &wgpu::Queue,
+            indices: &[usize],
+            dynamic: Vec<DynamicVertex>,
+        ) {
+            for (&index, vertex) in indices.iter().zip(dynamic) {
+                self.morph_pad = self
+                    .morph_pad
+                    .max(f64::from(vertex.morph[0].abs().max(vertex.morph[3].abs())));
+                self.dynamic[index] = vertex;
+            }
+            // One upload avoids hundreds of strided WebGPU calls along the two
+            // vertical edges, while CPU work retains only the changed vertices.
+            queue.write_buffer(&self.dynamic_buffer, 0, bytemuck::cast_slice(&self.dynamic));
         }
         fn cpu_bytes(&self) -> usize {
             self.dynamic.capacity() * std::mem::size_of::<DynamicVertex>()
@@ -1952,16 +2074,17 @@ mod browser {
         key: TileKey,
         mesh: Option<Mesh>,
         dynamic: Vec<DynamicVertex>,
-        geometry: Vec<SurfaceVertex>,
+        geometry: Option<Vec<SurfaceVertex>>,
+        ocean_start: Option<usize>,
         indices: Option<Vec<usize>>,
         kind: WorkKind,
         cursor: usize,
     }
     struct PendingCut {
-        parent: TileKey,
-        children: [TileKey; 4],
+        parents: Vec<TileKey>,
+        children: Vec<TileKey>,
         proposed: HashSet<TileKey>,
-        jobs: Vec<(TileKey, WorkKind)>,
+        jobs: Vec<(TileKey, WorkKind, TileKey)>,
         cursor: usize,
         work: Option<CutWork>,
         shared: HashMap<(u8, [i64; 3]), [f32; 3]>,
@@ -1979,6 +2102,7 @@ mod browser {
         reused_tiles: u64,
         max_prepare_ms: f64,
         last_prepare_ms: f64,
+        last_render_ms: f64,
         max_render_ms: f64,
         surface_fallbacks: u64,
     }
@@ -2031,6 +2155,7 @@ mod browser {
         cut_dirty: bool,
         cut_visible: bool,
         signature: Option<[u64; 5]>,
+        last_camera_change: f64,
         cut_serial: u64,
         morph_start: f64,
         epochs: [MorphEpoch; 32],
@@ -2099,14 +2224,14 @@ mod browser {
 
         fn level_for(&self, direction: DVec3, altitude: f64) -> u8 {
             let step = ((self.config.height.max(1) as f64
-                / (128.0 * altitude * 0.41421356237 * 2.0))
+                / (STREAM_SEGMENTS as f64 * altitude * 0.41421356237 * 2.0))
                 .log2()
                 .ceil() as i32)
-                .clamp(0, 18) as u8;
+                .clamp(0, i32::from(MAX_TILE_LEVEL)) as u8;
             let mut level = camera_level(altitude).max(step);
             while level > 0
                 && footprint_keys(direction, level, self.aspect(), altitude, self.view_tilt).len()
-                    > 64
+                    > MAX_VISIBLE_TILES
             {
                 level -= 1;
             }
@@ -2158,6 +2283,8 @@ mod browser {
             if cpu < 768 * 1024 * 1024 * 4 / 5 && gpu < 768 * 1024 * 1024 * 4 / 5 {
                 let future = self.requests_at(self.direction(), self.altitude * 0.5);
                 keys.extend(future.into_iter().filter(|key| seen.insert(*key)).take(64));
+            } else {
+                keys = pressure_frontier(keys, &self.active_set, self.staged_parent());
             }
             keys
         }
@@ -2354,14 +2481,20 @@ mod browser {
             }
             let mut pinned = self.active_set.clone();
             pinned.extend(self.active_set.iter().filter_map(|leaf| lod::parent(*leaf)));
+            let (face, u, v) = face_uv(self.direction());
+            if let Some(center) = lod::covering_key(&self.active_set, face as u8, u, v) {
+                // Keep the central return path resident without retaining every
+                // historical ancestor of the entire visible partition.
+                pinned.extend((0..center.level).filter_map(|level| lod::ancestor(center, level)));
+            }
             // Reserve a complete sibling quartet before its fourth packet arrives.
             // Without this reservation, pressure can repeatedly evict the first three.
             if let Some(parent) = self.staged_parent() {
                 pinned.extend(lod::children(parent));
             }
             if let Some(p) = &self.pending {
-                pinned.insert(p.parent);
-                pinned.extend(p.children);
+                pinned.extend(p.parents.iter().copied());
+                pinned.extend(p.children.iter().copied());
                 pinned.extend(p.jobs.iter().map(|v| v.0));
             }
             let wanted: HashSet<_> = self.requests().into_iter().collect();
@@ -2472,15 +2605,68 @@ mod browser {
                 .min_by_key(|k| k.level)?;
             self.cached_surface(coarse, direction, time, true)
         }
-        fn plan_transition(&mut self, parent: TileKey, coarsening: bool) {
-            let children = lod::children(parent);
+        fn plan_transitions(
+            &mut self,
+            candidates: impl IntoIterator<Item = TileKey>,
+            coarsening: bool,
+            now: f64,
+            transitioning: bool,
+            frame_deadline: f64,
+        ) -> bool {
+            let mut parents = Vec::new();
+            let mut children = Vec::new();
+            let mut neighbors = Vec::new();
+            let mut reserved = HashSet::new();
+            let mut instant = false;
             let mut proposed = self.active_set.clone();
-            if coarsening {
-                if !lod::coarsen(&mut proposed, parent) {
-                    return;
+            let plan_begin = js_now();
+            for parent in candidates {
+                if js_now() >= frame_deadline.min(plan_begin + 0.002) {
+                    // Rejected candidates can cost as much as accepted ones.
+                    // Continue planning next frame instead of scanning the
+                    // entire partition while its neighboring morphs settle.
+                    self.cut_dirty = true;
+                    break;
                 }
-            } else if !lod::split(&mut proposed, parent) {
-                return;
+                if transitioning && !self.neighbors_settled(parent, coarsening, now) {
+                    continue;
+                }
+                let affected = self.affected_neighbors(parent, coarsening);
+                let quartet = lod::children(parent);
+                let candidate_instant = coarsening
+                    && self.outside_view(
+                        std::iter::once(parent)
+                            .chain(quartet)
+                            .chain(affected.iter().copied()),
+                        now,
+                    );
+                if !parents.is_empty() && candidate_instant != instant {
+                    continue;
+                }
+                let footprint =
+                    transition_footprint(parent, &self.active_set, coarsening, &affected);
+                if !reserved.is_disjoint(&footprint) {
+                    continue;
+                }
+                let changed = if coarsening {
+                    lod::coarsen(&mut proposed, parent)
+                } else {
+                    lod::split(&mut proposed, parent)
+                };
+                if !changed {
+                    continue;
+                }
+                instant = candidate_instant;
+                parents.push(parent);
+                children.extend(quartet);
+                neighbors.extend(affected.into_iter().map(|key| (key, parent)));
+                reserved.extend(footprint);
+                if parents.len() == 8 || js_now() - plan_begin >= 0.002 {
+                    break;
+                }
+            }
+            if parents.is_empty() {
+                return false;
             }
             self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
             let epoch = self.next_epoch;
@@ -2488,15 +2674,9 @@ mod browser {
                 id: epoch,
                 start: 1e9,
             };
-            let neighbors = self.affected_neighbors(parent, coarsening);
-            let instant = coarsening
-                && self.outside_view(
-                    children.into_iter().chain(neighbors.iter().copied()),
-                    js_now(),
-                );
-            let mut shared_keys: HashSet<_> = children.into_iter().collect();
-            shared_keys.insert(parent);
-            shared_keys.extend(neighbors.iter().copied());
+            let mut shared_keys: HashSet<_> = children.iter().copied().collect();
+            shared_keys.extend(parents.iter().copied());
+            shared_keys.extend(neighbors.iter().map(|(key, _)| *key));
             let same_level_sources: Vec<_> = shared_keys.iter().copied().collect();
             for key in same_level_sources {
                 for neighbor in tile_neighbors(key, &proposed) {
@@ -2527,10 +2707,14 @@ mod browser {
                 .collect();
             let mut jobs = Vec::new();
             if coarsening {
-                jobs.push((parent, WorkKind::Parent));
+                jobs.extend(
+                    parents
+                        .iter()
+                        .map(|&parent| (parent, WorkKind::Parent, parent)),
+                );
             }
             if !instant {
-                jobs.extend(children.into_iter().map(|k| {
+                jobs.extend(children.iter().copied().map(|k| {
                     (
                         k,
                         if coarsening {
@@ -2538,12 +2722,17 @@ mod browser {
                         } else {
                             WorkKind::Refine
                         },
+                        lod::parent(k).unwrap(),
                     )
                 }));
             }
-            jobs.extend(neighbors.into_iter().map(|k| (k, WorkKind::Edge)));
+            jobs.extend(
+                neighbors
+                    .into_iter()
+                    .map(|(key, parent)| (key, WorkKind::Edge, parent)),
+            );
             self.pending = Some(PendingCut {
-                parent,
+                parents,
                 children,
                 proposed,
                 jobs,
@@ -2555,6 +2744,7 @@ mod browser {
                 epoch,
                 started: None,
             });
+            true
         }
         fn affected_neighbors(&mut self, parent: TileKey, coarsening: bool) -> Vec<TileKey> {
             if self.neighbor_serial != self.cut_serial {
@@ -2575,18 +2765,36 @@ mod browser {
             if source
                 .into_iter()
                 .flat_map(|key| tile_neighbors(key, &self.active_set))
-                .any(|key| self.tiles[self.tile_lookup[&key]].transition_start + 0.35 > time)
+                .any(|key| {
+                    self.tiles[self.tile_lookup[&key]].transition_start + MORPH_DURATION_SECONDS
+                        > time
+                })
             {
                 return false;
             }
             self.affected_neighbors(parent, coarsening)
                 .iter()
-                .all(|key| self.tiles[self.tile_lookup[key]].transition_start + 0.35 <= time)
+                .all(|key| {
+                    self.tiles[self.tile_lookup[key]].transition_start + MORPH_DURATION_SECONDS
+                        <= time
+                })
         }
         fn refresh_cut(&mut self) {
             self.tick = self.tick.wrapping_add(1);
             if self.world.is_none() {
                 return;
+            }
+            let begin = js_now();
+            let deadline = begin
+                + cut_prepare_budget(
+                    begin - self.last_camera_change,
+                    self.metrics.last_render_ms,
+                    self.metrics.last_prepare_ms,
+                );
+            for key in &self.active_keys {
+                if let Some(&index) = self.tile_lookup.get(key) {
+                    self.tiles[index].last_used = self.tick;
+                }
             }
             let signature = [
                 self.yaw.to_bits(),
@@ -2597,6 +2805,7 @@ mod browser {
             ];
             if self.signature != Some(signature) {
                 self.signature = Some(signature);
+                self.last_camera_change = js_now();
                 self.cut_dirty = true;
                 self.wanted = self.detail_level();
                 self.desired = self.footprint(self.wanted);
@@ -2604,7 +2813,7 @@ mod browser {
             }
             // In-flight local work is never cancelled merely because the camera moved.
             if self.pending.is_some() {
-                self.process_cut();
+                self.process_cut(deadline);
                 return;
             }
             if !self.cut_dirty {
@@ -2612,10 +2821,9 @@ mod browser {
             }
             self.cut_dirty = false;
             let now = js_now();
-            let transitioning = self
-                .active_set
-                .iter()
-                .any(|key| self.tiles[self.tile_lookup[key]].transition_start + 0.35 > now);
+            let transitioning = self.active_set.iter().any(|key| {
+                self.tiles[self.tile_lookup[key]].transition_start + MORPH_DURATION_SECONDS > now
+            });
             let mut parents: HashSet<_> = self
                 .active_set
                 .iter()
@@ -2632,23 +2840,28 @@ mod browser {
                             || !self.desired.iter().any(|d| {
                                 lod::is_ancestor(*parent, *d) || lod::is_ancestor(*d, *parent)
                             }))
-                        && lod::children(*parent)
-                            .iter()
-                            .all(|k| self.tiles[self.tile_lookup[k]].transition_start + 0.35 <= now)
+                        && lod::children(*parent).iter().all(|k| {
+                            self.tiles[self.tile_lookup[k]].transition_start
+                                + MORPH_DURATION_SECONDS
+                                <= now
+                        })
                 })
                 .collect();
             coarsen.sort_by(|a, b| b.level.cmp(&a.level));
             let (cpu, gpu) = self.cache_bytes();
             if cpu > 768 * 1024 * 1024 || gpu > 768 * 1024 * 1024 {
-                if let Some(parent) =
-                    coarsen.iter().find(|parent| {
-                        !self.desired.iter().any(|d| {
-                            lod::is_ancestor(**parent, *d) || lod::is_ancestor(*d, **parent)
-                        }) && (!transitioning || self.neighbors_settled(**parent, true, now))
+                let outside: Vec<_> = coarsen
+                    .iter()
+                    .copied()
+                    .filter(|parent| {
+                        !self
+                            .desired
+                            .iter()
+                            .any(|d| lod::is_ancestor(*parent, *d) || lod::is_ancestor(*d, *parent))
                     })
-                {
-                    self.plan_transition(*parent, true);
-                    self.process_cut();
+                    .collect();
+                if self.plan_transitions(outside, true, now, transitioning, deadline) {
+                    self.process_cut(deadline);
                     return;
                 }
             }
@@ -2664,7 +2877,9 @@ mod browser {
                                 self.tiles[i].gpu.is_some() || self.tiles[i].prepared.is_some()
                             })
                         })
-                        && self.tiles[self.tile_lookup[key]].transition_start + 0.35 <= now
+                        && self.tiles[self.tile_lookup[key]].transition_start
+                            + MORPH_DURATION_SECONDS
+                            <= now
                 })
                 .collect();
             refine.sort_by(|a, b| {
@@ -2674,35 +2889,26 @@ mod browser {
                         .total_cmp(&tile_center(*a).dot(self.direction()))
                 })
             });
-            if let Some(parent) = refine
-                .iter()
-                .find(|parent| !transitioning || self.neighbors_settled(**parent, false, now))
-            {
-                self.plan_transition(*parent, false);
-                self.process_cut();
+            if self.plan_transitions(refine, false, now, transitioning, deadline) {
+                self.process_cut(deadline);
                 return;
             }
-            if let Some(parent) = coarsen
-                .iter()
-                .find(|parent| !transitioning || self.neighbors_settled(**parent, true, now))
-            {
-                self.plan_transition(*parent, true);
-                self.process_cut();
-            } else if self
-                .active_set
-                .iter()
-                .any(|k| self.tiles[self.tile_lookup[k]].transition_start + 0.35 > now)
-            {
+            if self.plan_transitions(coarsen, true, now, transitioning, deadline) {
+                self.process_cut(deadline);
+            } else if self.active_set.iter().any(|k| {
+                self.tiles[self.tile_lookup[k]].transition_start + MORPH_DURATION_SECONDS > now
+            }) {
                 self.cut_dirty = true;
             }
         }
-        fn process_cut(&mut self) {
+        fn process_cut(&mut self, deadline: f64) {
             let Some(mut pending) = self.pending.take() else {
                 return;
             };
             let begin = js_now();
+            let budget = (deadline - begin).max(0.0);
             if let Some(start) = pending.started {
-                if pending.coarsening && begin < start + 0.35 {
+                if pending.coarsening && begin < start + MORPH_DURATION_SECONDS {
                     self.pending = Some(pending);
                     return;
                 }
@@ -2715,38 +2921,49 @@ mod browser {
                 return;
             }
             while pending.cursor < pending.jobs.len() {
-                let (key, kind) = pending.jobs[pending.cursor];
+                if js_now() >= deadline {
+                    break;
+                }
+                let (key, kind, parent) = pending.jobs[pending.cursor];
                 let index = self.tile_lookup[&key];
                 if pending.work.is_none() {
+                    if kind != WorkKind::Edge
+                        && (js_now() - begin >= budget * 0.5 || deadline - js_now() < 0.001)
+                    {
+                        break;
+                    }
                     let tile = &mut self.tiles[index];
                     tile.last_used = self.tick;
-                    let (mesh, dynamic, geometry) = if let Some(mesh) = tile.prepared.take() {
+                    let (mesh, dynamic, geometry, ocean_start, indices) = if kind == WorkKind::Edge
+                    {
+                        let gpu = tile.gpu.as_ref().expect("active edge mesh is resident");
+                        let mut indices: Vec<_> =
+                            tile.borders.iter().map(|b| b.index as usize).collect();
+                        if let Some(start) = gpu.ocean_start {
+                            indices.extend(tile.borders.iter().map(|b| start + b.index as usize));
+                        }
+                        let dynamic = indices.iter().map(|&i| gpu.dynamic[i]).collect();
+                        self.metrics.reused_tiles += 1;
+                        (None, dynamic, None, gpu.ocean_start, Some(indices))
+                    } else if let Some(mesh) = tile.prepared.take() {
                         let dynamic = mesh.vertices.iter().map(dynamic_vertex).collect();
-                        let geometry = mesh.vertices.iter().map(surface_vertex).collect();
-                        (Some(mesh), dynamic, geometry)
+                        let geometry: Vec<_> = mesh.vertices.iter().map(surface_vertex).collect();
+                        let ocean_start = geometry.iter().position(|g| g.ocean);
+                        (Some(mesh), dynamic, Some(geometry), ocean_start, None)
                     } else if let Some(gpu) = &tile.gpu {
                         self.metrics.reused_tiles += 1;
-                        (None, gpu.dynamic.clone(), gpu.geometry.clone())
+                        (None, gpu.dynamic.clone(), None, gpu.ocean_start, None)
                     } else {
                         self.cut_dirty = true;
                         self.pending = Some(pending);
                         return;
-                    };
-                    let indices = if kind == WorkKind::Edge {
-                        let mut indices: Vec<_> =
-                            tile.borders.iter().map(|b| b.index as usize).collect();
-                        if let Some(start) = geometry.iter().position(|g| g.ocean) {
-                            indices.extend(tile.borders.iter().map(|b| start + b.index as usize));
-                        }
-                        Some(indices)
-                    } else {
-                        None
                     };
                     pending.work = Some(CutWork {
                         key,
                         mesh,
                         dynamic,
                         geometry,
+                        ocean_start,
                         indices,
                         kind,
                         cursor: 0,
@@ -2756,14 +2973,22 @@ mod browser {
                 let length = work.indices.as_ref().map_or(work.dynamic.len(), Vec::len);
                 let ground_count = self.tiles[index].tile.vertices.len();
                 let side = (ground_count as f64).sqrt() as usize;
-                let ocean_start = work.geometry.iter().position(|g| g.ocean);
+                let ocean_start = work.ocean_start;
                 while work.cursor < length {
                     let i = work
                         .indices
                         .as_ref()
                         .map_or(work.cursor, |indices| indices[work.cursor]);
-                    let g = work.geometry[i];
-                    let old = work.dynamic[i];
+                    let g = work.geometry.as_ref().map_or_else(
+                        || self.tiles[index].gpu.as_ref().unwrap().geometry[i],
+                        |geometry| geometry[i],
+                    );
+                    let dynamic_index = if work.indices.is_some() {
+                        work.cursor
+                    } else {
+                        i
+                    };
+                    let old = work.dynamic[dynamic_index];
                     let original_index = if i < ground_count {
                         Some(i)
                     } else {
@@ -2818,7 +3043,7 @@ mod browser {
                                     self.tiles[index].tile.vertices[sample_index].direction,
                                 );
                                 self.parent_source(
-                                    pending.parent,
+                                    parent,
                                     key,
                                     sample_index,
                                     side,
@@ -2857,7 +3082,7 @@ mod browser {
                         }
                         WorkKind::Edge => (current_delta, current_depth, current_normal),
                     };
-                    work.dynamic[i] = DynamicVertex {
+                    work.dynamic[dynamic_index] = DynamicVertex {
                         morph: [
                             initial_delta as f32,
                             -(pending.epoch as f32),
@@ -2869,7 +3094,7 @@ mod browser {
                         water_depth: final_depth as f32,
                     };
                     work.cursor += 1;
-                    if work.cursor % 32 == 0 && js_now() - begin >= 0.004 {
+                    if work.cursor % 32 == 0 && js_now() >= deadline {
                         break;
                     }
                 }
@@ -2879,22 +3104,35 @@ mod browser {
                 }
                 let tile = &mut self.tiles[index];
                 let bytes = if let Some(mesh) = work.mesh {
-                    let gpu =
-                        GpuMesh::upload_dynamic(&self.device, &self.queue, &mesh, work.dynamic);
+                    let gpu = GpuMesh::upload_with_geometry(
+                        &self.device,
+                        &self.queue,
+                        &mesh,
+                        work.dynamic,
+                        work.geometry.take(),
+                    );
                     let bytes = gpu.bytes;
                     tile.gpu = Some(gpu);
                     bytes
                 } else {
                     let gpu = tile.gpu.as_mut().unwrap();
-                    let bytes = work.dynamic.len() * std::mem::size_of::<DynamicVertex>();
-                    gpu.update_dynamic(&self.queue, work.dynamic);
+                    let bytes = gpu.dynamic.len() * std::mem::size_of::<DynamicVertex>();
+                    if let Some(indices) = work.indices {
+                        gpu.update_edges(&self.queue, &indices, work.dynamic);
+                    } else {
+                        gpu.update_dynamic(&self.queue, work.dynamic);
+                    }
                     bytes
                 };
                 tile.morph_source = self.cut_serial;
                 self.metrics.uploads += 1;
                 self.metrics.upload_bytes += bytes as u64;
                 pending.cursor += 1;
-                break;
+                // Small edge jobs should share a frame; a completed upload no
+                // longer forces the scheduler to leave the remaining budget idle.
+                if js_now() >= deadline {
+                    break;
+                }
             }
             let elapsed = (js_now() - begin) * 1000.0;
             self.metrics.last_prepare_ms = elapsed;
@@ -2902,11 +3140,14 @@ mod browser {
             if pending.cursor == pending.jobs.len() {
                 if pending.instant
                     && !self.outside_view(
-                        pending.children.into_iter().chain(
-                            pending.jobs.iter().filter_map(|(key, kind)| {
+                        pending
+                            .parents
+                            .iter()
+                            .copied()
+                            .chain(pending.children.iter().copied())
+                            .chain(pending.jobs.iter().filter_map(|(key, kind, _)| {
                                 (*kind == WorkKind::Edge).then_some(*key)
-                            }),
-                        ),
+                            })),
                         js_now(),
                     )
                 {
@@ -2916,16 +3157,21 @@ mod browser {
                     pending.jobs.extend(
                         pending
                             .children
-                            .into_iter()
-                            .map(|key| (key, WorkKind::Coarsen)),
+                            .iter()
+                            .copied()
+                            .map(|key| (key, WorkKind::Coarsen, lod::parent(key).unwrap())),
                     );
                     self.pending = Some(pending);
                     return;
                 }
                 let start = f64::from(js_now() as f32);
-                let epoch_start = if pending.instant { start - 0.35 } else { start };
+                let epoch_start = if pending.instant {
+                    start - MORPH_DURATION_SECONDS
+                } else {
+                    start
+                };
                 self.epochs[pending.epoch as usize % 32].start = epoch_start as f32;
-                for (key, _) in &pending.jobs {
+                for (key, _, _) in &pending.jobs {
                     self.tiles[self.tile_lookup[key]].transition_start = epoch_start;
                 }
                 pending.started = Some(start);
@@ -3071,10 +3317,9 @@ mod browser {
             }
             self.queue.submit(Some(encoder.finish()));
             output.present();
-            self.metrics.max_render_ms = self
-                .metrics
-                .max_render_ms
-                .max((js_now() - frame_begin) * 1000.0);
+            self.metrics.last_render_ms = (js_now() - frame_begin) * 1000.0;
+            self.metrics.max_render_ms =
+                self.metrics.max_render_ms.max(self.metrics.last_render_ms);
             Ok(())
         }
     }
@@ -3175,7 +3420,7 @@ mod browser {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("planet shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
         });
         let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x4];
         let dynamic_attributes =
@@ -3253,6 +3498,7 @@ mod browser {
                 cut_dirty: true,
                 cut_visible: false,
                 signature: None,
+                last_camera_change: 0.0,
                 cut_serial: 1,
                 morph_start: 0.0,
                 epochs: [MorphEpoch::default(); 32],
@@ -3369,10 +3615,11 @@ mod browser {
                 return Err(JsValue::from_str("Préparation périmée"));
             }
             if world.render_grid.as_deref() == Some("vertices")
-                && prepared.tile.vertices.len() != (world.mesh_resolution() + 1).pow(2)
+                && prepared.tile.vertices.len()
+                    != canonical_tile_vertex_count(prepared.tile.key, world.mesh_resolution())
             {
                 return Err(JsValue::from_str(
-                    "La tuile doit utiliser la même grille que les racines canoniques",
+                    "La tuile doit utiliser la grille canonique de son niveau",
                 ));
             }
             let key = prepared.tile.key;
@@ -3414,6 +3661,8 @@ mod browser {
                 r.tiles.retain(|t| t.key.level == 0);
                 r.rebuild_lookup();
                 r.active_set = lod::initial_leaves();
+                r.cut_serial = r.cut_serial.wrapping_add(1);
+                r.neighbor_cache.clear();
                 r.sync_cut();
                 r.cut_dirty = true;
                 r.signature = None;
@@ -3600,7 +3849,7 @@ mod browser {
             let y = (((v + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
             let requests = r.requests();
             serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level":lod::covering_key(&r.active_set,face as u8,u,v).map(|key|key.level), "active_tiles": r.active_keys.len(), "draw_tiles":r.draw_keys.len(),
-                "cpu_bytes":r.cache_bytes().0,"gpu_bytes":r.cache_bytes().1,"cpu_budget_bytes":768*1024*1024u64,"gpu_budget_bytes":768*1024*1024u64,
+                "cpu_bytes":r.cache_bytes().0,"gpu_bytes":r.cache_bytes().1,"cpu_budget_bytes":768*1024*1024u64,"gpu_budget_bytes":768*1024*1024u64,"resident_keys":r.tiles.iter().map(|tile|tile.key).collect::<Vec<_>>(),
                 "pending_tiles":r.pending.as_ref().map_or(0,|p|p.jobs.len()-p.cursor),"mesh_builds":r.metrics.mesh_builds,"uploads":r.metrics.uploads,"upload_bytes":r.metrics.upload_bytes,
                 "cut_commits":r.metrics.cut_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"surface_fallbacks":r.metrics.surface_fallbacks,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"requests": requests }).to_string()
         })
@@ -3715,6 +3964,125 @@ mod tests {
         }
     }
     #[test]
+    fn level_22_normals_preserve_an_analytic_half_meter_per_meter_slope() {
+        let radius = 1_737_000.0;
+        let key = TileKey {
+            face: 4,
+            level: 22,
+            x: 1 << 21,
+            y: 1 << 21,
+        };
+        let segments = 128;
+        let count = f64::from(1u32 << key.level);
+        let mut tile = Tile {
+            key,
+            ..Default::default()
+        };
+        for y in 0..=segments {
+            for x in 0..=segments {
+                let u = 2.0 * (f64::from(key.x) + x as f64 / segments as f64) / count - 1.0;
+                let v = 2.0 * (f64::from(key.y) + y as f64 / segments as f64) / count - 1.0;
+                let direction = cube_direction(key.face, u, v);
+                // All reconstructed points lie on z = 1 + 0.5*x.
+                let distance = 1.0 / (direction.z - 0.5 * direction.x);
+                tile.vertices.push(Sample {
+                    direction: direction.to_array(),
+                    height_m: (distance - 1.0) * radius,
+                    biome: "Rock".into(),
+                    ..Default::default()
+                });
+            }
+        }
+        for y in 0..segments {
+            for x in 0..segments {
+                let a = (y * (segments + 1) + x) as u32;
+                let b = a + 1;
+                let c = a + (segments + 1) as u32;
+                tile.indices.extend([a, b, c + 1, a, c + 1, c]);
+            }
+        }
+        let mut mesh = tile_mesh(&tile, radius, 1.0).unwrap();
+        let sums = local_normal_sums(&mesh, false);
+        assert!(sums[segments + 2].length_squared() < 1e-30);
+        let expected = DVec3::new(-0.5, 0.0, 1.0).normalize();
+        for pass in 0..2 {
+            for vertex in mesh.vertices.iter().take(tile.vertices.len()) {
+                for normal in [vertex.shading_normal, vertex.parent_normal] {
+                    assert!(
+                        DVec3::from_array(normal.map(f64::from)).dot(expected) > 0.99999,
+                        "LOD 22 slope was lost in normal pass {pass}: {normal:?}"
+                    );
+                }
+            }
+            smooth_mesh_normals(std::slice::from_mut(&mut mesh));
+        }
+    }
+
+    #[test]
+    fn stationary_cut_budget_uses_available_frame_time() {
+        assert_eq!(cut_prepare_budget(0.0, 2.0, 0.0), 0.004);
+        assert_eq!(cut_prepare_budget(1.0, 2.0, 0.0), 0.008);
+        assert_eq!(cut_prepare_budget(1.0, 12.0, 8.0), 0.008);
+        assert_eq!(cut_prepare_budget(1.0, 12.0, 0.0), 0.004);
+    }
+
+    #[test]
+    fn disjoint_transition_groups_preserve_the_partition_in_both_directions() {
+        let mut cut = lod::initial_leaves();
+        for level in 0..3 {
+            let parents: Vec<_> = cut
+                .iter()
+                .copied()
+                .filter(|key| key.face == 4 && key.level == level)
+                .collect();
+            for parent in parents {
+                assert!(lod::split(&mut cut, parent));
+            }
+        }
+        let key = |x, y| TileKey {
+            face: 4,
+            level: 3,
+            x,
+            y,
+        };
+        let first = key(1, 1);
+        let adjacent = key(2, 1);
+        let distant = key(6, 6);
+        let footprint = |parent, cut: &HashSet<TileKey>, coarsening| {
+            transition_footprint(
+                parent,
+                cut,
+                coarsening,
+                &transition_neighbors(parent, cut, coarsening),
+            )
+        };
+        assert!(!footprint(first, &cut, false).is_disjoint(&footprint(adjacent, &cut, false)));
+        assert!(footprint(first, &cut, false).is_disjoint(&footprint(distant, &cut, false)));
+        let before = cut.clone();
+        for parent in [first, distant] {
+            assert!(lod::split(&mut cut, parent));
+        }
+        assert!(footprint(first, &cut, true).is_disjoint(&footprint(distant, &cut, true)));
+        for face in 0..6 {
+            let area: f64 = cut
+                .iter()
+                .filter(|key| key.face == face)
+                .map(|key| 4f64.powi(-i32::from(key.level)))
+                .sum();
+            assert_eq!(area, 1.0);
+        }
+        for a in &cut {
+            for b in &cut {
+                assert!(a == b || !lod::is_ancestor(*a, *b));
+            }
+        }
+        // Arrival/order cannot change the final surface partition.
+        for parent in [distant, first] {
+            assert!(lod::coarsen(&mut cut, parent));
+        }
+        assert_eq!(cut, before);
+    }
+    #[test]
     fn parent_surface_query_matches_the_exact_collision_triangle() {
         let tile = prepared_test_tile();
         let mesh = tile_mesh(&tile, 1_737_000.0, 1.0).unwrap();
@@ -3731,6 +4099,66 @@ mod tests {
             .unwrap();
             assert!((expected - hit.0).abs() < 1e-13);
             assert!(Vec3::from_array(hit.1).is_finite());
+        }
+    }
+
+    #[test]
+    fn streamed_grid_keeps_physical_vertex_spacing_after_one_extra_level() {
+        for altitude in [0.000003, 0.0001, 0.001, 0.01, 0.1, 0.5, 1.0] {
+            let previous_level =
+                ((1.0_f64 / altitude).log2().floor() as i32 + 2).clamp(0, 23) as u8;
+            let level = camera_level(altitude);
+            assert_eq!(level, previous_level + 1);
+            assert_eq!(
+                STREAM_SEGMENTS * (1usize << level),
+                128 * (1usize << previous_level),
+            );
+        }
+        let root = TileKey {
+            face: 4,
+            ..Default::default()
+        };
+        assert_eq!(canonical_tile_vertex_count(root, 128), 129 * 129);
+        for child in lod::children(root) {
+            assert_eq!(canonical_tile_vertex_count(child, 128), 65 * 65);
+        }
+    }
+
+    #[test]
+    fn first_64_segment_children_repartition_the_exact_128_segment_root_lattice() {
+        let root = TileKey {
+            face: 4,
+            ..Default::default()
+        };
+        let root_side = 129;
+        let root_at = |index: usize| {
+            let u = 2.0 * (index % root_side) as f64 / 128.0 - 1.0;
+            let v = 2.0 * (index / root_side) as f64 / 128.0 - 1.0;
+            let direction = cube_direction(4, u, v);
+            // Non-flat relief ensures this queries the actual parent surface.
+            let radius = 1.0 + 0.001 * (17.0 * u).sin() * (11.0 * v).cos();
+            (direction * radius, direction.as_vec3().to_array())
+        };
+        for child in lod::children(root) {
+            for y in 0..=STREAM_SEGMENTS {
+                for x in 0..=STREAM_SEGMENTS {
+                    let direction = cube_direction(
+                        child.face,
+                        (child.x as f64 + x as f64 / 64.0) - 1.0,
+                        (child.y as f64 + y as f64 / 64.0) - 1.0,
+                    );
+                    let parent_index =
+                        (child.y as usize * 64 + y) * root_side + child.x as usize * 64 + x;
+                    let expected = root_at(parent_index).0;
+                    let parent_u = 2.0 * (parent_index % root_side) as f64 / 128.0 - 1.0;
+                    let parent_v = 2.0 * (parent_index / root_side) as f64 / 128.0 - 1.0;
+                    assert_eq!(cube_direction(root.face, parent_u, parent_v), direction);
+                    // This is the same mixed-resolution fallback as parent_source.
+                    let hit = surface_query(direction, root, root_side, root_at).unwrap();
+                    assert!((hit.0 - expected.length()).abs() < 2e-12);
+                    assert!(Vec3::from_array(hit.1).is_finite());
+                }
+            }
         }
     }
 
@@ -4040,7 +4468,29 @@ mod tests {
                 + DVec3::from_array(v.position_low.map(f64::from));
             assert!(((point.length() - 1.0) * radius - sample.water_m).abs() < 1e-5);
             assert_eq!(v.morph[0], 0.0);
+            assert_eq!(
+                v.fields[2], -2.0,
+                "unclipped river triangles must share the overlay mask"
+            );
         }
+    }
+
+    #[test]
+    fn orbital_river_overlay_bounds_dense_chords_without_repeated_subdivision() {
+        let rivers = RiverLayer {
+            segments: (0..32_769)
+                .map(|_| RiverSegment {
+                    start: [0.0, 0.0, 1.0],
+                    end: [0.00005, 0.0, 1.0],
+                    start_height_m: 10.0,
+                    end_height_m: 0.0,
+                    width_m: 20.0,
+                })
+                .collect(),
+        };
+        let mesh = object_mesh(&rivers, &HumanLayer::default(), 2_000_000.0, 1.0);
+        assert_eq!(mesh.vertices.len(), 32_768 * 4);
+        assert_eq!(mesh.indices.len(), 32_768 * 6);
     }
 
     #[test]
@@ -4056,7 +4506,27 @@ mod tests {
     fn morph_has_exact_endpoints_and_stays_bounded() {
         assert_eq!(morph_progress(2.0, 3.0), 0.0);
         assert_eq!(morph_progress(4.0, 3.0), 1.0);
-        assert!((morph_progress(3.175, 3.0) - 0.5).abs() < 1e-12);
+        assert!((morph_progress(3.0 + MORPH_DURATION_SECONDS * 0.5, 3.0) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn shorter_morph_keeps_inverse_geometry_symmetric_and_releases_sources_at_its_end() {
+        let start = 10.0;
+        let parent_radius = 1.000123;
+        let refined_radius = 0.999456;
+        let mut previous = 0.0;
+        for frame in 0..=10 {
+            let elapsed = MORPH_DURATION_SECONDS * frame as f64 / 10.0;
+            let forward = morph_progress(start + elapsed, start);
+            let reverse = morph_progress(start + MORPH_DURATION_SECONDS - elapsed, start);
+            assert!(forward >= previous && (0.0..=1.0).contains(&forward));
+            let refining = parent_radius * (1.0 - forward) + refined_radius * forward;
+            let coarsening = refined_radius * (1.0 - reverse) + parent_radius * reverse;
+            assert!((refining - coarsening).abs() < 1e-14);
+            previous = forward;
+        }
+        assert_eq!(morph_progress(start + MORPH_DURATION_SECONDS, start), 1.0);
+        assert!(MORPH_DURATION_SECONDS < 0.18);
     }
 
     #[test]
@@ -4180,7 +4650,10 @@ mod tests {
         epochs[1] = MorphEpoch { id: 1, start: 1e9 };
         assert_eq!(epoch_progress(-1.0, 10.0, &epochs), 0.0);
         epochs[1].start = 10.0;
-        assert!((epoch_progress(-1.0, 10.175, &epochs) - 0.5).abs() < 1e-12);
+        assert!(
+            (epoch_progress(-1.0, 10.0 + MORPH_DURATION_SECONDS * 0.5, &epochs) - 0.5).abs()
+                < 1e-12
+        );
         epochs[2] = MorphEpoch { id: 2, start: 11.0 };
         assert_eq!(epoch_progress(-1.0, 11.0, &epochs), 1.0);
         assert_eq!(epoch_progress(-2.0, 11.0, &epochs), 0.0);
@@ -4384,6 +4857,58 @@ mod tests {
     }
 
     #[test]
+    fn pressure_requests_reserve_complete_siblings_and_keep_every_inverse_parent() {
+        let root = |face| TileKey {
+            face,
+            ..Default::default()
+        };
+        let old = root(0);
+        let staged = root(4);
+        let deferred = root(5);
+        let mut cut = lod::initial_leaves();
+        assert!(lod::split(&mut cut, old));
+        let targets = [
+            TileKey {
+                face: 4,
+                level: 3,
+                x: 2,
+                y: 2,
+            },
+            TileKey {
+                face: 5,
+                level: 3,
+                x: 2,
+                y: 2,
+            },
+        ];
+        let complete = frontier_keys(&cut, &targets, 3, tile_center(staged), true);
+        assert_eq!(complete.len(), 9);
+        let bounded = pressure_frontier(complete.clone(), &cut, Some(staged));
+        assert_eq!(bounded.len(), 5);
+        assert!(
+            bounded.contains(&old),
+            "missing parent required by inverse zoom"
+        );
+        assert!(lod::children(staged)
+            .iter()
+            .all(|key| bounded.contains(key)));
+        assert!(lod::children(deferred)
+            .iter()
+            .all(|key| !bounded.contains(key)));
+        // Once the first quartet is usable, another family can receive all its
+        // siblings rather than repeatedly loading one immediately evicted tile.
+        assert!(lod::split(&mut cut, staged));
+        let next = pressure_frontier(
+            frontier_keys(&cut, &targets, 3, tile_center(deferred), true),
+            &cut,
+            Some(deferred),
+        );
+        assert!(next.contains(&old));
+        assert!(lod::children(deferred).iter().all(|key| next.contains(key)));
+        assert_eq!(pressure_frontier(complete, &cut, None), vec![old]);
+    }
+
+    #[test]
     fn cube_face_fine_boundary_projects_to_the_actual_coarse_segment() {
         let parent = TileKey {
             face: 0,
@@ -4467,7 +4992,7 @@ mod tests {
         let direction = DVec3::ONE.normalize();
         let altitude = 1900.0 / 2_000_000.0;
         let level = camera_level(altitude);
-        assert_eq!(level, 12);
+        assert_eq!(level, 13);
         let level = footprint_level(direction, altitude, 3.0, 0.0);
         let keys = footprint_keys(direction, level, 3.0, altitude, 0.0);
         let eye = direction * (1.0 + altitude);
@@ -4516,7 +5041,7 @@ mod tests {
                     let tilt = 35f64.to_radians();
                     let level = footprint_level(direction, altitude, aspect, tilt);
                     let keys = footprint_keys(direction, level, aspect, altitude, tilt);
-                    assert!(keys.len() <= 64);
+                    assert!(keys.len() <= MAX_VISIBLE_TILES);
                     let (eye, forward, right, up) = camera_frame(direction, altitude, tilt, 1.0);
                     for y in -20..=20 {
                         for x in -40..=40 {

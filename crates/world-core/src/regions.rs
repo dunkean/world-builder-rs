@@ -423,7 +423,7 @@ mod tests {
         // This stream is much narrower than the coarse region raster spacing.
         region.residual_m = vec![50.0; region.heights_m.len()];
         for index in [river, lake] {
-            let p = world.cells[index].position;
+            let p = crate::coast::inverse(&world.config, world.cells[index].position);
             let before = world.sample(p);
             assert!(before.river > 0.99 || before.lake);
             let after = world.sample_with_patches(p, std::slice::from_ref(&region));

@@ -33,7 +33,7 @@ struct VertexOut {
     var out: VertexOut;
     var start=v.morph.y;
     if start<0.0 {let id=u32(-start);let record=scene.clips[id%32u].bounds;start=select(-1e9,record.y,record.x==f32(id));}
-    let progress=smoothstep(0.0,0.35,scene.light.w-start);
+    let progress=smoothstep(0.0,MORPH_DURATION_SECONDS,scene.light.w-start);
     let offset=mix(v.morph.x,v.morph.w,progress);
     let relative=(v.position-scene.eye.xyz)+(v.position_low-scene.eye_low.xyz)+v.normal_height.xyz*offset;
     out.clip = scene.view_projection * vec4<f32>(relative, 1.0);

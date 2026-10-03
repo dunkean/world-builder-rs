@@ -10,6 +10,7 @@ use rayon::prelude::*;
 const RIVER_ID_BASE: u64 = 1_u64 << 52;
 
 struct Patch {
+    atlas_direction: [f64; 3],
     attributes: [(usize, f64); 12],
     attribute_count: usize,
     nearby: [usize; 48],
@@ -22,7 +23,6 @@ struct Patch {
 struct WaterDatum {
     level: f64,
     id: u64,
-    distance2: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -39,7 +39,7 @@ struct Channel {
 impl World {
     pub fn sample(&self, position: [f64; 3]) -> Sample {
         let p = normalize(position);
-        let patch = reconstruction(self, p);
+        let patch = coastal_reconstruction(self, p);
         let mut temperature = 0.0;
         let mut moisture = 0.0;
         let mut discharge = 0.0;
@@ -60,76 +60,77 @@ impl World {
             }
         }
 
-        let shoreline_datum = water_datum(self, p, &patch);
-        let mut datum = shoreline_datum;
-        let mut height = patch.height;
-        let mut valley_influence = 0.0_f64;
-        let mut bed_owner: Option<(Channel, f64)> = None;
+        let shoreline_datum = water_datum(self, &patch);
+        let datum = shoreline_datum;
+        let amplitude = detail_amplitude(self, &patch, erodability, patch.height);
+        let natural = patch.height
+            + if amplitude > 0.0 {
+                fractal_detail(self, p, erodability) * amplitude
+            } else {
+                0.0
+            };
+        let natural = lake_divide_height(self, &patch, natural, amplitude);
+        let mut height = natural;
+        let mut channel: Option<(Channel, f64)> = None;
+        let mut dry_channel: Option<(Channel, f64)> = None;
+        let mut dry_weight = 1.0;
+        let mut dry_wet_mask = 1.0;
+        let mut channel_weight = 0.0;
+        let mut channel_beds = 0.0;
+        let mut channel_depths = 0.0;
         for &index in &patch.nearby[..patch.nearby_count] {
             let Some(candidate) = channel_at(self, index, p, patch.spacing_m) else {
                 continue;
             };
-            let influence =
-                smooth((1.0 - candidate.distance_m / candidate.valley_width_m).clamp(0.0, 1.0));
-            if influence == 0.0 {
-                continue;
-            }
-            // A spill outlet drains away from its lake. Its reconstructed
-            // valley can lie below the lake plane while still being outside
-            // the reservoir: a nearby wet stencil cell must not flood this
-            // downstream reach back up to the lake's level.
-            if !self.cells[selected].lake
-                && datum.is_some_and(|water| {
-                    water.id != 0 && candidate.water_level_m < water.level - 0.002
-                })
-            {
-                datum = None;
-            }
-            valley_influence = valley_influence.max(influence);
-            // A hydraulic bed and a smooth cross-section connect to the frozen
-            // drainage graph. The broad valley blend avoids imposing a remote
-            // atlas bed with an abrupt step at a pixel-wide river boundary.
-            let bank = candidate.depth_m * (candidate.distance_m / candidate.half_width_m).powi(2);
-            let bank = bank_profile(
-                bank,
-                candidate.depth_m,
-                (patch.height - candidate.water_level_m).abs().max(40.0),
-            );
-            let target = candidate.water_level_m - candidate.depth_m + bank;
-            let carved = patch.height * (1.0 - influence) + target * influence;
+            let carved = carve(candidate, natural);
             height = height.min(carved);
-            // Among actual hydraulic sections, pair the water profile with
-            // the reach that shapes the lowest bed. Broad dry valleys keep
-            // their terrain influence but cannot steal a real river's datum.
-            // A wet section also takes precedence over dry shoreline support.
-            if candidate.distance_m < candidate.half_width_m * 1.1
-                && bed_owner.is_none_or(|(old, old_bed)| {
-                    let wet = candidate.distance_m < candidate.half_width_m;
-                    let old_wet = old.distance_m < old.half_width_m;
-                    (wet && !old_wet)
-                        || (wet == old_wet
-                            && (carved < old_bed || (carved == old_bed && candidate.id < old.id)))
-                })
-            {
-                bed_owner = Some((candidate, carved));
+            let radial = candidate.distance_m / candidate.half_width_m;
+            let wet_shape = (1.0 - radial * radial).max(0.0).powi(2);
+            let bank_width = candidate.half_width_m * 0.65 + 1.0;
+            let weight = 1.0
+                - smooth(
+                    ((candidate.distance_m - candidate.half_width_m) / bank_width).clamp(0.0, 1.0),
+                );
+            if weight > 0.0 {
+                // Reconstruct bed and hydraulic depth with the same partition.
+                // A single reach retains its exact quartic wet section. Dry
+                // banks contribute a signed potential, so equal river planes
+                // remain equal instead of gaining a bump where sections overlap.
+                dry_weight *= 1.0 - weight;
+                dry_wet_mask *= 1.0 - wet_shape;
+                channel_weight += weight;
+                let bed = natural.min(carved);
+                let signed_depth = if wet_shape > 0.0 {
+                    candidate.depth_m * wet_shape
+                } else {
+                    (candidate.water_level_m - bed).min(0.0)
+                };
+                channel_beds += weight * bed;
+                channel_depths += weight * signed_depth;
+                if wet_shape > 0.0 {
+                    discharge = discharge.max(candidate.discharge);
+                    if channel.is_none_or(|(old, old_weight)| {
+                        wet_shape > old_weight || (wet_shape == old_weight && candidate.id < old.id)
+                    }) {
+                        channel = Some((candidate, wet_shape));
+                    }
+                } else if radial < 1.1
+                    && dry_channel.is_none_or(|(old, old_radius)| {
+                        radial < old_radius || (radial == old_radius && candidate.id < old.id)
+                    })
+                {
+                    dry_channel = Some((candidate, radial));
+                }
             }
         }
-        // A small dry support lets the renderer clip a shoreline. It must not
-        // turn the much broader valley, or a clamped reach endpoint, into water.
-        let channel = bed_owner
-            .map(|(owner, _)| owner)
-            .filter(|owner| owner.distance_m < owner.half_width_m * 1.1);
-
-        let mut amplitude = self.config.detail_m * (1.3 - 0.4 * erodability).clamp(0.3, 1.4);
-        if let Some(water) = shoreline_datum.filter(|d| d.id != 0) {
-            // Keep lake basin structure, with small shoreline bands rather
-            // than unconstrained hills replacing the bottom of a shallow lake.
-            amplitude = amplitude.min(3.0 + 0.12 * (patch.height - water.level).abs());
-        }
-        amplitude *= (1.0 - valley_influence).powi(2);
-        if amplitude > 0.0 {
-            height += fractal_detail(self, p, erodability) * amplitude;
-        }
+        let coverage = 1.0 - dry_weight;
+        let depth = if channel_weight > 0.0 {
+            let scale = coverage / channel_weight;
+            height = dry_weight * height + scale * channel_beds;
+            (scale * channel_depths).max(0.0)
+        } else {
+            0.0
+        };
 
         let mut ocean = false;
         let mut lake = false;
@@ -143,21 +144,25 @@ impl World {
             }
         }
         if !ocean && !lake {
-            if let Some(channel) = channel {
-                discharge = discharge.max(channel.discharge);
-                water_level = Some(channel.water_level_m);
+            if let Some((channel, _)) = channel.filter(|_| depth > 0.0) {
+                water_level = Some(height + depth);
                 water_id = Some(channel.id);
-                river = smooth((1.0 - channel.distance_m / channel.half_width_m).clamp(0.0, 1.0));
+                river = 1.0 - dry_wet_mask;
+            } else if let Some((channel, _)) = dry_channel.filter(|_| height >= 0.0) {
+                // Metadata only: dry support cannot create water or override a
+                // marine fallback below zero. Both geometric fields stay dry.
+                water_level = Some(height);
+                water_id = Some(channel.id);
             }
         }
         if height < 0.0 && water_id.is_none_or(|id| id == 0) {
-            if let Some(owner) = basin_owner(self, &patch) {
+            if let Some(owner) = lake_datum(self, &patch) {
                 // The canonical reservoir owns its dry submerged fringes too.
                 // A nearby sea stencil must not fill an endorheic basin up to
                 // zero, and a coastal fallback must not erase its water budget.
                 ocean = false;
-                lake = height < f64::from(owner.level_m);
-                water_level = Some(f64::from(owner.level_m));
+                lake = height < owner.level;
+                water_level = Some(owner.level);
                 water_id = Some(owner.id);
             } else {
                 // The unresolved marine coast uses a global zero level set.
@@ -283,6 +288,7 @@ fn atlas_index(face: u8, x: i32, y: i32, n: u32) -> usize {
 fn reconstruction(world: &World, p: [f64; 3]) -> Patch {
     let n = world.config.resolution;
     let mut result = Patch {
+        atlas_direction: p,
         attributes: [(0, 0.0); 12],
         attribute_count: 0,
         nearby: [0; 48],
@@ -313,8 +319,10 @@ fn reconstruction(world: &World, p: [f64; 3]) -> Patch {
             for (dx, height) in row.iter_mut().enumerate() {
                 let index = atlas_index(face as u8, ix + dx as i32 - 1, iy + dy as i32 - 1, n);
                 *height = f64::from(world.cells[index].height_m);
-                result.nearby[result.nearby_count] = index;
-                result.nearby_count += 1;
+                if !result.nearby[..result.nearby_count].contains(&index) {
+                    result.nearby[result.nearby_count] = index;
+                    result.nearby_count += 1;
+                }
             }
         }
         // Interpolating monotone cubic reconstruction preserves atlas centers
@@ -367,102 +375,155 @@ fn cubic(v: [f64; 4], t: f64) -> f64 {
         + (t3 - t2) * m1
 }
 
-fn water_datum(world: &World, p: [f64; 3], patch: &Patch) -> Option<WaterDatum> {
-    let mut result: Option<WaterDatum> = None;
+fn water_datum(world: &World, patch: &Patch) -> Option<WaterDatum> {
+    // One metric owns all reservoir decisions, including dry subsea fringes.
+    // A local marine stencil cannot override a canonical closed basin.
+    if let Some(lake) = lake_datum(world, patch) {
+        return Some(lake);
+    }
+    let p = patch.atlas_direction;
+    let mut nearest = f64::INFINITY;
+    let mut result = None;
     for &index in &patch.nearby[..patch.nearby_count] {
         let cell = &world.cells[index];
-        if !cell.ocean && !cell.lake {
-            continue;
-        }
-        if cell.lake
-            && !patch.attributes[..patch.attribute_count]
-                .iter()
-                .any(|&(corner, weight)| corner == index && weight > 1e-10)
-        {
-            // The 4x4 stencil supports cubic terrain derivatives, not water
-            // connectivity. A remote reservoir beyond the current quad must
-            // not lend its plane to another depression behind a dry ridge.
-            // Keep the sea's existing global datum and lake shoreline support
-            // on both wet and dry sides of a quad containing real lake water.
+        if !cell.ocean {
             continue;
         }
         let distance2 = (p[0] - cell.position[0]).powi(2)
             + (p[1] - cell.position[1]).powi(2)
             + (p[2] - cell.position[2]).powi(2);
-        let id = if cell.ocean {
-            0
-        } else {
-            cell.lake_id
-                .unwrap_or(1 + u64::from(cell.water_m.to_bits()))
-        };
-        let datum = WaterDatum {
-            level: if cell.ocean {
-                0.0
-            } else {
-                f64::from(cell.water_m)
-            },
-            id,
-            distance2,
-        };
-        if result.is_none_or(|old| {
-            distance2 < old.distance2 || (distance2 == old.distance2 && id < old.id)
-        }) {
-            result = Some(datum);
+        if distance2 < nearest {
+            nearest = distance2;
+            result = Some(WaterDatum { level: 0.0, id: 0 });
         }
     }
     result
 }
 
-fn basin_owner<'a>(world: &'a World, patch: &Patch) -> Option<&'a crate::hydrology::Lake> {
-    // Most marine/coastal quads contain no depression at all. Do not scan the
-    // small reservoir lists on their hot path. No cache is kept: World is public
-    // and synthetic worlds can change their cells and reservoirs between calls.
-    if !patch.attributes[..patch.attribute_count]
+fn lake_datum(world: &World, patch: &Patch) -> Option<WaterDatum> {
+    let (supports, count) = crate::lake_geometry::supports(
+        world,
+        &patch.nearby[..patch.nearby_count],
+        patch.atlas_direction,
+    );
+    supports[..count]
         .iter()
-        .any(|&(index, weight)| {
-            let cell = &world.cells[index];
-            weight > 1e-10 && !cell.ocean && cell.routing_height_m - cell.height_m >= 0.0005
+        .flatten()
+        .filter(|s| s.radius < 1.0)
+        .min_by(|a, b| a.radius.total_cmp(&b.radius).then(a.id.cmp(&b.id)))
+        .map(|support| WaterDatum {
+            level: support.level,
+            id: support.id,
         })
-    {
-        return None;
-    }
-    let mut result: Option<(&crate::hydrology::Lake, f64)> = None;
-    for &(index, weight) in &patch.attributes[..patch.attribute_count] {
-        if weight <= 1e-10 {
-            continue;
-        }
-        for lake in &world.lakes {
-            if lake.cells.contains(&index)
-                && result.is_none_or(|(old, old_weight)| {
-                    weight > old_weight || (weight == old_weight && lake.id < old.id)
-                })
-                && lake.cells.iter().any(|&i| {
-                    let cell = &world.cells[i];
-                    cell.lake
-                        && cell.lake_id == Some(lake.id)
-                        && cell.water_m.to_bits() == lake.level_m.to_bits()
-                })
-            {
-                result = Some((lake, weight));
-            }
-        }
-    }
-    result.map(|(owner, _)| owner)
 }
 
 fn smooth(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn bank_profile(bank: f64, depth: f64, cap: f64) -> f64 {
-    // Preserve the wet parabolic section exactly. Outside its shoreline,
-    // approach the valley shoulder without the hard cap's derivative break.
-    if bank <= depth {
-        bank
-    } else {
-        let scale = (cap - depth).max(1e-6);
-        depth - scale * (-(bank - depth) / scale).exp_m1()
+// The same invertible spherical map is evaluated at every LOD. A coastline is
+// a level set of the frozen atlas in this domain, never a camera-local noise mask.
+fn coastal_reconstruction(world: &World, p: [f64; 3]) -> Patch {
+    reconstruction(world, crate::coast::remap(&world.config, p))
+}
+
+fn detail_amplitude(world: &World, patch: &Patch, erodability: f64, height: f64) -> f64 {
+    let nominal = world.config.detail_m * (1.3 - 0.4 * erodability).clamp(0.3, 1.4);
+    let mut lake_weight = 0.0;
+    let mut protected = 0.0;
+    for &(index, weight) in &patch.attributes[..patch.attribute_count] {
+        let cell = &world.cells[index];
+        let plane = if cell.lake && !cell.ocean {
+            Some(f64::from(cell.water_m))
+        } else {
+            crate::lake_geometry::control_level(world, index)
+        };
+        if let Some(plane) = plane {
+            lake_weight += weight;
+            let depth = (patch.height - plane).abs();
+            protected += weight * nominal.min(3.0 + 0.12 * depth).min(0.8 * depth);
+        }
     }
+    // Protection fades continuously at the support boundary. Choosing a single
+    // lake datum and abruptly changing amplitude there produced square cliffs.
+    let amplitude = if lake_weight > 1e-12 {
+        let influence = smooth((lake_weight / 0.25).clamp(0.0, 1.0));
+        nominal * (1.0 - influence) + (protected / lake_weight) * influence
+    } else {
+        nominal
+    };
+    // Every normalized noise band is bounded by one. A strict fraction of the
+    // natural height leaves its sign unchanged, including tiny coastal ridges.
+    amplitude.min(height.abs() * 0.8)
+}
+
+/// Separate neighbouring reservoirs whose unresolved divide was lost by the
+/// coarse cubic reconstruction. Their hydraulic planes stay horizontal; a
+/// compact, continuous terrain ridge makes the ownership boundary dry.
+fn lake_divide_height(world: &World, patch: &Patch, natural: f64, detail_bound: f64) -> f64 {
+    let (supports, count) = crate::lake_geometry::supports(
+        world,
+        &patch.nearby[..patch.nearby_count],
+        patch.atlas_direction,
+    );
+    let mut height = natural;
+    let width = 0.18;
+    let nearest_radius = supports[..count]
+        .iter()
+        .flatten()
+        .map(|s| s.radius)
+        .fold(f64::INFINITY, f64::min);
+    for support in supports[..count].iter().flatten() {
+        let distance = (support.radius - 1.0).abs();
+        if distance < 0.14 {
+            // A closed reservoir below sea level also has to retain the global
+            // marine fallback outside its domain, not just its own lower plane.
+            let crest = support.level.max(0.0) + 0.25;
+            let ownership =
+                1.0 - smooth(((support.radius - nearest_radius) / 0.14).clamp(0.0, 1.0));
+            // Lift the reconstructed base rather than flattening individual
+            // noise troughs. The known detail bound keeps the exact divide dry
+            // while preserving its spatial variation.
+            let lift = (crest + detail_bound - patch.height).max(0.0);
+            height = height.max(natural + lift * (1.0 - smooth(distance / 0.14)) * ownership);
+        }
+    }
+    for a in 0..count {
+        for b in a + 1..count {
+            let a = supports[a].unwrap();
+            let b = supports[b].unwrap();
+            if (a.level - b.level).abs() < 0.02 {
+                continue;
+            }
+            let gap = (a.radius - b.radius).abs();
+            if gap >= width {
+                continue;
+            }
+            let crest = a.level.max(b.level) + 0.25;
+            // Continue the support past the quad border: adding a wet corner
+            // with tiny interpolation weight must not remove a retaining ridge.
+            let support = (1.0 - smooth(((a.radius - 1.0) / 0.3).clamp(0.0, 1.0)))
+                * (1.0 - smooth(((b.radius - 1.0) / 0.3).clamp(0.0, 1.0)));
+            let ownership =
+                1.0 - smooth(((a.radius.max(b.radius) - nearest_radius) / 0.14).clamp(0.0, 1.0));
+            let influence = (1.0 - smooth(gap / width)) * support * ownership;
+            height =
+                height.max(natural + (crest + detail_bound - patch.height).max(0.0) * influence);
+        }
+    }
+    height
+}
+
+pub(crate) fn natural_height(world: &World, p: [f64; 3]) -> f64 {
+    let p = normalize(p);
+    let patch = coastal_reconstruction(world, p);
+    let erodability = patch.attributes[..patch.attribute_count]
+        .iter()
+        .map(|&(index, weight)| weight * f64::from(world.cells[index].erodability))
+        .sum::<f64>();
+    let amplitude = detail_amplitude(world, &patch, erodability, patch.height);
+    let natural = patch.height + fractal_detail(world, p, erodability) * amplitude;
+    lake_divide_height(world, &patch, natural, amplitude)
 }
 
 fn fractal_detail(world: &World, p: [f64; 3], erodability: f64) -> f64 {
@@ -499,116 +560,99 @@ fn fractal_detail(world: &World, p: [f64; 3], erodability: f64) -> f64 {
     value / normalization
 }
 
-fn tangent(world: &World, index: usize) -> [f64; 3] {
-    let cell = &world.cells[index];
-    let mut incoming = None;
-    for neighbor in crate::hydrology::neighbours8(index, world.config.resolution) {
-        if world.cells[neighbor].receiver == Some(index)
-            && incoming.is_none_or(|old: usize| {
-                world.cells[neighbor].discharge > world.cells[old].discharge
-            })
-        {
-            incoming = Some(neighbor);
-        }
-    }
-    let before = incoming.map_or(cell.position, |i| world.cells[i].position);
-    let after = cell
-        .receiver
-        .map_or(cell.position, |i| world.cells[i].position);
-    let mut result = std::array::from_fn(|i| after[i] - before[i]);
-    let radial = dot(result, cell.position);
-    for (i, r) in result.iter_mut().enumerate() {
-        *r -= radial * cell.position[i];
-    }
-    normalize(result)
-}
-
-fn curve(world: &World, from: usize, to: usize, t: f64, ta: [f64; 3], tb: [f64; 3]) -> [f64; 3] {
-    let a = world.cells[from].position;
-    let b = world.cells[to].position;
-    let length = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
-    let t2 = t * t;
-    let t3 = t2 * t;
-    normalize(std::array::from_fn(|i| {
-        (2.0 * t3 - 3.0 * t2 + 1.0) * a[i]
-            + (t3 - 2.0 * t2 + t) * length * ta[i]
-            + (-2.0 * t3 + 3.0 * t2) * b[i]
-            + (t3 - t2) * length * tb[i]
-    }))
-}
-
 fn channel_at(world: &World, index: usize, p: [f64; 3], spacing: f64) -> Option<Channel> {
-    let cell = &world.cells[index];
-    if cell.ocean || cell.lake || cell.discharge < 120.0 {
-        return None;
-    }
-    let to = cell.receiver?;
-    let end = &world.cells[to];
-    let end_level = if end.ocean {
-        0.0
-    } else if end.lake {
-        f64::from(end.water_m)
-    } else {
-        f64::from(end.height_m)
-    };
-    let start_level = f64::from(cell.height_m);
-    // Potential spill routing is not a physical river through a dry depression.
-    if end_level > start_level + 0.002 {
-        return None;
-    }
-    let half_width = world.channel_width(cell.discharge) * 0.5;
+    let reach = world.river_reach(index)?;
+    channel_from_reach(world, reach, p, spacing)
+}
+
+fn channel_from_reach(
+    world: &World,
+    reach: &crate::river_geometry::RiverReach,
+    p: [f64; 3],
+    spacing: f64,
+) -> Option<Channel> {
+    let cell = &world.cells[reach.from];
     let spacing = cell.area_m2.sqrt().max(spacing * 0.1);
-    let valley_width = (half_width * 24.0).max(spacing * 0.28).min(spacing * 0.8);
-    let delta = std::array::from_fn::<_, 3, _>(|j| end.position[j] - cell.position[j]);
-    let segment_length = dot(delta, delta).sqrt() * world.config.radius_m;
-    let projection = (dot(std::array::from_fn(|j| p[j] - cell.position[j]), delta)
-        / dot(delta, delta))
-    .clamp(0.0, 1.0);
-    let near = normalize(std::array::from_fn(|j| {
-        cell.position[j] + projection * delta[j]
-    }));
-    let straight_distance =
-        ((p[0] - near[0]).powi(2) + (p[1] - near[1]).powi(2) + (p[2] - near[2]).powi(2)).sqrt()
-            * world.config.radius_m;
-    if straight_distance > valley_width + segment_length * 0.4 {
+    let widest = reach.width_start_m.max(reach.width_end_m) * 0.5;
+    let valley_width = (widest * 24.0).max(spacing * 0.28).min(spacing * 0.8);
+    let delta = std::array::from_fn::<_, 3, _>(|j| reach.end[j] - reach.start[j]);
+    let length2 = dot(delta, delta);
+    if length2 <= 1e-24 {
         return None;
     }
-    let ta = tangent(world, index);
-    let tb = tangent(world, to);
-    let mut best_distance = f64::INFINITY;
-    let mut best_t = 0.0;
-    let mut a = cell.position;
-    for i in 0..8 {
-        let b = curve(world, index, to, f64::from(i + 1) / 8.0, ta, tb);
-        let delta = std::array::from_fn::<_, 3, _>(|j| b[j] - a[j]);
-        let local =
-            (dot(std::array::from_fn(|j| p[j] - a[j]), delta) / dot(delta, delta)).clamp(0.0, 1.0);
-        let closest = normalize(std::array::from_fn(|j| a[j] + local * delta[j]));
-        let distance = ((p[0] - closest[0]).powi(2)
-            + (p[1] - closest[1]).powi(2)
-            + (p[2] - closest[2]).powi(2))
-        .sqrt()
-            * world.config.radius_m;
-        if distance < best_distance {
-            best_distance = distance;
-            best_t = (f64::from(i) + local) / 8.0;
-        }
-        a = b;
-    }
-    if best_distance >= valley_width {
+    let t = (dot(std::array::from_fn(|j| p[j] - reach.start[j]), delta) / length2).clamp(0.0, 1.0);
+    let near = normalize(std::array::from_fn(|j| reach.start[j] + t * delta[j]));
+    let distance = dot(
+        std::array::from_fn(|j| p[j] - near[j]),
+        std::array::from_fn(|j| p[j] - near[j]),
+    )
+    .sqrt()
+        * world.config.radius_m;
+    if distance > valley_width + length2.sqrt() * world.config.radius_m * 0.4 {
         return None;
     }
-    let level = start_level * (1.0 - best_t) + end_level.min(start_level) * best_t;
-    let depth = (0.35 + f64::from(cell.discharge).powf(0.3) * 0.15)
-        * (3.0 / world.config.gravity_m_s2).sqrt();
+    let (distance_m, t) = reach.closest(p);
+    if distance_m >= valley_width {
+        return None;
+    }
     Some(Channel {
-        distance_m: best_distance,
-        half_width_m: half_width,
+        distance_m,
+        half_width_m: reach.width(t) * 0.5,
         valley_width_m: valley_width,
-        water_level_m: level,
-        depth_m: depth.clamp(0.5, 18.0),
-        discharge: f64::from(cell.discharge),
-        id: RIVER_ID_BASE + index as u64 + 1,
+        water_level_m: reach.level(t),
+        depth_m: reach.depth(t),
+        discharge: reach.discharge_m3_s,
+        id: RIVER_ID_BASE + reach.from as u64 + 1,
+    })
+}
+
+fn carve(candidate: Channel, natural: f64) -> f64 {
+    // Preserve the complete hydraulic section and floodplain. Only the outer
+    // valley blends back into the natural terrain, with the same C1 kernel
+    // during catalogue fitting and actual terrain reconstruction.
+    let floodplain = (3.4 * candidate.half_width_m + 7.0).min(candidate.valley_width_m * 0.65);
+    let influence = smooth(
+        ((candidate.valley_width_m - candidate.distance_m)
+            / (candidate.valley_width_m - floodplain))
+            .clamp(0.0, 1.0),
+    );
+    let wall_slope = ((natural - candidate.water_level_m).max(0.0)
+        / (candidate.valley_width_m * 0.7))
+        .clamp(0.015, 1.2);
+    let target = crate::river_geometry::bank_height(
+        candidate.distance_m,
+        candidate.half_width_m * 2.0,
+        candidate.depth_m,
+        candidate.water_level_m,
+        wall_slope,
+    );
+    natural * (1.0 - influence) + target * influence
+}
+
+/// Bounded stencil in the same atlas domain as sample(), without river-cache
+/// access. Catalogue fitting can inspect neighbours while its cache is built.
+pub(crate) fn river_neighbourhood(world: &World, p: [f64; 3]) -> ([usize; 48], usize, f64) {
+    let patch = coastal_reconstruction(world, normalize(p));
+    (patch.nearby, patch.nearby_count, patch.spacing_m)
+}
+
+/// Receiver/tributary surface for profile fitting. Inside another wet section
+/// cap against its free surface, never its bed: a mutual bed cap would lower
+/// both reaches by another depth on every iteration. No own reach is included
+/// by the caller, and no compiled river-cache is consulted here.
+pub(crate) fn other_river_surface(
+    world: &World,
+    reach: &crate::river_geometry::RiverReach,
+    p: [f64; 3],
+    natural: f64,
+    spacing: f64,
+) -> Option<f64> {
+    let candidate = channel_from_reach(world, reach, p, spacing)?;
+    let surface = carve(candidate, natural);
+    Some(if candidate.distance_m < candidate.half_width_m {
+        surface.max(candidate.water_level_m)
+    } else {
+        surface
     })
 }
 
@@ -637,9 +681,11 @@ mod tests {
         let mut world = World::generate(WorldConfig {
             resolution: 8,
             detail_m: 0.0,
+            coast_detail_ratio: 0.0,
             ..Default::default()
         })
         .unwrap();
+        world.lakes.clear();
         for c in &mut world.cells {
             c.height_m = 160.0;
             c.water_m = 160.0;
@@ -653,6 +699,7 @@ mod tests {
             c.material = Material::Sandstone;
             c.biome = Biome::Grassland;
         }
+        world.invalidate_geometry();
         world
     }
 
@@ -688,6 +735,312 @@ mod tests {
         assert!(!dry.lake);
         assert_eq!(dry.water_m, dry.height_m);
         assert_eq!(dry.biome_mix[Biome::Lake as usize], 0.0);
+    }
+
+    #[test]
+    fn lake_surface_does_not_jump_at_a_dominant_cell_switch_near_a_dry_valley() {
+        let mut world = synthetic();
+        let previous_radius = world.config.radius_m;
+        world.config.radius_m = 10_000.0;
+        for cell in &mut world.cells {
+            cell.area_m2 *= (world.config.radius_m / previous_radius).powi(2);
+        }
+        let lake = geometry::cell_index(4, 3, 3, 8);
+        let river = geometry::cell_index(4, 3, 4, 8);
+        let downstream = geometry::cell_index(4, 4, 4, 8);
+        world.cells[lake].height_m = 60.0;
+        world.cells[lake].water_m = 100.0;
+        world.cells[lake].lake = true;
+        world.cells[lake].lake_id = Some(17);
+        world.cells[river].height_m = 60.0;
+        world.cells[river].water_m = 60.0;
+        world.cells[river].discharge = 30_000.0;
+        world.cells[river].receiver = Some(downstream);
+        world.cells[downstream].height_m = 40.0;
+        world.cells[downstream].water_m = 40.0;
+        world.cells[downstream].discharge = 30_000.0;
+        world.invalidate_geometry();
+        let a = world.sample(direction(4, -0.125, -1e-8));
+        let b = world.sample(direction(4, -0.125, 1e-8));
+        assert!(a.lake && b.lake);
+        assert_eq!(a.water_body_id, Some(17));
+        assert_eq!(b.water_body_id, Some(17));
+        assert_eq!(a.water_m, 100.0);
+        assert_eq!(b.water_m, 100.0);
+        assert!((a.height_m - b.height_m).abs() < 0.001);
+    }
+
+    #[test]
+    fn different_lake_planes_have_a_continuous_dry_divide() {
+        let mut world = synthetic();
+        let a = geometry::cell_index(4, 3, 3, 8);
+        let b = geometry::cell_index(4, 4, 3, 8);
+        for (index, level, id) in [(a, 100.0, 17), (b, 110.0, 18)] {
+            world.cells[index].height_m = 60.0;
+            world.cells[index].water_m = level;
+            world.cells[index].lake = true;
+            world.cells[index].lake_id = Some(id);
+        }
+        world.invalidate_geometry();
+        for (index, level) in [(a, 100.0), (b, 110.0)] {
+            let sample = world.sample(world.cells[index].position);
+            assert!(sample.lake);
+            assert_eq!(sample.height_m, 60.0);
+            assert_eq!(sample.water_m, level);
+        }
+        let before = world.sample(direction(4, -1e-8, -0.125));
+        let after = world.sample(direction(4, 1e-8, -0.125));
+        assert!(!before.lake && !after.lake);
+        assert!(before.height_m > 110.0 && after.height_m > 110.0);
+        assert!((before.height_m - after.height_m).abs() < 0.001);
+        for i in 0..=1000 {
+            let sample = world.sample(direction(4, -0.125 + i as f64 * 0.00025, -0.125));
+            if sample.lake {
+                assert_eq!(
+                    sample.water_m,
+                    if sample.water_body_id == Some(17) {
+                        100.0
+                    } else {
+                        110.0
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unequal_cell_areas_use_the_same_metric_for_water_and_divides() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = 60.0;
+            cell.water_m = 60.0;
+        }
+        for (x, level, id, area_scale) in [(3, 100.0, 17, 0.49), (4, 110.0, 18, 1.44)] {
+            let cell = &mut world.cells[geometry::cell_index(4, x, 3, 8)];
+            cell.water_m = level;
+            cell.lake = true;
+            cell.lake_id = Some(id);
+            cell.area_m2 *= area_scale;
+        }
+        world.invalidate_geometry();
+        let mut previous: Option<Sample> = None;
+        let mut owners = [false; 2];
+        for i in 0..=2000 {
+            let sample = world.sample(direction(4, -0.125 + i as f64 * 0.000125, -0.125));
+            if sample.lake {
+                owners[usize::from(sample.water_body_id == Some(18))] = true;
+            }
+            if let Some(old) = previous {
+                assert!(
+                    !(old.lake && sample.lake && old.water_body_id != sample.water_body_id),
+                    "two horizontal planes touched at unequal-area ownership boundary, i={i}"
+                );
+            }
+            previous = Some(sample);
+        }
+        assert_eq!(owners, [true, true]);
+    }
+
+    #[test]
+    fn a_non_owner_lake_pair_cannot_raise_a_fin_inside_a_third_lake() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = 60.0;
+            cell.water_m = 60.0;
+        }
+        for (x, y, level, id) in [(3, 3, 100.0, 17), (4, 3, 110.0, 18), (3, 4, 120.0, 19)] {
+            let cell = &mut world.cells[geometry::cell_index(4, x, y, 8)];
+            cell.water_m = level;
+            cell.lake = true;
+            cell.lake_id = Some(id);
+        }
+        world.invalidate_geometry();
+        for delta in [0.025, 0.05] {
+            let sample = world.sample(direction(4, -0.125 + delta, -0.125 + delta));
+            assert!(sample.lake);
+            assert_eq!(sample.water_body_id, Some(17));
+            assert_eq!(sample.height_m, 60.0);
+            assert_eq!(sample.water_m, 100.0);
+        }
+    }
+
+    #[test]
+    fn subsea_reservoir_support_has_no_quad_fallback_outside_its_metric_domain() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = -120.0;
+            cell.water_m = -120.0;
+        }
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].water_m = -80.0;
+        world.cells[index].lake = true;
+        world.cells[index].lake_id = Some(17);
+        world.lakes.push(crate::hydrology::Lake {
+            id: 17,
+            level_m: -80.0,
+            cells: vec![index],
+            ..Default::default()
+        });
+        world.invalidate_geometry();
+        let center = world.cells[index].position;
+        let east = normalize(geometry::cross([0.0, 1.0, 0.0], center));
+        let north = geometry::cross(center, east);
+        let angular_radius = 0.85 * world.cells[index].area_m2.sqrt() / world.config.radius_m;
+        for i in 0..32 {
+            let phi = i as f64 * std::f64::consts::TAU / 32.0;
+            let angle = angular_radius * 1.12;
+            let p = normalize(std::array::from_fn(|axis| {
+                center[axis] * angle.cos()
+                    + (east[axis] * phi.cos() + north[axis] * phi.sin()) * angle.sin()
+            }));
+            let patch = coastal_reconstruction(&world, p);
+            assert!(
+                lake_datum(&world, &patch).is_none(),
+                "quad fallback at phi={phi}"
+            );
+            assert!(!world.sample(p).lake);
+        }
+    }
+
+    #[test]
+    fn bounded_metric_stencil_matches_full_reservoir_search_at_cube_seams() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = 60.0;
+            cell.water_m = 100.0;
+            cell.lake = true;
+            cell.lake_id = Some(17);
+        }
+        world.invalidate_geometry();
+        let all: Vec<_> = (0..world.cells.len()).collect();
+        for face in 0..6 {
+            for u in [-1.00000001, -1.0, -0.75, 0.0, 0.75, 1.0, 1.00000001] {
+                for v in [-1.00000001, -1.0, -0.75, 0.0, 0.75, 1.0, 1.00000001] {
+                    let p = direction(face, u, v);
+                    let patch = coastal_reconstruction(&world, p);
+                    let (bounded, n) = crate::lake_geometry::supports(
+                        &world,
+                        &patch.nearby[..patch.nearby_count],
+                        p,
+                    );
+                    let (full, m) = crate::lake_geometry::supports(&world, &all, p);
+                    assert_eq!(n, m, "missing support at face={face}, u={u}, v={v}");
+                    assert!((bounded[0].unwrap().radius - full[0].unwrap().radius).abs() < 1e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retaining_terrain_keeps_detail_instead_of_clamping_a_flat_ring() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = 60.0;
+            cell.water_m = 60.0;
+        }
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].water_m = 100.0;
+        world.cells[index].lake = true;
+        world.cells[index].lake_id = Some(17);
+        world.invalidate_geometry();
+        let center = world.cells[index].position;
+        let east = normalize(geometry::cross([0.0, 1.0, 0.0], center));
+        let chord = 0.85 * world.cells[index].area_m2.sqrt() / world.config.radius_m;
+        let angle = 2.0 * (chord * 0.5).asin();
+        let p = normalize(std::array::from_fn(|axis| {
+            center[axis] * angle.cos() + east[axis] * angle.sin()
+        }));
+        let patch = coastal_reconstruction(&world, p);
+        let low = lake_divide_height(&world, &patch, 59.0, 1.0);
+        let high = lake_divide_height(&world, &patch, 61.0, 1.0);
+        assert!((high - low - 2.0).abs() < 1e-12);
+        assert!(low >= 100.25 - 1e-10);
+    }
+
+    #[test]
+    fn fine_detail_cannot_erase_a_frozen_dry_lake_spill_control() {
+        let mut world = synthetic();
+        world.config.detail_m = 500.0;
+        let control = geometry::cell_index(4, 3, 3, 8);
+        let outlet = geometry::cell_index(4, 4, 3, 8);
+        world.cells[control].height_m = 60.0;
+        world.cells[control].water_m = 100.0;
+        world.cells[control].lake = true;
+        world.cells[control].lake_id = Some(17);
+        world.cells[outlet].height_m = 100.0;
+        world.cells[outlet].water_m = 100.0;
+        world.lakes.push(crate::hydrology::Lake {
+            id: 17,
+            level_m: 100.0,
+            cells: vec![control],
+            control_cell: control,
+            outlet: Some(outlet),
+            outflow_m3_s: 600.0,
+            ..Default::default()
+        });
+        for seed in 0..64 {
+            world.config.seed = seed;
+            world.invalidate_geometry();
+            let height = natural_height(&world, world.cells[outlet].position);
+            assert!(
+                (height - 100.0).abs() < 1e-9,
+                "spill erased at seed={seed}: {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn subsea_lake_and_marine_fallback_are_separated_by_retaining_terrain() {
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = -120.0;
+            cell.water_m = -120.0;
+        }
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].water_m = -80.0;
+        world.cells[index].lake = true;
+        world.cells[index].lake_id = Some(17);
+        world.invalidate_geometry();
+        let center = world.cells[index].position;
+        let east = normalize(geometry::cross([0.0, 1.0, 0.0], center));
+        let angular_radius = 0.85 * world.cells[index].area_m2.sqrt() / world.config.radius_m;
+        let mut previous: Option<Sample> = None;
+        let mut dry = 0;
+        for i in 0..=1000 {
+            let angle = angular_radius * (0.8 + i as f64 * 0.0004);
+            let p = normalize(std::array::from_fn(|axis| {
+                center[axis] * angle.cos() + east[axis] * angle.sin()
+            }));
+            let sample = world.sample(p);
+            if sample.water_m == sample.height_m {
+                dry += 1;
+            }
+            if let Some(old) = previous {
+                let both_wet = old.water_m > old.height_m && sample.water_m > sample.height_m;
+                assert!(!(both_wet && old.water_body_id != sample.water_body_id));
+            }
+            previous = Some(sample);
+        }
+        assert!(dry > 0);
+    }
+
+    #[test]
+    fn fine_detail_cannot_dry_a_shallow_canonical_lake_cell() {
+        let mut world = synthetic();
+        world.config.detail_m = 500.0;
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].height_m = 99.99;
+        world.cells[index].water_m = 100.0;
+        world.cells[index].lake = true;
+        world.cells[index].lake_id = Some(17);
+        for seed in 0..64 {
+            world.config.seed = seed;
+            world.invalidate_geometry();
+            let sample = world.sample(world.cells[index].position);
+            assert!(sample.lake, "detail dried lake at seed={seed}");
+            assert!(sample.height_m < 100.0);
+            assert_eq!(sample.water_m, 100.0);
+        }
     }
 
     #[test]
@@ -813,28 +1166,210 @@ mod tests {
     }
 
     #[test]
-    fn valley_shoulders_are_c1_and_keep_the_wet_section() {
-        for (depth, cap) in [(3.0, 40.0), (18.0, 6000.0)] {
-            for i in 0..=20 {
-                let bank = depth * f64::from(i) / 20.0;
-                assert_eq!(bank_profile(bank, depth, cap), bank);
-            }
-            // Test both the wet/dry join and the former hard-cap terrace.
-            for join in [depth, cap] {
-                let epsilon = 0.001;
-                let center = bank_profile(join, depth, cap);
-                let left = (center - bank_profile(join - epsilon, depth, cap)) / epsilon;
-                let right = (bank_profile(join + epsilon, depth, cap) - center) / epsilon;
-                assert!((left - right).abs() < 0.0001);
-                assert!(left > 0.0 && right > 0.0);
-            }
-            let mut previous = 0.0;
-            for i in 0..=100 {
-                let height = bank_profile(cap * f64::from(i) / 10.0, depth, cap);
-                assert!(height >= previous && height <= cap);
-                previous = height;
+    fn river_wet_section_matches_the_shared_bank_profile() {
+        let mut world = synthetic();
+        let a = geometry::cell_index(4, 3, 3, 8);
+        let b = geometry::cell_index(4, 4, 3, 8);
+        world.cells[a].receiver = Some(b);
+        world.cells[a].discharge = 1000.0;
+        world.cells[b].discharge = 1000.0;
+        let reach = world.river_reach(a).unwrap();
+        let p = reach.position(0.5);
+        let along = normalize(std::array::from_fn(|i| reach.end[i] - reach.start[i]));
+        let across = normalize(geometry::cross(p, along));
+        let width = reach.width(0.5);
+        let depth = reach.depth(0.5);
+        for fraction in [-0.995_f64, -0.9, -0.5, 0.0, 0.5, 0.9, 0.995] {
+            let offset = fraction * width * 0.5;
+            let q = normalize(std::array::from_fn(|i| {
+                p[i] + across[i] * offset / world.config.radius_m
+            }));
+            let sample = world.sample(q);
+            let expected =
+                crate::river_geometry::bank_height(offset.abs(), width, depth, 160.0, 0.015);
+            assert!((f64::from(sample.height_m) - expected).abs() < 0.002);
+            assert!(sample.water_m > sample.height_m);
+            assert!((sample.water_m - 160.0).abs() < 0.0001);
+            assert!(sample.river > 0.0);
+        }
+    }
+
+    #[test]
+    fn converging_rivers_keep_ground_and_water_continuous_across_wet_edges() {
+        let mut world = synthetic();
+        let old_radius = world.config.radius_m;
+        world.config.radius_m = 10_000.0;
+        for cell in &mut world.cells {
+            cell.area_m2 *= (world.config.radius_m / old_radius).powi(2);
+        }
+        let high = geometry::cell_index(4, 3, 3, 8);
+        let low = geometry::cell_index(4, 4, 3, 8);
+        let join = geometry::cell_index(4, 4, 4, 8);
+        for (index, height, receiver) in [
+            (high, 160.0, Some(join)),
+            (low, 110.0, Some(join)),
+            (join, 100.0, None),
+        ] {
+            world.cells[index].height_m = height;
+            world.cells[index].water_m = height;
+            world.cells[index].receiver = receiver;
+            world.cells[index].discharge = 30_000.0;
+        }
+        world.invalidate_geometry();
+        let reach = world.river_reach(high).unwrap();
+        let depth_bound = reach
+            .depth(0.0)
+            .max(world.river_reach(low).unwrap().depth(0.0));
+        let mut boundaries = 0;
+        let state = |s: &Sample| (s.water_body_id, s.water_m > s.height_m + 0.0001);
+        for step in 0..=8 {
+            let t = 0.65 + step as f64 * 0.04;
+            let center = reach.position(t);
+            let along = normalize(std::array::from_fn(|i| {
+                reach.position((t + 0.001).min(1.0))[i] - reach.position((t - 0.001).max(0.0))[i]
+            }));
+            let across = normalize(geometry::cross(center, along));
+            let extent = reach.width(t) * 2.0;
+            let at = |offset: f64| {
+                normalize(std::array::from_fn(|i| {
+                    center[i] + across[i] * offset / world.config.radius_m
+                }))
+            };
+            let mut lo = -extent;
+            let mut previous = world.sample(at(lo));
+            for i in 1..=200 {
+                let hi = extent * (-1.0 + 2.0 * i as f64 / 200.0);
+                let sample = world.sample(at(hi));
+                assert!(f64::from(sample.water_m - sample.height_m) <= depth_bound + 0.02);
+                if state(&sample) != state(&previous) {
+                    let mut left = lo;
+                    let mut right = hi;
+                    let before_state = state(&previous);
+                    for _ in 0..32 {
+                        if right - left < 0.001 {
+                            break;
+                        }
+                        let middle = 0.5 * (left + right);
+                        if state(&world.sample(at(middle))) == before_state {
+                            left = middle;
+                        } else {
+                            right = middle;
+                        }
+                    }
+                    let a = world.sample(at(left));
+                    let b = world.sample(at(right));
+                    assert!(
+                        (a.height_m - b.height_m).abs() < 0.01,
+                        "ground step at t={t}: {} -> {}",
+                        a.height_m,
+                        b.height_m
+                    );
+                    assert!(
+                        (a.water_m - b.water_m).abs() < 0.05,
+                        "water step at t={t}: {} -> {}",
+                        a.water_m,
+                        b.water_m
+                    );
+                    boundaries += 1;
+                }
+                previous = sample;
+                lo = hi;
             }
         }
+        assert!(
+            boundaries > 8,
+            "fixture did not cross enough hydraulic interfaces"
+        );
+    }
+
+    #[test]
+    fn overlapping_rivers_with_the_same_stage_cannot_raise_the_water_plane() {
+        let mut world = synthetic();
+        let old_radius = world.config.radius_m;
+        world.config.radius_m = 10_000.0;
+        for cell in &mut world.cells {
+            cell.area_m2 *= (world.config.radius_m / old_radius).powi(2);
+        }
+        let a = geometry::cell_index(4, 3, 3, 8);
+        let b = geometry::cell_index(4, 4, 3, 8);
+        let join = geometry::cell_index(4, 4, 4, 8);
+        for index in [a, b] {
+            world.cells[index].receiver = Some(join);
+            world.cells[index].discharge = 30_000.0;
+        }
+        world.cells[join].discharge = 60_000.0;
+        world.invalidate_geometry();
+        let reach = world.river_reach(a).unwrap();
+        let mut wet = 0;
+        for step in 0..=16 {
+            let t = 0.6 + step as f64 * 0.025;
+            let center = reach.position(t);
+            let along = normalize(std::array::from_fn(|i| reach.end[i] - reach.start[i]));
+            let across = normalize(geometry::cross(center, along));
+            for side in -20..=20 {
+                let offset = reach.width(t) * side as f64 / 20.0;
+                let p = normalize(std::array::from_fn(|i| {
+                    center[i] + across[i] * offset / world.config.radius_m
+                }));
+                let sample = world.sample(p);
+                assert!(
+                    sample.water_m <= 160.0001,
+                    "common plane raised to {}",
+                    sample.water_m
+                );
+                if sample.water_m > sample.height_m + 0.0001 {
+                    wet += 1;
+                    assert!(
+                        (sample.water_m - 160.0).abs() < 0.0001,
+                        "common plane fell to {}",
+                        sample.water_m
+                    );
+                }
+            }
+        }
+        assert!(wet > 100);
+    }
+
+    #[test]
+    fn fine_vertical_detail_cannot_flip_the_canonical_coastline() {
+        let mut world = synthetic();
+        world.config.detail_m = 140.0;
+        for cell in &mut world.cells {
+            cell.height_m = (800.0 * cell.position[0]) as f32;
+            cell.ocean = cell.height_m < 0.0;
+            cell.water_m = if cell.ocean { 0.0 } else { cell.height_m };
+        }
+        for y in 0..31 {
+            for x in 0..61 {
+                let p = direction(
+                    4,
+                    (f64::from(x) - 30.0) * 0.0047,
+                    (f64::from(y) - 15.0) * 0.025,
+                );
+                let base = coastal_reconstruction(&world, p).height;
+                let fine = natural_height(&world, p);
+                assert_eq!(base.is_sign_positive(), fine.is_sign_positive());
+                assert!((fine - base).abs() <= base.abs() * 0.8 + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn lake_detail_protection_fades_across_the_quad_boundary() {
+        let mut world = synthetic();
+        world.config.detail_m = 140.0;
+        world.config.coast_detail_ratio = 0.0;
+        for cell in &mut world.cells {
+            cell.height_m = 60.0;
+            cell.water_m = 60.0;
+        }
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].lake = true;
+        world.cells[index].water_m = 100.0;
+        world.cells[index].lake_id = Some(17);
+        let left = world.sample(direction(4, 0.125 - 1e-9, -0.125));
+        let right = world.sample(direction(4, 0.125 + 1e-9, -0.125));
+        assert!((left.height_m - right.height_m).abs() < 0.001);
     }
 
     #[test]
@@ -976,14 +1511,7 @@ mod tests {
         let mut previous = 1000.0;
         for i in 0..41 {
             let t = f64::from(i) / 40.0;
-            let p = curve(
-                &world,
-                cells[0],
-                cells[1],
-                t,
-                tangent(&world, cells[0]),
-                tangent(&world, cells[1]),
-            );
+            let p = world.river_reach(cells[0]).unwrap().position(t);
             let s = world.sample(p);
             let level = s.water_level_m.unwrap();
             assert!(level <= previous + 0.05);
@@ -1014,22 +1542,20 @@ mod tests {
 
         // The lake stays visible in the cubic stencil along the entire reach.
         // Its plane must never replace the river's falling hydraulic profile.
+        let mut previous = 100.0_f64;
         for i in 1..=40 {
             let t = f64::from(i) / 40.0;
-            let p = curve(
-                &world,
-                outlet,
-                downstream,
-                t,
-                tangent(&world, outlet),
-                tangent(&world, downstream),
-            );
+            let reach = world.river_reach(outlet).unwrap();
+            let p = reach.position(t);
             let sample = world.sample(p);
             assert!(!sample.lake, "lake flooded river at t={t}");
             assert!(sample.river > 0.99);
             assert!(sample.water_body_id.unwrap() >= RIVER_ID_BASE);
-            assert!((f64::from(sample.water_m) - (100.0 - 40.0 * t)).abs() < 0.1);
+            assert!((f64::from(sample.water_m) - reach.level(t)).abs() < 0.1);
+            assert!(reach.level(t) <= previous + 1e-6);
+            previous = reach.level(t);
         }
+        assert!((previous - 60.0).abs() < 1e-6);
     }
 
     #[test]

@@ -1,10 +1,13 @@
 //! Deterministic prototype planet compiler: global spherical drainage, persistent
 //! atlas and continuous spatial detail. This is a reduced model, not a climate GCM.
 
+mod coast;
 pub mod erosion;
 pub mod geometry;
 pub mod hydrology;
+mod lake_geometry;
 mod regions;
+pub mod river_geometry;
 mod sampler;
 pub mod tile_wire;
 pub use regions::RegionPatch;
@@ -17,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
+    sync::OnceLock,
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.6.5";
+pub const GENERATOR_VERSION: &str = "prototype-0.7.0";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +34,12 @@ pub struct WorldConfig {
     pub ocean_fraction: f64,
     pub relief_m: f64,
     pub detail_m: f64,
+    /// Strength of the invertible spherical coastline twists, independent of detail_m.
+    pub coast_detail_ratio: f64,
+    /// Smallest wavelength used to displace the canonical coastline, in metres.
+    pub coast_reference_spacing_m: f64,
+    /// Depressions shallower than this are drained before reservoirs are built.
+    pub lake_min_basin_depth_m: f64,
     pub axial_tilt_deg: f64,
     pub gravity_m_s2: f64,
     /// Alternative to ocean_fraction: total ocean water volume in cubic metres.
@@ -52,6 +62,9 @@ impl Default for WorldConfig {
             ocean_fraction: 0.58,
             relief_m: 6_000.0,
             detail_m: 140.0,
+            coast_detail_ratio: 0.16,
+            coast_reference_spacing_m: 1.0,
+            lake_min_basin_depth_m: 8.0,
             axial_tilt_deg: 23.4,
             gravity_m_s2: 3.0,
             water_volume_m3: None,
@@ -81,6 +94,25 @@ impl WorldConfig {
         }
         if !self.detail_m.is_finite() || !(0.0..=self.relief_m).contains(&self.detail_m) {
             bail!("detail_m must be finite and between zero and relief_m");
+        }
+        for (name, value, min, max) in [
+            ("coast_detail_ratio", self.coast_detail_ratio, 0.0, 1.0),
+            (
+                "coast_reference_spacing_m",
+                self.coast_reference_spacing_m,
+                0.25,
+                10_000.0,
+            ),
+            (
+                "lake_min_basin_depth_m",
+                self.lake_min_basin_depth_m,
+                0.0,
+                500.0,
+            ),
+        ] {
+            if !value.is_finite() || value < min || value > max {
+                bail!("{name} must be finite and in {min}..={max}");
+            }
         }
         if !self.axial_tilt_deg.is_finite() || !(0.0..=90.0).contains(&self.axial_tilt_deg) {
             bail!("axial_tilt_deg must be between zero and 90 degrees");
@@ -237,6 +269,11 @@ pub struct World {
     pub lakes: Vec<hydrology::Lake>,
     #[serde(default)]
     pub erosion: erosion::ErosionReport,
+    /// Reconstructible geometry for the frozen atlas. Mutators must invalidate it.
+    #[serde(skip)]
+    pub river_cache: OnceLock<Vec<Option<Box<river_geometry::RiverReach>>>>,
+    #[serde(skip)]
+    pub(crate) hydraulic_cache: OnceLock<std::sync::Arc<lake_geometry::LakeDomains>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -611,36 +648,59 @@ fn classify(cell: &Cell) -> Biome {
 }
 
 impl World {
+    pub fn invalidate_geometry(&mut self) {
+        self.river_cache.take();
+        self.hydraulic_cache.take();
+    }
+
+    pub fn river_reach(&self, index: usize) -> Option<&river_geometry::RiverReach> {
+        self.river_cache
+            .get_or_init(|| river_geometry::compile(self))
+            .get(index)?
+            .as_deref()
+    }
+
+    #[cfg(test)]
     fn channel_width(&self, discharge: f32) -> f64 {
-        // Geometrically similar Darcy-Weisbach channels: velocity scales as sqrt(g),
-        // area as 1/sqrt(g), and width as g^(-1/4), at fixed discharge.
-        (f64::from(discharge).sqrt() * 1.8 * (9.81 / self.config.gravity_m_s2).powf(0.25))
-            .clamp(8.0, 2500.0)
+        river_geometry::width(self, f64::from(discharge))
     }
 
     pub fn rivers(&self) -> Vec<RiverSegment> {
-        self.cells
-            .iter()
-            .enumerate()
-            .filter_map(|(i, cell)| {
-                if cell.ocean || cell.lake || cell.discharge < 120.0 {
-                    return None;
-                }
-                let receiver = cell.receiver?;
-                let next = &self.cells[receiver];
-                if next.height_m > cell.height_m + 0.02 {
-                    return None;
-                }
-                Some(RiverSegment {
-                    id: format!("{}-river-{i}", self.id),
-                    from: i,
-                    to: receiver,
-                    start: cell.position,
-                    end: next.position,
-                    start_height_m: cell.height_m,
-                    end_height_m: next.height_m,
-                    discharge_m3_s: cell.discharge,
-                    width_m: self.channel_width(cell.discharge) as f32,
+        self.river_segments(usize::MAX)
+    }
+
+    /// Orbital display is bounded independently from the complete physical graph.
+    /// Detailed tile sampling always uses every reach in the canonical catalogue.
+    pub fn river_segments(&self, max_reaches: usize) -> Vec<RiverSegment> {
+        let catalog = self
+            .river_cache
+            .get_or_init(|| river_geometry::compile(self));
+        let mut selected: Vec<_> = catalog.iter().flatten().collect();
+        if selected.len() > max_reaches {
+            selected.sort_by(|a, b| {
+                b.discharge_m3_s
+                    .total_cmp(&a.discharge_m3_s)
+                    .then(a.from.cmp(&b.from))
+            });
+            selected.truncate(max_reaches);
+        }
+        selected
+            .into_iter()
+            .flat_map(|reach| {
+                (0..16).map(move |step| {
+                    let t0 = step as f64 / 16.0;
+                    let t1 = (step + 1) as f64 / 16.0;
+                    RiverSegment {
+                        id: format!("{}-river-{}-{step}", self.id, reach.from),
+                        from: reach.from,
+                        to: reach.to,
+                        start: reach.position(t0),
+                        end: reach.position(t1),
+                        start_height_m: reach.level(t0) as f32,
+                        end_height_m: reach.level(t1) as f32,
+                        discharge_m3_s: reach.discharge_m3_s as f32,
+                        width_m: reach.width((t0 + t1) * 0.5) as f32,
+                    }
                 })
             })
             .collect()
@@ -768,13 +828,14 @@ impl World {
         }
         hydrology::route_potential(&mut cells, n);
         climate(&mut cells, &config);
-        let erosion = erosion::evolve(&mut cells, &config);
+        let mut erosion = erosion::evolve(&mut cells, &config);
         let datum_shift = choose_sea_level(&cells, &config);
         sea_level_m += datum_shift;
         for cell in &mut cells {
             cell.height_m -= datum_shift;
             cell.bedrock_m -= datum_shift;
         }
+        erosion::finish_minor_basins(&mut cells, &config, &mut erosion);
         hydrology::route_potential(&mut cells, n);
         climate(&mut cells, &config);
         let (lakes, total_runoff, outlet_discharge) =
@@ -842,6 +903,8 @@ impl World {
             seasonal_phase: None,
             lakes,
             erosion,
+            river_cache: OnceLock::new(),
+            hydraulic_cache: OnceLock::new(),
         };
         world.validate()?;
         Ok(world)

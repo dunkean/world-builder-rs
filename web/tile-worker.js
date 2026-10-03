@@ -5,9 +5,9 @@ const ready = init();
 const requests = new Map();
 const memory = new Map();
 let memoryBytes = 0;
-const MEMORY_LIMIT = 64 * 1024 * 1024;
+const MEMORY_LIMIT = 128 * 1024 * 1024;
 const DISK_LIMIT = 384 * 1024 * 1024;
-const DISK_ENTRIES = 256;
+const DISK_ENTRIES = 2048;
 const cacheName = 'world-builder-tiles-v1';
 let disk;
 let diskIndex;
@@ -108,7 +108,9 @@ self.onmessage = async ({ data }) => {
     const result = packet.buffer;
     self.postMessage({ type: 'tile', id: data.id, key: data.key, epoch: data.epoch, packet: result,
       fetch_ms: preparationStarted - started, prepare_ms: performance.now() - preparationStarted,
-      metrics: { ...metrics, memory_bytes: memoryBytes, disk_bytes: diskBytes } }, [result]);
+      metrics: { ...metrics, memory_bytes: memoryBytes, disk_bytes: diskBytes,
+        worker_memory_capacity_bytes: MEMORY_LIMIT, worker_disk_capacity_bytes: DISK_LIMIT,
+        worker_disk_entry_capacity: DISK_ENTRIES, worker_disk_entries: diskIndex?.size ?? 0 } }, [result]);
   } catch (error) {
     if (controller.signal.aborted) metrics.aborted += 1;
     self.postMessage({ type: 'error', id: data.id, epoch: data.epoch,

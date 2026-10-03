@@ -4,58 +4,85 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b121a">
-  <title>World Builder — laboratoire planétaire</title>
+  <title>World Builder</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <canvas id="planet" aria-label="Explorateur de planète en trois dimensions"></canvas>
-  <header class="topbar">
-    <div class="brand"><span class="brand-icon">◉</span><div>WORLD BUILDER <small>Laboratoire de mondes procéduraux</small></div></div>
-    <div class="runtime"><span id="runtime-dot" class="dot"></span><span id="backend">Chargement du moteur Rust…</span></div>
-  </header>
-  <aside class="panel">
-    <div class="panel-title"><span>01 / PLANÈTE</span><span class="badge">PROTOTYPE</span></div>
-    <h1>Une graine.<br>Tout un monde.</h1>
-    <p class="intro">Terrain érodé, lacs par bassins et détails fractals sur une sphère continue. Calcul natif, exploration WebAssembly.</p>
-    <form id="generator">
-      <label for="seed">Graine</label>
-      <div class="seed-row"><input id="seed" name="seed" value="42" type="number" min="0" max="9007199254740991" required><button type="button" id="randomize" aria-label="Nouvelle graine">↻</button></div>
-      <div class="field-pair">
-        <div><label for="resolution">Atlas / face</label><select id="resolution"><option value="32">32 × 32 · rapide</option><option value="64" selected>64 × 64 · aperçu</option><option value="96">96 × 96 · intermédiaire</option><option value="128">128 × 128 · fin</option><option value="256">256 × 256 · détaillé</option><option value="512">512 × 512 · atlas étendu</option></select></div>
-        <div><label for="radius">Rayon (km)</label><input id="radius" type="number" value="1737" min="10" max="20000" step="1"></div>
-      </div>
-      <label class="slider-label" for="ocean-fraction">Surface océanique visée <output id="ocean-value">58 %</output></label>
-      <input id="ocean-fraction" type="range" min="5" max="95" value="58">
-      <details class="advanced"><summary>Paramètres physiques</summary>
-        <div class="field-pair"><div><label for="relief">Relief (m)</label><input id="relief" type="number" value="6000" min="100" max="30000" step="100"></div><div><label for="gravity">Gravité (m/s²)</label><input id="gravity" type="number" value="3" min="0.1" max="50" step="0.1"></div></div>
-        <label for="tilt">Inclinaison axiale (°)</label><input id="tilt" type="number" value="23.4" min="0" max="90" step="0.1">
-        <div class="field-pair"><div><label for="erosion-steps">Étapes d’érosion</label><input id="erosion-steps" type="number" value="24" min="0" max="256" step="1"></div><div><label for="geological-years">Durée géologique (ans)</label><input id="geological-years" type="number" value="2000000" min="1" max="100000000" step="100000"></div></div>
-        <p class="hint">Plus d’étapes affinent le calcul ; la durée règle l’évolution du relief.</p>
-      </details>
-      <button class="primary" id="generate" type="submit" disabled><span>Générer la planète</span><span>↗</span></button>
-    </form>
-    <div class="divider"></div>
-    <div class="panel-title"><span>02 / EXPLORATION</span></div>
-    <label for="layer">Champ visible</label>
-    <select id="layer"><option value="0">Biomes et eaux</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage et rivières</option></select>
-    <label class="slider-label" for="season">Saison <output id="season-value">Moyenne annuelle</output></label>
-    <input id="season" type="range" min="0" max="12" value="0" step="1">
-    <div class="overlay-options"><label><input id="show-rivers" type="checkbox"> Rivières</label><label><input id="show-human" type="checkbox"> Villes et routes</label></div>
-    <label class="contract-option" style="display:none"><input id="conservative-refinement" type="checkbox"> Raffinement conservatif <span>expérimental</span></label>
-    <p id="contract-status" class="hint" hidden>Conservation des altitudes uniquement.</p>
-    <label class="slider-label" for="exaggeration">Relief visuel <output id="exaggeration-value">×1</output></label>
-    <input id="exaggeration" type="range" min="1" max="30" value="1">
-    <label class="slider-label" for="view-tilt">Inclinaison de la vue <output id="view-tilt-value">0°</output></label>
-    <input id="view-tilt" type="range" min="0" max="35" value="0" step="1">
-    <button class="secondary" id="reset" type="button">Revenir à la vue orbitale</button>
-    <label for="destination">Aller à…</label>
-    <div class="destination-row"><select id="destination"><option value="">Choisir un lieu</option></select><button class="destination-button" id="fly" type="button" aria-label="Explorer le lieu choisi">↗</button></div>
-    <p class="hint">Glisser pour tourner · Molette pour descendre<br>Le relief ×1 conserve les dimensions physiques.<br>Débits annuels · Routes et villes : symboles.</p>
-    <details id="metrics"><summary>Mesures du monde</summary><div id="stats">Aucune planète chargée.</div></details>
+  <aside class="panel" aria-label="Propriétés du monde">
+    <header class="panel-header"><h1>World Builder</h1><button id="toggle-panel" class="icon-button" type="button" aria-label="Réduire le panneau" aria-expanded="true" aria-controls="panel-body">‹</button></header>
+    <div id="panel-body">
+      <nav class="tabs" role="tablist" aria-label="Réglages">
+        <button id="tab-generation" type="button" role="tab" aria-selected="true" aria-controls="pane-generation" data-tab="generation">Génération</button>
+        <button id="tab-view" type="button" role="tab" aria-selected="false" aria-controls="pane-view" data-tab="view" tabindex="-1">Vue</button>
+        <button id="tab-world" type="button" role="tab" aria-selected="false" aria-controls="pane-world" data-tab="world" tabindex="-1">Monde</button>
+      </nav>
+      <section id="pane-generation" class="tab-pane" role="tabpanel" aria-labelledby="tab-generation">
+        <form id="generator">
+          <div class="form-fields">
+            <label for="preset">Point de départ</label>
+            <select id="preset"><option value="custom">Personnalisé</option><option value="balanced">Équilibré</option><option value="preview">Essai rapide</option><option value="mountains">Relief marqué</option><option value="oceanic">Monde océanique</option></select>
+            <p id="preset-description" class="hint">Les réglages prennent effet à la prochaine génération.</p>
+            <label for="seed">Graine</label>
+            <div class="seed-row"><input id="seed" name="seed" value="42" type="number" min="0" max="9007199254740991" step="1" required><button id="randomize" class="icon-button" type="button" aria-label="Tirer une nouvelle graine" title="Nouvelle graine">↻</button></div>
+            <details class="settings-section" open><summary>Planète</summary>
+              <div class="field-pair"><div><label for="resolution">Atlas / face</label><select id="resolution"><option value="32">32 × 32</option><option value="64">64 × 64</option><option value="96">96 × 96</option><option value="128" selected>128 × 128</option><option value="256">256 × 256</option><option value="512">512 × 512</option><option value="1024">1024 × 1024</option></select></div><div><label for="radius">Rayon <span>km</span></label><input id="radius" type="number" value="1737" min="10" max="100000" step="any" required></div></div>
+              <p id="config-cost" class="hint">98 304 cellules d’atlas</p>
+              <label for="gravity">Gravité <span>m/s²</span></label><input id="gravity" type="number" value="3" min="0.05" max="100" step="any" required>
+            </details>
+            <details class="settings-section" open><summary>Relief et côtes</summary>
+              <div class="field-pair"><div><label for="relief">Amplitude du relief <span>m</span></label><input id="relief" type="number" value="6000" min="10" step="any" required></div><div><label for="detail">Détail du terrain <span>m</span></label><input id="detail" type="number" value="140" min="0" step="any" required></div></div>
+              <label class="slider-label" for="coast-detail">Détail côtier <output id="coast-detail-value">16 %</output></label><input id="coast-detail" type="range" min="0" max="100" step="0.1" value="16">
+              <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="1" min="0.25" max="10000" step="any" required>
+              <p class="hint">Le détail côtier règle la déformation des côtes. L’échelle minimale reste fixe, quel que soit le zoom.</p>
+            </details>
+            <details class="settings-section"><summary>Érosion et géologie</summary>
+              <div class="field-pair"><div><label for="erosion-steps">Étapes de calcul</label><input id="erosion-steps" type="number" value="24" min="0" max="256" step="1" required></div><div><label for="geological-years">Durée <span>millions d’années</span></label><input id="geological-years" type="number" value="2" min="0.000001" max="100" step="any" required></div></div>
+              <label for="uplift">Soulèvement <span>mm/an</span></label><input id="uplift" type="number" value="0.15" min="0" max="10" step="any" required>
+              <label for="stream-power">Coefficient d’incision fluviale <span>10⁻⁶/an</span></label><input id="stream-power" type="number" value="8" min="0" max="10000" step="any" required>
+              <label for="diffusivity">Diffusion des versants <span>m²/an</span></label><input id="diffusivity" type="number" value="0.8" min="0" max="1000" step="any" required>
+              <p class="hint">La durée règle l’évolution physique ; le nombre d’étapes règle la discrétisation du calcul. Zéro étape désactive l’érosion.</p>
+            </details>
+            <details class="settings-section"><summary>Océans et lacs</summary>
+              <label for="water-mode">Quantité d’eau</label><select id="water-mode"><option value="fraction">Surface océanique visée</option><option value="volume">Volume d’eau imposé</option></select>
+              <div id="ocean-control"><label class="slider-label" for="ocean-fraction">Surface océanique <output id="ocean-value">58 %</output></label><input id="ocean-fraction" type="range" min="5" max="95" step="0.1" value="58"></div>
+              <div id="volume-control" hidden><label for="water-volume">Volume d’eau <span>km³</span></label><input id="water-volume" type="number" value="1000000" min="0" step="any" disabled></div>
+              <div class="field-pair"><div><label for="lake-depth">Profondeur minimale des bassins <span>m</span></label><input id="lake-depth" type="number" value="8" min="0" max="500" step="any" required></div><div><label for="lake-fill">Durée de remplissage <span>ans</span></label><input id="lake-fill" type="number" value="25" min="0.01" max="10000" step="any" required></div></div>
+              <p class="hint">Les petits bassins sont drainés pendant le calcul du terrain. Leur profondeur minimale ne masque pas l’eau après génération.</p>
+            </details>
+            <details class="settings-section"><summary>Climat</summary>
+              <label for="tilt">Inclinaison axiale <span>°</span></label><input id="tilt" type="number" value="23.4" min="0" max="90" step="any" required>
+              <p class="hint">L’inclinaison règle le forçage saisonnier. La saison affichée se choisit dans l’onglet Vue.</p>
+            </details>
+          </div>
+          <div class="generation-actions">
+            <p id="config-state" class="config-state" role="status">Réglages prêts à générer</p>
+            <button class="primary" id="generate" type="submit" disabled><span>Générer la planète</span><span aria-hidden="true">↗</span></button>
+            <div class="config-actions"><button id="import-config" type="button">Importer JSON</button><button id="export-config" type="button">Exporter JSON</button><button id="restore-defaults" type="button" title="Rétablir les paramètres par défaut, en conservant la graine">Défauts</button></div>
+            <input id="config-file" type="file" accept=".json,application/json" hidden>
+          </div>
+        </form>
+      </section>
+      <section id="pane-view" class="tab-pane" role="tabpanel" aria-labelledby="tab-view" hidden>
+        <div class="pane-content">
+          <label for="layer">Champ visible</label><select id="layer"><option value="0">Biomes et eaux</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage</option></select>
+          <label class="slider-label" for="season">Saison <output id="season-value">Moyenne annuelle</output></label><input id="season" type="range" min="0" max="12" value="0" step="1">
+          <label class="checkbox-label"><input id="show-rivers" type="checkbox"> Afficher les rivières</label>
+          <label class="slider-label" for="exaggeration">Amplification visuelle du relief <output id="exaggeration-value">×1</output></label><input id="exaggeration" type="range" min="1" max="30" value="1">
+          <label class="slider-label" for="view-tilt">Inclinaison de la vue <output id="view-tilt-value">0°</output></label><input id="view-tilt" type="range" min="0" max="35" value="0" step="1">
+          <p class="hint">×1 conserve les dimensions physiques. Ces réglages s’appliquent immédiatement.</p>
+          <div class="section-divider"></div>
+          <label for="destination">Lieu à explorer</label><div class="destination-row"><select id="destination"><option value="">Choisir un lieu</option></select><button class="icon-button" id="fly" type="button" aria-label="Explorer le lieu choisi">↗</button></div>
+          <label for="visit-altitude">Altitude au-dessus du terrain <span>m</span></label><div class="destination-row"><input id="visit-altitude" type="number" value="30000" min="1" max="700000000" step="any"><button class="icon-button" id="go-altitude" type="button" aria-label="Appliquer l’altitude à la vue actuelle" title="Appliquer à la vue actuelle">↗</button></div>
+          <button class="secondary" id="reset" type="button">Revenir à la vue orbitale</button>
+          <p class="hint">Glisser pour tourner · Molette pour changer d’altitude</p>
+          <div hidden><input id="conservative-refinement" type="checkbox"><p id="contract-status" hidden></p></div>
+        </div>
+      </section>
+      <section id="pane-world" class="tab-pane" role="tabpanel" aria-labelledby="tab-world" hidden><div class="pane-content"><h2 id="world-name">Aucune planète chargée</h2><p id="world-meta" class="hint"></p><div id="stats">Les mesures apparaîtront après génération.</div></div></section>
+      <div class="panel-footer"><div id="message" role="status" aria-live="polite" hidden></div><div class="runtime"><span id="runtime-dot" class="dot"></span><span id="backend">Chargement du moteur…</span></div></div>
+    </div>
   </aside>
-  <div class="world-label"><span class="eyebrow">MONDE ACTIF</span><strong id="world-name">Prêt à explorer</strong><span id="world-meta">La géographie précède les détails.</span></div>
-  <footer class="statusbar"><span id="status">Initialisation…</span><span id="camera">Orbite</span><span id="fps">— fps</span></footer>
-  <div id="message" role="status" aria-live="polite" hidden></div>
+  <main class="viewport"><canvas id="planet" aria-label="Explorateur de planète en trois dimensions"></canvas><footer class="statusbar"><span id="status">Initialisation…</span><span id="camera">Orbite</span><span id="fps">— fps</span></footer></main>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

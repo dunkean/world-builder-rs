@@ -472,6 +472,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn open_reservoir_exports_its_budget_once_and_keeps_a_real_outgoing_reach() {
+        let mut world = crate::World::generate(WorldConfig {
+            resolution: 8,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        for cell in &mut world.cells {
+            cell.height_m = 200.0;
+            cell.water_m = 200.0;
+            cell.temperature_c = 20.0;
+            cell.moisture = 0.0;
+        }
+        let pit = cell_index(4, 2, 3, 8);
+        let fringe = cell_index(4, 3, 3, 8);
+        let spill = cell_index(4, 4, 3, 8);
+        let downhill = cell_index(4, 5, 3, 8);
+        let sea = cell_index(4, 6, 3, 8);
+        for (index, height) in [
+            (pit, 60.0),
+            (fringe, 80.0),
+            (spill, 100.0),
+            (downhill, 10.0),
+            (sea, -30.0),
+        ] {
+            world.cells[index].height_m = height;
+        }
+        world.cells[pit].moisture = 1.0;
+        world.cells[fringe].moisture = 1.0;
+        for (x, y) in [(1, 3), (2, 2), (2, 4)] {
+            let upstream = cell_index(4, x, y, 8);
+            world.cells[upstream].height_m = 140.0;
+            world.cells[upstream].moisture = 1.0;
+        }
+        world.config.lake_fill_years = 100_000.0;
+        let (lakes, input, exported) = physical_water(&mut world.cells, &world.config);
+        assert_eq!(lakes.len(), 1);
+        let lake = &lakes[0];
+        assert!(lake.outlet.is_some());
+        assert!(lake.outflow_m3_s > crate::river_geometry::MIN_RIVER_DISCHARGE_M3_S);
+        assert!(world.cells[lake.control_cell].lake);
+        assert_eq!(world.cells[lake.control_cell].receiver, lake.outlet);
+        assert!(
+            (f64::from(world.cells[lake.control_cell].discharge) - lake.outflow_m3_s).abs()
+                / lake.outflow_m3_s
+                < 1e-6
+        );
+        let loss = lake.evaporation_m3_s + lake.infiltration_m3_s + lake.storage_change_m3_s;
+        assert!((input - loss - exported).abs() / input < 1e-10);
+        assert_eq!(topological(&world.cells).len(), world.cells.len());
+        let control = lake.control_cell;
+        let level = lake.level_m;
+        world.lakes = lakes;
+        let reach = crate::river_geometry::reach(&world, control).unwrap();
+        assert!(reach.lake_outlet);
+        assert_eq!(reach.start_level_m, f64::from(level));
+        assert!(reach.end_level_m <= reach.start_level_m);
+        let mouth = crate::river_geometry::reach(&world, downhill).unwrap();
+        assert!(mouth.marine_mouth);
+        assert_eq!(mouth.end_level_m, 0.0);
+    }
+
+    #[test]
     fn physical_basin_includes_connected_submetre_fringe_without_changing_erosion_groups() {
         let world = crate::World::generate(WorldConfig {
             resolution: 8,

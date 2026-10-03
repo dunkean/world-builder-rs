@@ -1,6 +1,7 @@
 import init, * as viewer from '/pkg/world_viewer.js';
 import { TileStream } from './tile-stream.js';
 import { CameraPredictor } from './camera-predictor.js';
+import { setupSettings } from './settings.js';
 const predictor = new CameraPredictor();
 
 const $ = (id) => document.getElementById(id);
@@ -16,7 +17,6 @@ const renderMetrics = { frames: 0, max_render_ms: 0, render_ms: 0 };
 let generationBusy = false;
 let rendererFailed = false;
 let riverData;
-let humanData;
 let seasonPhase;
 let renderEpoch = 0;
 const destinations = new Map();
@@ -36,6 +36,7 @@ async function api(path, options = {}) {
 }
 
 const number = (value, digits = 0) => Number(value).toLocaleString('fr-FR', { maximumFractionDigits: digits });
+const settings = setupSettings(document, message);
 
 function addMetric(label, value) {
   const row = document.createElement('div');
@@ -50,7 +51,7 @@ function addMetric(label, value) {
 
 function loadWorld(world) {
   viewer.set_world(JSON.stringify(world));
-  viewer.set_overlays($('show-rivers').checked, $('show-human').checked);
+  viewer.set_overlays($('show-rivers').checked, false);
   activeWorld = world;
   destinations.clear();
   predictor.reset();
@@ -73,9 +74,8 @@ function loadWorld(world) {
   if (river && river.discharge > 0) addDestination('river', 'Grande rivière', river.position ?? river.direction);
   lastTile = undefined;
   loadedTiles.clear();
-  renderEpoch += 1;
+  renderEpoch += 1; tileStream?.reset(renderEpoch);
   riverData = undefined;
-  humanData = undefined;
   seasonPhase = undefined;
   $('season').value = 0;
   $('season-value').value = 'Moyenne annuelle';
@@ -84,15 +84,8 @@ function loadWorld(world) {
   loadOverlays(world.id);
   $('world-name').textContent = `Planète ${world.config.seed}`;
   $('world-meta').textContent = `${number(world.config.radius_m / 1000)} km · ${number(world.stats?.cells ?? 6 * world.config.resolution ** 2)} cellules d'atlas`;
-  $('seed').value = world.config.seed;
-  $('radius').value = world.config.radius_m / 1000;
-  $('resolution').value = world.config.resolution;
-  if (world.config.ocean_fraction !== undefined) { $('ocean-fraction').value = world.config.ocean_fraction * 100; $('ocean-value').value = `${number(world.config.ocean_fraction * 100)} %`; }
-  if (world.config.relief_m !== undefined) $('relief').value = world.config.relief_m;
-  if (world.config.gravity_m_s2 !== undefined) $('gravity').value = world.config.gravity_m_s2;
-  if (world.config.axial_tilt_deg !== undefined) $('tilt').value = world.config.axial_tilt_deg;
-  $('erosion-steps').value = world.config.erosion_steps ?? 24;
-  $('geological-years').value = world.config.geological_years ?? 2000000;
+  settings.apply(world.config, { applied: true });
+  $('visit-altitude').max = String(world.config.radius_m * 7);
   $('stats').replaceChildren();
   addMetric('Identifiant', String(world.id).slice(0, 16));
   addMetric('Rayon', `${number(world.config.radius_m / 1000)} km`);
@@ -133,15 +126,6 @@ async function loadOverlays(worldId) {
       const lake = data.lakes?.filter((l) => l.volume_m3 > 0).sort((a, b) => b.area_m2 - a.area_m2)[0];
       if (lake) addDestination('lake', 'Grand lac', lake.direction);
     }),
-    api(`/api/worlds/${worldId}/human`).then((data) => {
-      if (activeWorld?.id !== worldId) return;
-      humanData = JSON.stringify(data);
-      viewer.set_human(humanData);
-      if (data.settlements?.length) addDestination('village', 'Première localité', data.settlements[0].direction);
-      addMetric('Population implantée', number(data.population ?? 0));
-      addMetric('Localités', number(data.settlements?.length ?? 0));
-      addMetric('Routes', number(data.roads?.length ?? 0));
-    }),
   ]);
   for (const result of results) if (result.status === 'rejected') console.warn('Couche indisponible', result.reason);
 }
@@ -155,9 +139,8 @@ async function changeSeason() {
     if (activeWorld?.id !== worldId || Number($('season').value) !== month) return;
     viewer.set_world(JSON.stringify(world));
     if (riverData) viewer.set_rivers(riverData);
-    if (humanData) viewer.set_human(humanData);
     seasonPhase = month === 0 ? undefined : (month - 1) / 12;
-    renderEpoch += 1;
+    renderEpoch += 1; tileStream?.reset(renderEpoch);
     loadedTiles.clear();
     $('status').textContent = month === 0 ? 'Climat moyen annuel' : `Saison ${month}/12 · forçage solaire réduit, débits annuels`;
   } catch (error) { message(`Saison : ${error.message}`); }
@@ -169,9 +152,10 @@ async function generate() {
   $('generate').disabled = true;
   $('generate').firstElementChild.textContent = 'Calcul en cours…';
   message('');
-  const config = { seed: Number($('seed').value), resolution: Number($('resolution').value), radius_m: Number($('radius').value) * 1000, ocean_fraction: Number($('ocean-fraction').value) / 100, relief_m: Number($('relief').value), gravity_m_s2: Number($('gravity').value), axial_tilt_deg: Number($('tilt').value), erosion_steps: Number($('erosion-steps').value), geological_years: Number($('geological-years').value) };
   try {
-    $('status').textContent = 'Compilation native : relief, climat et hydrologie…';
+    const config = settings.read();
+    settings.setBusy(true);
+    $('status').textContent = 'Calcul du relief, du climat et de l’hydrologie…';
     const result = await api('/api/worlds', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(config) });
     if (result.cells) {
       loadWorld(result);
@@ -180,7 +164,7 @@ async function generate() {
       for (;;) {
         await new Promise((resolve) => setTimeout(resolve, 600));
         const job = await api(`/api/jobs/${id}`);
-        $('status').textContent = job.message ?? (job.status === 'queued' ? 'Génération dans la file…' : 'Compilation native du monde…');
+        $('status').textContent = job.message ?? (job.status === 'queued' ? 'Génération dans la file…' : 'Calcul du monde…');
         if (job.status === 'failed') throw new Error(job.error ?? 'La génération a échoué');
         if (job.status === 'ready' || job.status === 'complete' || job.status === 'completed') {
           loadWorld(await api(job.world_id ? `/api/worlds/${job.world_id}/preview?resolution=128` : '/api/world/latest/preview?resolution=128'));
@@ -193,6 +177,7 @@ async function generate() {
     $('status').textContent = 'Génération interrompue';
   } finally {
     generationBusy = false;
+    settings.setBusy(false);
     $('generate').disabled = false;
     $('generate').firstElementChild.textContent = 'Générer la planète';
   }
@@ -228,9 +213,9 @@ function updateDetail() {
     renderMetrics.forecast_requests = added;
   }
   tileStream.update(requests, {
-    epoch: renderEpoch, keyOf, radius: activeWorld.config.radius_m,
+    epoch: renderEpoch, keyOf, residentKeys: info.resident_keys, radius: activeWorld.config.radius_m,
     exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
-    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=128&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'continuous-coast-2'}`, location.origin).href,
+    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=64&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-6'}`, location.origin).href,
   });
   if (info.level >= 0) {
     $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;
@@ -250,34 +235,42 @@ canvas.addEventListener('pointermove', (event) => {
 for (const event of ['pointerup', 'pointercancel']) canvas.addEventListener(event, () => { pointer = undefined; });
 canvas.addEventListener('wheel', (event) => { event.preventDefault(); viewer.zoom(event.deltaY); }, { passive: false });
 $('generator').addEventListener('submit', (event) => { event.preventDefault(); generate(); });
-$('randomize').addEventListener('click', () => { $('seed').value = crypto.getRandomValues(new Uint32Array(1))[0]; });
-$('ocean-fraction').addEventListener('input', () => { $('ocean-value').value = `${$('ocean-fraction').value} %`; });
 $('reset').addEventListener('click', () => {
   viewer.reset_view();
   predictor.reset();
   $('view-tilt').value = '0';
   $('view-tilt-value').value = '0°';
 });
-$('fly').addEventListener('click', () => {
-  const direction = destinations.get($('destination').value);
-  if (!direction) return;
-  viewer.fly_to(JSON.stringify(direction), 30000);
+function visit(direction) {
+  if (!activeWorld || !direction) return;
+  const altitude = Number($('visit-altitude').value);
+  if (!Number.isFinite(altitude) || altitude < 1 || altitude > activeWorld.config.radius_m * 7) {
+    message(`L’altitude doit être comprise entre 1 et ${number(activeWorld.config.radius_m * 7)} m.`);
+    return;
+  }
+  viewer.fly_to(JSON.stringify(direction), altitude);
   predictor.reset();
-  $('status').textContent = 'Arrivée à 30 km au-dessus du lieu · molette pour descendre';
+  message('');
+  $('status').textContent = `Arrivée à ${number(altitude)} m au-dessus du terrain`;
+}
+$('fly').addEventListener('click', () => visit(destinations.get($('destination').value)));
+$('go-altitude').addEventListener('click', () => {
+  if (!activeWorld) return;
+  visit(JSON.parse(viewer.view_info()).direction);
 });
 $('layer').addEventListener('change', () => viewer.set_mode(Number($('layer').value)));
 $('season').addEventListener('input', () => { $('season-value').value = Number($('season').value) === 0 ? 'Moyenne annuelle' : `Saison ${$('season').value} / 12`; });
 $('season').addEventListener('change', changeSeason);
-for (const id of ['show-rivers', 'show-human']) $(id).addEventListener('change', () => viewer.set_overlays($('show-rivers').checked, $('show-human').checked));
+$('show-rivers').addEventListener('change', () => viewer.set_overlays($('show-rivers').checked, false));
 $('conservative-refinement').addEventListener('change', () => {
-  renderEpoch += 1;
+  renderEpoch += 1; tileStream?.reset(renderEpoch);
   viewer.clear_tiles();
   loadedTiles.clear();
   $('contract-status').hidden = !$('conservative-refinement').checked;
   $('contract-status').textContent = 'Conservation des altitudes uniquement. Descendre pour vérifier le raffinement.';
 });
 $('exaggeration').addEventListener('input', () => { $('exaggeration-value').value = `×${$('exaggeration').value}`; });
-$('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); viewer.clear_tiles(); loadedTiles.clear(); renderEpoch += 1; lastTile = undefined; updateDetail(); });
+$('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); viewer.clear_tiles(); loadedTiles.clear(); renderEpoch += 1; tileStream?.reset(renderEpoch); lastTile = undefined; updateDetail(); });
 $('view-tilt').addEventListener('input', () => { $('view-tilt-value').value = `${$('view-tilt').value}°`; viewer.set_view_tilt(Number($('view-tilt').value)); });
 
 function frame(now) {

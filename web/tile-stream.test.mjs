@@ -76,3 +76,71 @@ test('camera demand reprioritizes prepared arrivals before speculative neighbors
   stream.installNext();
   assert.deepEqual(installed, [2, 3, 1]);
 });
+
+test('renderer eviction requests a formerly loaded parent again without a world reset', () => {
+  const { messages, stream, context, requests, respond } = setup();
+  stream.update([requests[0]], { ...context, residentKeys: [] });
+  respond(messages.find((m) => m.type === 'load'));
+  stream.installNext();
+  assert.ok(stream.loaded.has('1'));
+  stream.update([requests[0]], { ...context, residentKeys: [requests[0]] });
+  assert.equal(messages.filter((m) => m.type === 'load').length, 1);
+  // A completed inverse cut evicted the parent without installing any packet.
+  stream.update([requests[0]], { ...context, residentKeys: [] });
+  assert.equal(messages.filter((m) => m.type === 'load' && m.key === '1').length, 2);
+  assert.equal(stream.epoch, context.epoch);
+});
+
+test('resident refresh discards an unnecessary prepared packet and preserves queue accounting', () => {
+  const { messages, installed, stream, context, requests, respond } = setup();
+  stream.update(requests.slice(0, 2), { ...context, residentKeys: [] });
+  const first = messages.find((m) => m.key === '1');
+  const second = messages.find((m) => m.key === '2');
+  respond(first);
+  assert.equal(stream.metrics.ready_bytes, 1);
+  stream.update(requests.slice(0, 2), { ...context, residentKeys: requests.slice(0, 2) });
+  assert.equal(stream.ready.length, 0);
+  assert.equal(stream.metrics.ready_bytes, 0);
+  assert.ok(messages.some((m) => m.type === 'cancel' && m.id === second.id));
+  respond(second);
+  stream.installNext();
+  assert.deepEqual(installed, []);
+  assert.equal(stream.jobs.size, 0);
+  assert.equal(messages.filter((m) => m.type === 'load').length, 2);
+});
+
+test('synchronous epoch reset rejects prepared and in-flight old terrain before the next update', () => {
+  const { messages, installed, stream, context, requests, respond } = setup();
+  stream.update(requests.slice(0, 2), context);
+  const first = messages.find((m) => m.key === '1');
+  const second = messages.find((m) => m.key === '2');
+  respond(first);
+  assert.equal(stream.ready.length, 1);
+  stream.reset(2);
+  respond(second);
+  stream.installNext();
+  assert.deepEqual(installed, []);
+  assert.equal(stream.ready.length, 0);
+  assert.equal(stream.jobs.size, 0);
+  assert.equal(stream.metrics.ready_bytes, 0);
+  assert.equal(stream.loaded.size, 0);
+  // Reset does not submit the previous world's demand between animation frames.
+  assert.equal(messages.filter((m) => m.type === 'load').length, 2);
+  stream.update([requests[0]], { ...context, epoch: 2 });
+  assert.ok(messages.some((m) => m.type === 'load' && m.key === '1' && m.epoch === 2));
+});
+
+test('camera cancellation releases dispatch slots before the worker acknowledges old jobs', () => {
+  const { messages, stream, context, requests, respond } = setup();
+  stream.update(requests.slice(0, 3), context);
+  const previous = messages.filter((m) => m.type === 'load');
+  stream.update(requests.slice(10, 13), context);
+  assert.equal(stream.jobs.size, 3);
+  for (const tile of requests.slice(10, 13)) {
+    assert.ok(messages.some((m) => m.type === 'load' && m.key === tile.key));
+  }
+  for (const job of previous) respond(job);
+  assert.equal(stream.ready.length, 0);
+  assert.equal(stream.jobs.size, 3);
+  assert.equal(messages.filter((m) => m.type === 'load').length, 6);
+});

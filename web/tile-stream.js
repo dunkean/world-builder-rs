@@ -17,21 +17,29 @@ export class TileStream {
     worker.onerror = (error) => { console.error('Worker de terrain', error.message); };
   }
 
+  reset(epoch) {
+    for (const [id] of this.jobs) this.worker.postMessage({ type: 'cancel', id });
+    this.jobs.clear();
+    this.loaded.clear(); this.ready.length = 0; this.failures.clear();
+    this.desired.clear(); this.context = undefined;
+    this.metrics.ready_bytes = 0; this.epoch = epoch;
+  }
+
   update(requests, context) {
-    if (this.epoch !== context.epoch) {
-      for (const [id] of this.jobs) this.worker.postMessage({ type: 'cancel', id });
-      this.loaded.clear(); this.ready.length = 0; this.failures.clear();
-      this.metrics.ready_bytes = 0; this.epoch = context.epoch;
-    }
+    if (this.epoch !== context.epoch) this.reset(context.epoch);
+    if (context.residentKeys) this.loaded = new Set(context.residentKeys.map(context.keyOf));
     this.context = context;
     this.desired = new Map(requests.map((tile) => [context.keyOf(tile), tile]));
     this.priority = new Map([...this.desired.keys()].map((key, index) => [key, index]));
     for (const [id, job] of this.jobs) {
-      if (job.epoch !== this.epoch || !this.desired.has(job.key)) {
-        if (!job.cancelled) { this.worker.postMessage({ type: 'cancel', id }); job.cancelled = true; }
+      if (job.epoch !== this.epoch || !this.desired.has(job.key) || this.loaded.has(job.key)) {
+        this.worker.postMessage({ type: 'cancel', id });
+        // Unique job IDs let late responses be rejected without retaining a
+        // cancelled job in one of the three slots needed by the new camera.
+        this.jobs.delete(id);
       }
     }
-    this.ready = this.ready.filter((tile) => tile.epoch === this.epoch && this.desired.has(tile.key));
+    this.ready = this.ready.filter((tile) => tile.epoch === this.epoch && this.desired.has(tile.key) && !this.loaded.has(tile.key));
     this.metrics.ready_bytes = this.ready.reduce((n, tile) => n + tile.packet.byteLength, 0);
     this.prioritizeReady();
     this.dispatch();
@@ -60,7 +68,7 @@ export class TileStream {
   receive(data) {
     const job = this.jobs.get(data.id);
     this.jobs.delete(data.id);
-    if (!job || job.cancelled || data.epoch !== this.epoch || !this.desired.has(job.key)) {
+    if (!job || job.cancelled || data.epoch !== this.epoch || !this.desired.has(job.key) || this.loaded.has(job.key)) {
       this.metrics.stale += 1;
     } else if (data.type === 'tile') {
       this.ready.push(data); this.metrics.ready_bytes += data.packet.byteLength;
@@ -77,7 +85,7 @@ export class TileStream {
     const tile = this.ready.shift();
     if (!tile) return;
     this.metrics.ready_bytes -= tile.packet.byteLength;
-    if (tile.epoch !== this.epoch || !this.desired.has(tile.key)) { this.dispatch(); return; }
+    if (tile.epoch !== this.epoch || !this.desired.has(tile.key) || this.loaded.has(tile.key)) { this.dispatch(); return; }
     const started = performance.now();
     try {
       const keys = JSON.parse(this.install(new Uint8Array(tile.packet)));

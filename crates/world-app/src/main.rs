@@ -26,7 +26,7 @@ mod preview;
 mod regions;
 
 // Render-field revision changes tile caches without rewriting physical atlases.
-const SURFACE_REVISION: &str = "continuous-coast-2";
+const SURFACE_REVISION: &str = "spherical-coast-6";
 
 #[derive(Parser)]
 #[command(
@@ -143,7 +143,7 @@ impl TileCache {
         self.size += value.len();
         self.order.push_back(key.clone());
         self.entries.insert(key, value);
-        while self.size > self.capacity || self.entries.len() > 512 {
+        while self.size > self.capacity || self.entries.len() > 2048 {
             if let Some(key) = self.order.pop_front() {
                 if let Some(value) = self.entries.remove(&key) {
                     self.size -= value.len();
@@ -507,7 +507,7 @@ async fn manifest(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let w = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":128,"max_tile_level":18,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
+        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":64,"max_tile_level":24,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
     ))
 }
 #[derive(Deserialize)]
@@ -537,7 +537,7 @@ impl TileFormat {
     }
 }
 fn default_segments() -> u32 {
-    128
+    64
 }
 
 const TILE_DISK_CAPACITY: u64 = 1024 * 1024 * 1024;
@@ -915,7 +915,7 @@ async fn rivers(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let world = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"world_id":world.id,"segments":world.rivers(),"discharge_model":"annual mean runoff"}),
+        serde_json::json!({"world_id":world.id,"segments":world.river_segments(256),"display_reach_limit":256,"discharge_model":"annual mean runoff"}),
     ))
 }
 async fn lakes(
