@@ -150,6 +150,24 @@ impl World {
                 river = smooth((1.0 - channel.distance_m / channel.half_width_m).clamp(0.0, 1.0));
             }
         }
+        if height < 0.0 && water_id.is_none_or(|id| id == 0) {
+            if let Some(owner) = basin_owner(self, &patch) {
+                // The canonical reservoir owns its dry submerged fringes too.
+                // A nearby sea stencil must not fill an endorheic basin up to
+                // zero, and a coastal fallback must not erase its water budget.
+                ocean = false;
+                lake = height < f64::from(owner.level_m);
+                water_level = Some(f64::from(owner.level_m));
+                water_id = Some(owner.id);
+            } else {
+                // The unresolved marine coast uses a global zero level set.
+                // Keep the frozen fine height and existing lake/channel owners;
+                // the finite 4x4 terrain stencil is not an ocean shoreline.
+                ocean = true;
+                water_level = Some(0.0);
+                water_id = Some(0);
+            }
+        }
         let water = water_level
             .filter(|&level| level > height && (ocean || lake || river > 0.0))
             .unwrap_or(height);
@@ -356,6 +374,18 @@ fn water_datum(world: &World, p: [f64; 3], patch: &Patch) -> Option<WaterDatum> 
         if !cell.ocean && !cell.lake {
             continue;
         }
+        if cell.lake
+            && !patch.attributes[..patch.attribute_count]
+                .iter()
+                .any(|&(corner, weight)| corner == index && weight > 1e-10)
+        {
+            // The 4x4 stencil supports cubic terrain derivatives, not water
+            // connectivity. A remote reservoir beyond the current quad must
+            // not lend its plane to another depression behind a dry ridge.
+            // Keep the sea's existing global datum and lake shoreline support
+            // on both wet and dry sides of a quad containing real lake water.
+            continue;
+        }
         let distance2 = (p[0] - cell.position[0]).powi(2)
             + (p[1] - cell.position[1]).powi(2)
             + (p[2] - cell.position[2]).powi(2);
@@ -381,6 +411,43 @@ fn water_datum(world: &World, p: [f64; 3], patch: &Patch) -> Option<WaterDatum> 
         }
     }
     result
+}
+
+fn basin_owner<'a>(world: &'a World, patch: &Patch) -> Option<&'a crate::hydrology::Lake> {
+    // Most marine/coastal quads contain no depression at all. Do not scan the
+    // small reservoir lists on their hot path. No cache is kept: World is public
+    // and synthetic worlds can change their cells and reservoirs between calls.
+    if !patch.attributes[..patch.attribute_count]
+        .iter()
+        .any(|&(index, weight)| {
+            let cell = &world.cells[index];
+            weight > 1e-10 && !cell.ocean && cell.routing_height_m - cell.height_m >= 0.0005
+        })
+    {
+        return None;
+    }
+    let mut result: Option<(&crate::hydrology::Lake, f64)> = None;
+    for &(index, weight) in &patch.attributes[..patch.attribute_count] {
+        if weight <= 1e-10 {
+            continue;
+        }
+        for lake in &world.lakes {
+            if lake.cells.contains(&index)
+                && result.is_none_or(|(old, old_weight)| {
+                    weight > old_weight || (weight == old_weight && lake.id < old.id)
+                })
+                && lake.cells.iter().any(|&i| {
+                    let cell = &world.cells[i];
+                    cell.lake
+                        && cell.lake_id == Some(lake.id)
+                        && cell.water_m.to_bits() == lake.level_m.to_bits()
+                })
+            {
+                result = Some((lake, weight));
+            }
+        }
+    }
+    result.map(|(owner, _)| owner)
 }
 
 fn smooth(t: f64) -> f64 {
@@ -621,6 +688,112 @@ mod tests {
         assert!(!dry.lake);
         assert_eq!(dry.water_m, dry.height_m);
         assert_eq!(dry.biome_mix[Biome::Lake as usize], 0.0);
+    }
+
+    #[test]
+    fn lake_plane_does_not_cross_a_ridge_into_an_independent_low_valley() {
+        let mut world = synthetic();
+        let lake = geometry::cell_index(4, 3, 3, 8);
+        let dry_valley = geometry::cell_index(4, 5, 3, 8);
+        world.cells[lake].height_m = 60.0;
+        world.cells[lake].water_m = 100.0;
+        world.cells[lake].lake = true;
+        world.cells[lake].lake_id = Some(17);
+        world.cells[lake].biome = Biome::Lake;
+        world.cells[dry_valley].height_m = 60.0;
+        world.cells[dry_valley].water_m = 60.0;
+        world.cells[dry_valley].routing_height_m = 60.0;
+
+        let (face, u, v) = geometry::face_uv(world.cells[dry_valley].position);
+        for y in -4..=4 {
+            for x in -4..=4 {
+                let p = direction(face, u + f64::from(x) / 400.0, v + f64::from(y) / 400.0);
+                let sample = world.sample(p);
+                assert!(!sample.lake, "remote lake flooded x={x}, y={y}");
+                assert_eq!(sample.water_level_m, None);
+                assert_eq!(sample.water_body_id, None);
+                assert_eq!(sample.water_m, sample.height_m);
+            }
+        }
+        let center = world.sample(world.cells[dry_valley].position);
+        assert_eq!(center.height_m, 60.0);
+        let wet = world.sample(world.cells[lake].position);
+        assert!(wet.lake);
+        assert_eq!(wet.water_m, 100.0);
+    }
+
+    #[test]
+    fn marine_surface_does_not_stop_at_the_terrain_stencil() {
+        let mut world = synthetic();
+        world.lakes.clear();
+        for cell in &mut world.cells {
+            cell.height_m = -5.0;
+            cell.water_m = -5.0;
+            cell.routing_height_m = 0.0;
+        }
+        let ocean = geometry::cell_index(4, 0, 3, 8);
+        world.cells[ocean].ocean = true;
+        world.cells[ocean].water_m = 0.0;
+        let (_, u, v) = geometry::face_uv(world.cells[ocean].position);
+        // Cross the exact old four-cell support boundary; both sides of each
+        // resulting triangle are under sea level and must share the same datum.
+        for i in -16..=16 {
+            let p = direction(4, u + 0.5 + f64::from(i) * 0.00001, v);
+            let patch = reconstruction(&world, p);
+            let sample = world.sample(p);
+            assert_eq!(sample.height_m.to_bits(), (patch.height as f32).to_bits());
+            assert!(sample.ocean);
+            assert_eq!(sample.water_level_m, Some(0.0));
+            assert_eq!(sample.water_body_id, Some(0));
+            assert_eq!(sample.water_m, 0.0);
+        }
+        let land = geometry::cell_index(4, 5, 3, 8);
+        world.cells[land].height_m = 160.0;
+        let dry = world.sample(world.cells[land].position);
+        assert!(!dry.ocean);
+        assert_eq!(dry.water_level_m, None);
+    }
+
+    #[test]
+    fn closed_subsea_basin_keeps_its_dry_fringe_and_lake_level() {
+        let mut world = synthetic();
+        world.lakes.clear();
+        let pit = geometry::cell_index(4, 2, 3, 8);
+        let fringe = geometry::cell_index(4, 3, 3, 8);
+        let dry = geometry::cell_index(4, 4, 3, 8);
+        let sea = geometry::cell_index(4, 6, 3, 8);
+        for (index, height) in [(pit, -120.0), (fringe, -60.0), (dry, -20.0)] {
+            world.cells[index].height_m = height;
+            world.cells[index].water_m = height;
+            world.cells[index].routing_height_m = 100.0;
+        }
+        world.cells[pit].lake = true;
+        world.cells[pit].lake_id = Some(17);
+        world.cells[pit].water_m = -80.0;
+        world.cells[sea].height_m = -30.0;
+        world.cells[sea].ocean = true;
+        world.cells[sea].water_m = 0.0;
+        world.cells[sea].routing_height_m = 0.0;
+        world.lakes.push(crate::hydrology::Lake {
+            id: 17,
+            level_m: -80.0,
+            spill_level_m: 100.0,
+            cells: vec![pit, fringe, dry],
+            ..Default::default()
+        });
+        for index in [pit, fringe, dry] {
+            let sample = world.sample(world.cells[index].position);
+            assert_eq!(sample.height_m, world.cells[index].height_m);
+            assert!(!sample.ocean);
+            assert_eq!(sample.water_level_m, Some(-80.0));
+            assert_eq!(sample.water_body_id, Some(17));
+            assert_eq!(sample.lake, index == pit);
+            assert_eq!(sample.water_m, world.cells[index].height_m.max(-80.0));
+        }
+        // Reservoir ownership follows the current World, including mutations;
+        // it cannot come from an ID-keyed static spatial cache.
+        world.lakes.clear();
+        assert!(world.sample(world.cells[dry].position).ocean);
     }
 
     #[test]

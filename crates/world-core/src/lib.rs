@@ -19,7 +19,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.6.4";
+pub const GENERATOR_VERSION: &str = "prototype-0.6.5";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]

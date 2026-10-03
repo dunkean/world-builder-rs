@@ -25,6 +25,9 @@ mod hierarchy;
 mod preview;
 mod regions;
 
+// Render-field revision changes tile caches without rewriting physical atlases.
+const SURFACE_REVISION: &str = "continuous-coast-2";
+
 #[derive(Parser)]
 #[command(
     name = "worldctl",
@@ -504,7 +507,7 @@ async fn manifest(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let w = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":128,"max_tile_level":18,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[6,10]}),
+        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":128,"max_tile_level":18,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
     ))
 }
 #[derive(Deserialize)]
@@ -542,9 +545,10 @@ static TILE_DISK_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn tile_disk_path(data: &FsPath, key: &str) -> PathBuf {
     let revision = format!(
-        "tile-cache-1/{}/{}/{key}",
+        "tile-cache-2/{}/{}/{}/{key}",
         world_core::GENERATOR_VERSION,
-        regions::VERSION
+        regions::VERSION,
+        SURFACE_REVISION
     );
     data.join("tile-cache").join(format!(
         "{}.bin",
@@ -657,24 +661,24 @@ async fn tile(
     if q.phase.is_some_and(|phase| !phase.is_finite()) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "phase invalide".into()));
     }
-    let generator = q.generator.as_deref().unwrap_or("spatial");
-    if !["spatial", "analytic", "contracts"].contains(&generator) {
+    let generator = q.generator.as_deref().unwrap_or("coherent");
+    if !["spatial", "analytic", "coherent", "contracts"].contains(&generator) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "générateur inconnu".into(),
         ));
     }
     let contracts = generator == "contracts";
-    let analytic = generator == "analytic";
+    let analytic = generator == "analytic" || generator == "coherent";
     let format = q.format;
     if contracts && matches!(format, TileFormat::Postcard) {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
-            "Postcard est disponible pour le générateur spatial uniquement".into(),
+            "Postcard n’est pas disponible pour les contrats".into(),
         ));
     }
     let key = format!(
-        "{id}/{face}/{level}/{x}/{y}/{}/{:?}/{generator}/{format:?}",
+        "{SURFACE_REVISION}/{id}/{face}/{level}/{x}/{y}/{}/{:?}/{generator}/{format:?}",
         q.segments, q.phase
     );
     app.tile_metrics.requests.fetch_add(1, Ordering::Relaxed);
@@ -1093,7 +1097,23 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{}", e.1))
         }
-        let (a, b, c) = tokio::join!(
+        // Keep the first request waiting for a worker until both peers have
+        // joined its flight; a fast cached-field computation must not make the
+        // coalescing assertion depend on scheduler timing.
+        let held_workers = app
+            .tile_workers
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let release_workers = async {
+            while app.tile_metrics.requests.load(Ordering::Relaxed) < 3 {
+                tokio::task::yield_now().await;
+            }
+            drop(held_workers);
+        };
+        let (_, a, b, c) = tokio::join!(
+            release_workers,
             request(&app, &world, 3),
             request(&app, &world, 3),
             request(&app, &world, 3)
@@ -1193,6 +1213,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(app.tile_workers.available_permits(), 1);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn coherent_tiles_keep_the_same_field_across_regional_thresholds() {
+        let world = Arc::new(
+            World::generate(WorldConfig {
+                resolution: 8,
+                erosion_steps: 0,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let data =
+            std::env::temp_dir().join(format!("world-coherent-field-{}", std::process::id()));
+        let app = App {
+            data: data.clone(),
+            world: Arc::new(RwLock::new(Some(world.clone()))),
+            jobs: Default::default(),
+            generation: Arc::new(Semaphore::new(1)),
+            counter: Default::default(),
+            tiles: Default::default(),
+            tile_workers: Arc::new(Semaphore::new(4)),
+            tile_flights: Default::default(),
+            tile_metrics: Default::default(),
+        };
+        for level in [0, 1, 5, 6, 9, 10] {
+            let key = TileKey {
+                face: 4,
+                level,
+                x: 0,
+                y: 0,
+            };
+            let response = tile(
+                State(app.clone()),
+                Path((world.id.clone(), 4, level, 0, 0)),
+                Query(TileQuery {
+                    segments: 8,
+                    phase: None,
+                    generator: Some("coherent".into()),
+                    format: TileFormat::Postcard,
+                }),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.1));
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let received = world_core::tile_wire::decode_tile(&bytes).unwrap();
+            let expected = world.tile(key, 8).unwrap();
+            assert_eq!(
+                &bytes[..],
+                world_core::tile_wire::encode_tile(&expected).unwrap()
+            );
+            assert_eq!(
+                received.vertices[0].height_m,
+                world.sample(received.vertices[0].direction).height_m
+            );
+        }
         std::fs::remove_dir_all(data).unwrap();
     }
 

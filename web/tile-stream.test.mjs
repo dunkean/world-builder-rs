@@ -62,3 +62,17 @@ test('worker completion queue is bounded even while the renderer is busy', () =>
   assert.equal(stream.ready.length, 6);
   assert.equal(messages.filter((m) => m.type === 'load').length, 6);
 });
+
+
+test('camera demand reprioritizes prepared arrivals before speculative neighbors', () => {
+  const { messages, installed, stream, context, requests, respond } = setup();
+  stream.update(requests.slice(0, 3), context);
+  respond(messages.find((m) => m.key === '3'));
+  respond(messages.find((m) => m.key === '1'));
+  stream.update([requests[1], requests[2], requests[0]], context);
+  respond(messages.find((m) => m.key === '2'));
+  stream.installNext();
+  stream.installNext();
+  stream.installNext();
+  assert.deepEqual(installed, [2, 3, 1]);
+});

@@ -25,6 +25,7 @@ export class TileStream {
     }
     this.context = context;
     this.desired = new Map(requests.map((tile) => [context.keyOf(tile), tile]));
+    this.priority = new Map([...this.desired.keys()].map((key, index) => [key, index]));
     for (const [id, job] of this.jobs) {
       if (job.epoch !== this.epoch || !this.desired.has(job.key)) {
         if (!job.cancelled) { this.worker.postMessage({ type: 'cancel', id }); job.cancelled = true; }
@@ -32,7 +33,12 @@ export class TileStream {
     }
     this.ready = this.ready.filter((tile) => tile.epoch === this.epoch && this.desired.has(tile.key));
     this.metrics.ready_bytes = this.ready.reduce((n, tile) => n + tile.packet.byteLength, 0);
+    this.prioritizeReady();
     this.dispatch();
+  }
+
+  prioritizeReady() {
+    this.ready.sort((a, b) => (this.priority?.get(a.key) ?? Infinity) - (this.priority?.get(b.key) ?? Infinity));
   }
 
   dispatch() {
@@ -58,6 +64,7 @@ export class TileStream {
       this.metrics.stale += 1;
     } else if (data.type === 'tile') {
       this.ready.push(data); this.metrics.ready_bytes += data.packet.byteLength;
+      this.prioritizeReady();
       Object.assign(this.metrics, data.metrics, { last_fetch_ms: data.fetch_ms, last_prepare_ms: data.prepare_ms });
     } else if (!data.aborted) {
       this.failures.set(job.key, Date.now() + 5000);

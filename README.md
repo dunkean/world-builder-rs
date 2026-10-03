@@ -22,7 +22,7 @@ L'interface expose graine, résolution d'atlas, rayon, fraction océanique, grav
 
 Faire glisser pour tourner, utiliser la molette pour descendre ou « Aller à… » pour rejoindre un relief sans glace, une côte, un lac, une rivière ou une vallée fluviale. Incliner la vue jusqu’à 35° pour observer les pentes. Les saisons actualisent climat et biomes simplifiés ; les débits restent annuels. Rivières, villes et routes peuvent être masquées. Le relief ×1 garde ses dimensions physiques.
 
-Relief et côtes combinent un atlas évolué par érosion et des bandes fractales adressées par position globale. Les lacs ont un niveau horizontal et un budget d'eau ; les chenaux suivent le drainage. Au zoom, les tuiles partagent des régions érodées et persistées aux niveaux 6 et 10. La région fine hérite du parent ; des bandes différentielles d'érosion s'ajoutent au relief analytique sans effacer ses fréquences plus fines. Leur moyenne locale est retirée pour éviter des cuvettes carrées aux frontières des régions. Le premier passage calcule les régions, les suivants les rechargent.
+Relief et côtes combinent un atlas évolué par érosion et des bandes fractales adressées par position globale. L’exploration utilise `generator=coherent` : le globe orbital et toutes les tuiles évaluent le même champ, sans activation d’une nouvelle région érodée au zoom. Le raffinement révèle des sommets intermédiaires ; il ne change pas les sommets communs. Le générateur régional `spatial` reste accessible par API pour les expériences ultérieures. Les lacs ont un niveau horizontal et un budget d’eau ; leur plan ne traverse plus une crête pour inonder une vallée indépendante.
 
 Le navigateur prépare les maillages dans un worker WASM, conserve les buffers GPU et répartit les transitions entre les images. Il réutilise les tuiles en mémoire et dans un cache persistant ; en vue rapprochée, seuls le champ de vision et une couronne de sécurité sont dessinés. Les déplacements ne relancent pas le morph des tuiles communes.
 
@@ -36,7 +36,7 @@ cargo run --release -p world-app -- preview --seed 123 --resolution 64
 cargo run --release -p world-app -- validate
 cargo run --release -p world-app -- serve --port 8001
 cargo test --workspace
-node --test web/tile-stream.test.mjs
+node --test web/*.test.mjs
 cargo run --release -p world-core --example benchmark -- 128 1337
 ./scripts/build-web.sh
 ```

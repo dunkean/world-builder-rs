@@ -18,6 +18,7 @@ struct VertexIn {
     @location(5) morph: vec4<f32>,
     @location(6) shading_normal: vec3<f32>,
     @location(7) parent_normal: vec3<f32>,
+    @location(8) water_depth: f32,
 };
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -30,14 +31,17 @@ struct VertexOut {
 };
 @vertex fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let progress = smoothstep(0.0, 0.35, scene.light.w - scene.options.y);
-    let relative = (v.position - scene.eye.xyz) + (v.position_low - scene.eye_low.xyz) + v.normal_height.xyz * v.morph.x * (1.0 - progress);
+    var start=v.morph.y;
+    if start<0.0 {let id=u32(-start);let record=scene.clips[id%32u].bounds;start=select(-1e9,record.y,record.x==f32(id));}
+    let progress=smoothstep(0.0,0.35,scene.light.w-start);
+    let offset=mix(v.morph.x,v.morph.w,progress);
+    let relative=(v.position-scene.eye.xyz)+(v.position_low-scene.eye_low.xyz)+v.normal_height.xyz*offset;
     out.clip = scene.view_projection * vec4<f32>(relative, 1.0);
     out.position = relative;
     out.normal_height = v.normal_height;
     out.color = v.color;
     out.fields = v.fields;
-    out.fields.w = mix(v.morph.z, v.fields.w, progress);
+    out.fields.w=mix(v.morph.z,v.water_depth,progress);
     out.flags = u32(v.color.a + 0.5);
     out.shading_normal = normalize(mix(v.parent_normal, v.shading_normal, progress));
     return out;
@@ -72,6 +76,7 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
         else { face = 5u; uv = vec2<f32>(-p.x, p.y) / -p.z; }
     }
     if water && v.fields.w <= 0.01 { discard; }
+    if water && v.fields.z < -1.5 && scene.options.z < 0.5 { discard; }
     var color = v.color.rgb;
     if scene.options.x < 0.5 && lod > 0.0 && scene.options.z > 0.5 {
         color = mix(color, vec3(0.05, 0.34, 0.44), smoothstep(0.6, 0.9, v.fields.z));

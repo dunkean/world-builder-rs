@@ -194,6 +194,23 @@ pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
 }
 
 pub(crate) fn depressions(cells: &[Cell], n: u32, order: &[usize]) -> Vec<Depression> {
+    depression_groups(cells, n, order, 1.0, 0.05)
+}
+
+fn physical_depressions(cells: &[Cell], n: u32, order: &[usize]) -> Vec<Depression> {
+    // The metre threshold selects meaningful reservoirs; it is not a dam
+    // around each deep pixel. Include their hydraulically connected shallow
+    // fringes so storage, losses and shoreline ownership use the same basin.
+    depression_groups(cells, n, order, 0.001, 0.0001)
+}
+
+fn depression_groups(
+    cells: &[Cell],
+    n: u32,
+    order: &[usize],
+    fringe_depth_m: f32,
+    level_tolerance_m: f32,
+) -> Vec<Depression> {
     let mut labels = vec![false; cells.len()];
     let mut rank = vec![0; cells.len()];
     for (k, &i) in order.iter().enumerate() {
@@ -216,8 +233,8 @@ pub(crate) fn depressions(cells: &[Cell], n: u32, order: &[usize]) -> Vec<Depres
             for j in neighbours8(i, n) {
                 if !labels[j]
                     && !cells[j].ocean
-                    && cells[j].routing_height_m - cells[j].height_m >= 1.0
-                    && (cells[j].routing_height_m - level).abs() < 0.05
+                    && cells[j].routing_height_m - cells[j].height_m >= fringe_depth_m
+                    && (cells[j].routing_height_m - level).abs() < level_tolerance_m
                 {
                     labels[j] = true;
                     queue.push_back(j);
@@ -363,7 +380,7 @@ fn reservoir(group: &Depression, cells: &[Cell], input: f64, seconds: f64) -> La
 
 pub(crate) fn physical_water(cells: &mut [Cell], config: &WorldConfig) -> (Vec<Lake>, f64, f64) {
     let order = route_potential(cells, config.resolution);
-    let groups = depressions(cells, config.resolution, &order);
+    let groups = physical_depressions(cells, config.resolution, &order);
     let mut labels = vec![usize::MAX; cells.len()];
     for (g, group) in groups.iter().enumerate() {
         for &i in &group.cells {
@@ -453,6 +470,76 @@ pub(crate) fn physical_water(cells: &mut [Cell], config: &WorldConfig) -> (Vec<L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_basin_includes_connected_submetre_fringe_without_changing_erosion_groups() {
+        let world = crate::World::generate(WorldConfig {
+            resolution: 8,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut cells = world.cells;
+        for c in &mut cells {
+            c.height_m = 160.0;
+            c.water_m = 160.0;
+            c.ocean = false;
+            c.lake = false;
+            c.lake_id = None;
+            c.receiver = None;
+            c.temperature_c = 20.0;
+            c.moisture = 1.0;
+        }
+        let deep = cell_index(4, 3, 3, 8);
+        let fringe = cell_index(4, 4, 3, 8);
+        let spill = cell_index(4, 5, 3, 8);
+        let outlet = cell_index(4, 6, 3, 8);
+        cells[deep].height_m = 60.0;
+        cells[fringe].height_m = 99.7;
+        cells[spill].height_m = 100.0;
+        cells[outlet].height_m = -10.0;
+        let heights: Vec<_> = cells.iter().map(|c| c.height_m.to_bits()).collect();
+        let order = route_potential(&mut cells, 8);
+        let morphology = depressions(&cells, 8, &order);
+        assert_eq!(morphology.len(), 1);
+        assert_eq!(morphology[0].cells, vec![deep]);
+        let basins = physical_depressions(&cells, 8, &order);
+        assert_eq!(basins.len(), 1);
+        assert!(basins[0].cells.contains(&deep));
+        assert!(basins[0].cells.contains(&fringe));
+        assert!(!basins[0].cells.contains(&spill));
+        assert_eq!(basins[0].level, 100.0);
+        assert_eq!(
+            heights,
+            cells
+                .iter()
+                .map(|c| c.height_m.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let config = WorldConfig {
+            resolution: 8,
+            lake_fill_years: 100_000.0,
+            ..Default::default()
+        };
+        let (lakes, runoff, exported) = physical_water(&mut cells, &config);
+        assert_eq!(lakes.len(), 1);
+        let lake = &lakes[0];
+        assert!(lake.cells.contains(&fringe));
+        assert!(cells[fringe].lake);
+        assert_eq!(cells[fringe].water_m, lake.level_m);
+        let loss = lake.evaporation_m3_s + lake.infiltration_m3_s + lake.storage_change_m3_s;
+        assert!((runoff - exported - loss).abs() / runoff < 1e-10);
+        assert_eq!(topological(&cells).len(), cells.len());
+        assert_eq!(
+            heights,
+            cells
+                .iter()
+                .map(|c| c.height_m.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn lake_level_comes_from_water_volume_and_losses_not_spill_potential() {
         let world = crate::World::generate(WorldConfig {

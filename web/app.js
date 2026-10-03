@@ -1,5 +1,7 @@
 import init, * as viewer from '/pkg/world_viewer.js';
 import { TileStream } from './tile-stream.js';
+import { CameraPredictor } from './camera-predictor.js';
+const predictor = new CameraPredictor();
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('planet');
@@ -48,8 +50,10 @@ function addMetric(label, value) {
 
 function loadWorld(world) {
   viewer.set_world(JSON.stringify(world));
+  viewer.set_overlays($('show-rivers').checked, $('show-human').checked);
   activeWorld = world;
   destinations.clear();
+  predictor.reset();
   $('destination').replaceChildren(new Option('Choisir un lieu', ''));
   let peak;
   let river;
@@ -203,17 +207,32 @@ function updateDetail() {
   const phase = seasonPhase;
   const conservative = $('conservative-refinement').checked;
   const keyOf = (tile) => `${worldId}/${tile.face}/${tile.level}/${tile.x}/${tile.y}`;
-  const priority = (tile) => tile.level === info.level ? 0 : tile.level < info.level ? 1 : 2;
+  // The viewer orders essential ancestors and visible refinement before
+  // future detail. Preserve that order: a finest tile is useless without its
+  // resident ancestry. Prediction never modifies the camera/render cut.
+  const essential = info.requests ?? [info];
   const memoryPressure = info.cpu_bytes >= (info.cpu_budget_bytes ?? Infinity) * 0.8;
-  const requests = info.level < 2 ? [] : [...(info.requests ?? [info])]
-    .filter((tile) => !memoryPressure || tile.level === info.level || loadedTiles.has(keyOf(tile)))
-    .sort((a, b) => priority(a) - priority(b));
+  // Coarsening can require an evicted parent above the new target level.
+  // Keep every cut-maintenance request even under memory pressure.
+  const requests = [...essential];
+  renderMetrics.forecast_requests = 0;
+  const forecast = predictor.sample(info, performance.now(), activeWorld.config.radius_m);
+  if (forecast && !memoryPressure && typeof viewer.prediction_requests === 'function') {
+    const future = JSON.parse(viewer.prediction_requests(JSON.stringify(forecast.direction), forecast.altitude_m));
+    const seen = new Set(requests.map(keyOf));
+    let added = 0;
+    for (const tile of future) {
+      const key = keyOf(tile);
+      if (!seen.has(key) && !loadedTiles.has(key)) { requests.push(tile); seen.add(key); if (++added >= 64) break; }
+    }
+    renderMetrics.forecast_requests = added;
+  }
   tileStream.update(requests, {
     epoch: renderEpoch, keyOf, radius: activeWorld.config.radius_m,
     exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
-    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=128&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : ''}`, location.origin).href,
+    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=128&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'continuous-coast-2'}`, location.origin).href,
   });
-  if (info.level >= 2) {
+  if (info.level >= 0) {
     $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;
   }
 }
@@ -235,6 +254,7 @@ $('randomize').addEventListener('click', () => { $('seed').value = crypto.getRan
 $('ocean-fraction').addEventListener('input', () => { $('ocean-value').value = `${$('ocean-fraction').value} %`; });
 $('reset').addEventListener('click', () => {
   viewer.reset_view();
+  predictor.reset();
   $('view-tilt').value = '0';
   $('view-tilt-value').value = '0°';
 });
@@ -242,6 +262,7 @@ $('fly').addEventListener('click', () => {
   const direction = destinations.get($('destination').value);
   if (!direction) return;
   viewer.fly_to(JSON.stringify(direction), 30000);
+  predictor.reset();
   $('status').textContent = 'Arrivée à 30 km au-dessus du lieu · molette pour descendre';
 });
 $('layer').addEventListener('change', () => viewer.set_mode(Number($('layer').value)));
@@ -289,7 +310,7 @@ try {
   $('runtime-dot').classList.add('ready');
   $('generate').disabled = false;
   requestAnimationFrame(frame);
-  setInterval(updateDetail, 100);
+  setInterval(updateDetail, 50);
   try { loadWorld(await api('/api/world/latest/preview?resolution=128')); } catch { await generate(); }
 } catch (error) {
   $('backend').textContent = 'Moteur indisponible';
