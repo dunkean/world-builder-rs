@@ -181,3 +181,81 @@ doivent conserver les mêmes coordonnées. Cela ajoute un vrai réseau local
 sans déplacer une crique ou un affluent chaque fois que l'utilisateur zoome.
 Il ne faut pas présenter le prototype actuel comme équivalent à cette
 simulation locale tant que cette étape et ses raccords n'ont pas été mesurés.
+
+## Complément : petits lacs canoniques (prototype 0.9)
+
+Le prototype reconstruit maintenant des bassins de 50 m à 3 km dans des provinces froides, humides et peu inclinées. Leur présence, leur contour et leur plan d'eau sont fixés dans le monde ; une maille plus fine résout des objets déjà présents. Les rivières et les réservoirs de l'atlas gardent leurs contraintes hydrauliques.
+
+### Référence terrain à 10 × 10 km
+
+La référence examinée est le TypeScript actif de `city_generator/web/src/gen/terrain/`, dans `/mnt/d/Workspace/Self/RPG/city_generator`. Les sources Python historiques n'interviennent pas dans cette comparaison.
+
+| Source active | Apport utile au prototype sphérique | Limite du transfert |
+| --- | --- | --- |
+| `heightfield.ts` | Longueurs d'onde et hauteurs exprimées en mètres ; relief sublinéaire avec l'étendue ; sols doux autour des vallées | Le relief est normalisé pour une carte locale et utilise un côté aval choisi pour cette carte. Refaire cette normalisation au zoom changerait le monde. |
+| `erosion.ts` | Incision stream-power implicite, drainage avant incision, relaxation des talus et diffusion ; variation d'altitude remontée depuis un solveur grossier | À 10 km, le domaine de simulation avec marge vaut 14,4 km et sa grille de 224 cellules donne environ 64,3 m. Ces bords locaux ne constituent pas les exutoires d'une planète. |
+| `hydrology.ts` | Connexion marine par flood-fill, graphe de drainage acyclique, accumulation, géométrie de chenal et meanders selon la pente | Des apports ou chemins peuvent être forcés depuis le bord local. Le prototype doit garder le débit et les récepteurs du graphe global. |
+| `rivernet.ts` | Largeur liée à l'aire contribuante, confluences orientées vers l'aval, raccords des canaux | Les aires virtuelles et les apports hors carte sont adaptés à une carte de jeu, pas à un bilan hydrologique planétaire. |
+
+La reconstruction conserve les longueurs en mètres et les contraintes globales. Les champs géographiques sont évalués à une position fixe ; la caméra ne définit ni domaine de relief, ni graine, ni seuil d'apparition. Les provinces de bouclier atténuent le bruit fin au cœur du domaine sans effacer le relief de l'atlas. Leurs nouveaux petits bassins sont une hypothèse de reconstruction glaciaire, pas le résultat d'un solveur de glacier ou d'un nouveau bilan de l'eau.
+
+### Objets lacustres et domaines
+
+`local_water.rs` propose des centres irréguliers dans une fine coquille d'adresses spatiales 3D. Les buckets servent uniquement à retrouver les objets : aucune bordure de bucket n'entre dans les hauteurs ou les niveaux d'eau. Les formes réunissent quatre ou cinq lobes le long d'un axe courbe, parfois une branche latérale, puis un déplacement et une irrégularité continus du contour. Les tailles varient de 50 m à 3 km ; la profondeur nominale est bornée à 0,65–8 m. Les champs ne dessinent pas des disques réguliers ou un anneau de relief ajouté autour de chaque lac.
+
+Chaque objet décide sa présence dans un lobe central réel, à partir de la province, de l'humidité annuelle, de la température annuelle, d'une pente de l'atlas et des contraintes de l'eau existante. Chaque lobe, y compris le bras latéral, fournit son centre et quatre rayons sondés sur le contour de rive et le contour extérieur du raccord. Ces sondes excluent les versants incompatibles avec la profondeur du bassin ; l'écart de hauteur autorisé entre les sondes vaut `0,5 + 0,02 × length_m` mètres. Le plan horizontal est fixé sous les altitudes du centre, de la rive basse et du raccord extérieur. Le relief intérieur et la frange sèche sont raccordés continûment au terrain naturel ; une frange humide alimente le mélange de biome marécageux. Entre deux plans différents, un partage sec continu évite une transition d'eau mouillée à un autre niveau. Une dépression sèche extérieure située sous ce plan conserve son propre drainage ; elle ne reçoit pas le datum du bassin voisin.
+
+`roughness` est une pente en mètres par mètre ; les altitudes, dimensions et profondeurs sont en mètres. Les identifiants des petits lacs occupent `[1 << 40, 1 << 41)`, distincts de l'océan, des réservoirs physiques et du marqueur des rivières `1 << 52`. Le niveau associé à un identifiant ne dépend pas de la maille de rendu. Le sampler garde la priorité des grands réservoirs et de la mer ; le relief de ces domaines ne doit pas être repris par un petit bassin.
+
+Le cache retient au plus 1 024 voisinages de 4 096 m et 65 536 propositions appartenant à la coquille sphérique. Un point dont le voisinage est prêt prend un seul verrou ; la construction d'un voisinage fait aussi des accès au cache des propositions. Les slots `Arc<OnceLock<…>>` partagent une validation froide entre appels concurrents, et les rejets sont mémorisés comme les objets retenus. Les callbacks de terrain sont exécutés hors du mutex. Plusieurs voisinages réutilisent le même descripteur `Arc<Basin>` et ne répètent donc pas toutes ses sondes de rive. Les deux caches utilisent une éviction FIFO bornée ; un descripteur partagé reste valide pendant les appels qui le détiennent. L'éviction entraîne un recalcul déterministe. Un clone de `World` partage ces caches tant que `invalidate_geometry()` n'est pas appelé ; un clone direct de `LocalWaterAtlas` part vide.
+
+Les objets sont adressés dans les coordonnées de l'atlas `q`, puis transportés par la même côte fixe que les autres reliefs. Le callback retrouve le terrain géographique naturel sans microbassins ni creusement de rivière. Le halo couvre les supports des candidats et leur projection sphérique ; la garde de compilation rejette aussi en release tout support atteignant 2 300 m. Les objets sont triés par identifiant avant les mélanges, et chaque contribution de terrain est pondérée par son support continu, propriétaire compris. Les points communs à des buckets différents conservent ainsi le même ordre arithmétique. Le halo provincial de 2 500 m permet à un objet de dépasser la limite de sa province ; cette limite ne coupe pas un objet déjà accepté. Le sampler garde la priorité des plans physiques et utilise un index global des réservoirs et contrôles de déversement, avec une exclusion conservatrice à 2 301 m. Les provinces sont préselectionnées sur une pente d'atlas inférieure à 0,025 et à plus de 8 km des contraintes lacustres ; leur cœur conserve 4 % du détail fin, sans effacer le relief de l'atlas.
+
+### Mesures du 3 octobre 2026
+
+Mesure principale après revue et corrections, sur l'atlas 512 sauvegardé :
+
+```sh
+cargo test -p world-core local_water --lib -- --nocapture
+cargo run --release -p world-core --example local_water_probe -- data/worlds/d8d1261ca22a1815f74f/atlas.json /tmp/wb-local-water-512-province-final
+```
+
+Ce fichier conserve la graine `2386084681`, un atlas `512² × 6`, 8 étapes d'érosion, 350 000 ans géologiques, un rayon de 1 737 km, un détail de 140 m et une densité lacustre de 0,55. La reconstruction locale courante est appliquée au sampling ; le chargement du JSON ne régénère pas l'atlas. Les 32 provinces sont explorées avec 81 points espacés de 1 250 m chacune. La fenêtre retenue est centrée sur la province 27, à la direction `[-0.5590794587440743, -0.774891421916368, -0.29491260239410366]`.
+
+| Grille sur 10 km | Espacement | Identifiants avec un point mouillé | Part des points occupée par l'eau | Profondeur maximale | Points partagés modifiés | Temps de sampling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 intervalles | 78,125 m | 38 | 5,6787 % | 5,591 m | 0 | 86,315 ms |
+| 256 intervalles | 39,0625 m | 42 | 5,6867 % | 5,598 m | 0 | 326,930 ms |
+| 512 intervalles | 19,53125 m | 42 | 5,6922 % | 5,603 m | 0 | 1 309,836 ms |
+
+Les 82 690 comparaisons de points communs entre deux grilles conservent bit pour bit sol, eau, identifiant et statut lacustre. Tous les points mouillés d'un même identifiant partagent le même plan horizontal. La grille fine comporte aussi 4 588 points classés marécage, soit environ 1,74 %. Les proportions sont des comptages de points dans cette fenêtre choisie, pas une statistique de la planète ni un bilan d'eau. Les quatre identifiants supplémentaires entre les grilles grossière et fine étaient sous-résolus, sans activation liée au zoom.
+
+Les coûts sont séparés : lecture du JSON **2 249,191 ms** ; première compilation complète du catalogue de rivières déclenchée par `world.river_reach(0)` **3 650,228 ms** ; exploration des 2 592 points provinciaux **1 790,711 ms**. Une première exécution de la même compilation froide mesurait 3 925,924 ms. Ce coût hydraulique comprend les caches géographiques et lacustres que la compilation consulte, et n'est pas un chronométrage isolé de `local_water`. Les temps des grilles mesurent seulement les appels à `world.sample`, après cette préparation ; l'écriture des CSV en est exclue.
+
+Le premier probe plaçait sa fenêtre sur le dernier point mouillé du survey, environ 5 km à côté de ce centre provincial : cette fenêtre contient 21 identifiants et 3,0737 % d'eau à 19,53 m, avec la même cohérence des points partagés. L'exemple a été corrigé pour centrer la fenêtre sur la province sélectionnée. Un contrôle dans la fenêtre antérieure exacte `[-0.10790962020745694, -0.9008999688800017, -0.42039833484291345]` donne 8 identifiants, 1,1084 % d'eau et 4,782 m de profondeur à 19,53 m, toujours sans modification des points partagés. Les CSV et rapports complets sont dans `/tmp/wb-local-water-512-province-final*`, `/tmp/wb-local-water-512-final*` et `/tmp/wb-local-water-512-old-final*`.
+
+La carte numérique des trois résolutions est dans `/tmp/wb-local-water-512-center-final.png`. La coupe du bassin `1874456003376`, au point local `x = -1 972,65625 m`, `y = 3 007,8125 m`, montre un fond à 267,076 m sous le plan horizontal à 272,679 m. Elle est conservée dans `/tmp/wb-local-water-512-center-final-profile.png`. Ces figures sont dérivées des CSV et n'évaluent pas le renderer.
+
+### Mesure 128 antérieure à la revue, conservée comme comparaison
+
+Le tableau suivant décrit le premier essai, avant les sondes par lobe et par raccord extérieur, la protection globale des plans physiques et le cache par proposition. Il ne décrit pas le champ final et n'est pas directement comparable à l'atlas 512, dont le nombre d'étapes d'érosion diffère. Le programme peut encore générer un monde 128 avec `cargo run --release -p world-core --example local_water_probe -- 128 /tmp/wb-local-water-real`, mais la reconstruction actuelle ne reproduira pas ces résultats historiques.
+
+L'exemple génère la graine `2386084681`, un atlas `128² × 6`, 25 étapes d'érosion et les autres valeurs par défaut de cette révision : rayon 1 737 km, temps géologique 350 000 ans, détail 140 m, densité lacustre 0,55. Il mesure les huit premières provinces par 81 points espacés de 1 250 m et examine une fenêtre de 10 km dans la plus riche de ces huit zones. Ce choix ne modifie aucun objet du monde. La compilation de l'atlas prend 2 446,925 ms sur cette machine. La première exploration des huit provinces prend 3 813,564 ms pour 648 points ; ce coût initial comprend les caches géographiques et hydrauliques froids et ne représente pas un coût isolé du module lacustre.
+
+Le monde mesuré a l'identifiant `f4b66658bad7e5c3ac1d`. La fenêtre choisie se situe dans la province numéro 7, autour de la direction `[-0.4851244680608404, 0.8332524680089498, 0.26522551733511784]`.
+
+| Grille sur 10 km | Espacement | Lacs avec un point mouillé résolu | Part des points occupée par l'eau | Profondeur maximale | Points partagés modifiés | Temps de sampling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 intervalles | 78,125 m | 27 | 4,7173 % | 4,686 m | 0 | 188,421 ms |
+| 256 intervalles | 39,0625 m | 33 | 4,7404 % | 4,695 m | 0 | 383,804 ms |
+| 512 intervalles | 19,53125 m | 34 | 4,7418 % | 4,715 m | 0 | 1 580,865 ms |
+
+La comparaison porte sur la hauteur du sol, la hauteur de l'eau, l'identifiant et le statut lacustre, exactement aux points communs. Chaque lac mouillé conserve un niveau identique bit pour bit. Les sept identifiants supplémentaires entre 78 m et 19,5 m sont des objets sous-résolus par la première grille ; cela ne prouve pas la conservation de la topologie des triangles entre les points. Sur la grille fine, 3 886 points secs sont classés comme marécage, soit environ 1,48 % des points de la fenêtre. Les CSV et le JSON complet sont produits dans `/tmp/wb-local-water-real*`.
+
+Le bassin le plus profond a l'identifiant `1350471602600`. Au point local `x = 4 140,625 m`, `y = 1 113,28125 m`, son fond est à 414,130 m et son eau à 418,845 m. La coupe garde un plan horizontal au-dessus d'un fond irrégulier ; la profondeur maximale mesurée est de 4,715 m. Des figures Matplotlib dérivées des CSV ont été inspectées dans `/tmp/wb-local-water-real.png` et `/tmp/wb-local-water-real-profile.png` ; ce sont des figures du champ numérique, pas des captures du renderer.
+
+### Régressions du module final
+
+Les huit régressions du module passent. Sur une province synthétique plate et humide à densité 1, 1 135 points sur 6 561 sont mouillés, avec 75 identifiants résolus à 125 m. Après vidage des deux caches et parcours inverse, identifiants, plans et altitudes restent identiques. Sur un sol doux avec pente et bruit continus, 104 changements de propriétaire entre plans différents sont bisectés à moins de 4 µm : aucune paire ne reste mouillée des deux côtés et le saut de terrain maximal vaut `0,000000446 m`. Aux 203 entrées ou sorties d'un support voisin, la même bissection mesure un saut maximal de `0,000000226 m`. Des paires à 2 mm sur une véritable frontière de cache restent sous 1 cm de différence. Les provinces sèches, chaudes, raides ou protégées n'ajoutent aucun objet. Sur 512 points d'intégration répartis entre une mer et un grand lac synthétiques, activer le module conserve exactement lit, plan, identifiant et statut. Deux régressions concurrentes vérifient qu'un quartier froid et deux quartiers différents qui se chevauchent exécutent le même nombre de callbacks qu'un parcours série ; les propositions retenues et rejetées sont réemployées après vidage du seul cache de quartiers.
+
+Ces contrôles portent sur le champ déterministe et des cas précis. Les microbassins restent une reconstruction sans bilan local vérifié de précipitation, d'évaporation, de stockage ou de sédiment. Le rendu WebGPU, les interactions de chaque domaine lacustre sinueux et l'érosion glaciaire réelle doivent être évalués séparément.

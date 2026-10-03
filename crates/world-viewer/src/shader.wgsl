@@ -5,6 +5,7 @@ struct Uniforms {
     eye_low: vec4<f32>,
     light: vec4<f32>,
     options: vec4<f32>,
+    cartography: vec4<u32>,
     clips: array<TileClip, 32>,
 };
 @group(0) @binding(0) var<uniform> scene: Uniforms;
@@ -51,7 +52,78 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     return mix(low, high, clamp(x, 0.0, 1.0));
 }
 
+fn cell_ink(cell: vec3<i32>, seed: u32) -> f32 {
+    let lattice = bitcast<vec3<u32>>(cell);
+    var h = (lattice.x * 0x8da6b343u) ^ (lattice.y * 0xd8163841u) ^ (lattice.z * 0xcb1ab31fu) ^ seed;
+    h = (h ^ (h >> 16u)) * 0x7feb352du;
+    h = (h ^ (h >> 15u)) * 0x846ca68bu;
+    h = h ^ (h >> 16u);
+    return f32(h & 0x00ffffffu) / 8388607.5 - 1.0;
+}
+
+// A three-dimensional field on the sphere, not UVs on individual cube faces.
+// Quintic interpolation keeps cell boundaries smooth without a texture lookup.
+fn map_noise(q: vec3<f32>, seed: u32) -> f32 {
+    let base = vec3<i32>(floor(q));
+    let f = fract(q);
+    let t = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let low = mix(
+        mix(cell_ink(base, seed), cell_ink(base + vec3<i32>(1, 0, 0), seed), t.x),
+        mix(cell_ink(base + vec3<i32>(0, 1, 0), seed), cell_ink(base + vec3<i32>(1, 1, 0), seed), t.x), t.y);
+    let high = mix(
+        mix(cell_ink(base + vec3<i32>(0, 0, 1), seed), cell_ink(base + vec3<i32>(1, 0, 1), seed), t.x),
+        mix(cell_ink(base + vec3<i32>(0, 1, 1), seed), cell_ink(base + vec3<i32>(1, 1, 1), seed), t.x), t.y);
+    return mix(low, high, t.z);
+}
+
+fn map_grain(p: vec3<f32>, footprint_m: f32) -> f32 {
+    // Rotate the lattice away from the cube axes. Neither the camera nor the
+    // relief exaggeration chooses coordinates, a seed, or an octave phase.
+    let q = vec3<f32>(dot(p, vec3(0.36, 0.48, 0.8)),
+                      dot(p, vec3(-0.8, 0.6, 0.0)),
+                      dot(p, vec3(-0.48, -0.64, 0.6))) * scene.options.y;
+    let seed = scene.cartography.x ^ (scene.cartography.y * 0x9e3779b9u);
+    var grain = 0.0;
+    // Only the rendering is filtered. The underlying fields are fixed; skip
+    // frequencies below two pixels to avoid moiré and unnecessary hash work.
+    if footprint_m < 4000.0 {
+        grain += map_noise(q / 8000.0, seed ^ 0x713ab51du)
+            * 0.55 * (1.0 - smoothstep(1000.0, 4000.0, footprint_m));
+    }
+    if footprint_m < 200.0 {
+        grain += map_noise(q / 400.0, seed ^ 0x318f402bu)
+            * 0.30 * (1.0 - smoothstep(50.0, 200.0, footprint_m));
+    }
+    if footprint_m < 10.0 {
+        grain += map_noise(q / 20.0, seed ^ 0x91d203f7u)
+            * 0.15 * (1.0 - smoothstep(2.5, 10.0, footprint_m));
+    }
+    return grain;
+}
+
+fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
+    let d = max(0.0, depth);
+    if marine {
+        // Bathymetry, including a shallow shelf, reads as a continuous map.
+        let lagoon = vec3(0.18, 0.47, 0.46);
+        let shelf = vec3(0.055, 0.27, 0.36);
+        let deep = vec3(0.015, 0.09, 0.17);
+        var ink = mix(lagoon, shelf, 1.0 - exp(-d / 35.0));
+        ink = mix(ink, deep, 1.0 - exp(-d / 900.0));
+        let shore = 1.0 - smoothstep(0.0, 1.6, d);
+        ink = mix(ink, vec3(0.53, 0.64, 0.56), shore * 0.12);
+        return ink * (1.0 + grain * 0.04);
+    }
+    let river = style < -1.5;
+    let shallow = select(vec3(0.09, 0.34, 0.31), vec3(0.055, 0.33, 0.40), river);
+    let deep = select(vec3(0.035, 0.17, 0.23), vec3(0.030, 0.21, 0.32), river);
+    return mix(shallow, deep, 1.0 - exp(-d / select(6.0, 2.5, river))) * (1.0 + grain * 0.025);
+}
+
 @fragment fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
+    let radial = normalize(v.normal_height.xyz);
+    // Derivatives precede every divergent branch/discard, also on WebGL2.
+    let footprint_m = scene.options.y * max(length(dpdx(radial)), length(dpdy(radial)));
     if v.flags >= 99u {
         if v.flags < 101u && scene.options.z < 0.5 { discard; }
         if v.flags < 101u && scene.eye.w < 10000.0 { discard; }
@@ -80,7 +152,23 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     if water && v.fields.z < -1.5 && scene.options.z < 0.5 { discard; }
     var color = v.color.rgb;
     let mode = u32(scene.options.x);
-    if mode == 1u {
+    if mode == 0u {
+        let grain = map_grain(radial, footprint_m);
+        if water {
+            // Existing hydraulic/LOD markers stay unchanged. Marine ink is
+            // unambiguously bluer than freshwater ink, including legacy tiles.
+            let marine = (v.fields.z > -1.5 && v.fields.z < -0.5)
+                || (v.fields.z >= -1.5 && v.color.b > v.color.g * 1.3);
+            color = water_ink(v.fields.w, v.fields.z, marine, grain);
+        } else {
+            // The CPU supplies the actual biome fractions. Grain modulates
+            // their ink rather than reclassifying land or painting fake water.
+            color *= 1.0 + grain * 0.11;
+            let slope = 1.0 - max(0.0, dot(normalize(v.shading_normal), radial));
+            let rock = smoothstep(0.10, 0.42, slope);
+            color = mix(color, vec3(0.40, 0.35, 0.28) * (1.0 + grain * 0.045), rock * 0.38);
+        }
+    } else if mode == 1u {
         color = ramp((v.normal_height.w + 2.0) / 8.0, vec3(0.08, 0.20, 0.34), vec3(0.96, 0.91, 0.75));
     } else if mode == 2u {
         color = ramp(v.fields.x / 65.0 + 0.4, vec3(0.09, 0.36, 0.78), vec3(0.95, 0.21, 0.07));
@@ -89,23 +177,22 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     } else if mode == 4u {
         color = mix(vec3(0.22, 0.25, 0.27), vec3(0.10, 0.77, 0.97), clamp(v.fields.z, 0.0, 1.0));
     }
-    let radial = normalize(v.normal_height.xyz);
     let normal = normalize(v.shading_normal);
     let diffuse = max(0.0, dot(normal, normalize(scene.light.xyz)));
-    let ambient = 0.33;
-    let light = ambient + 0.72 * diffuse;
+    // Restrained hillshade keeps the map legible on steep and unlit slopes.
+    let light = select(0.58 + 0.44 * diffuse, 0.82 + 0.18 * diffuse, water);
     var result = color * light;
     if !water {
         // Contrast the real surface slope relative to the local planetary normal.
         let slope_light = diffuse - max(0.0, dot(radial, normalize(scene.light.xyz)));
-        result *= clamp(1.0 + 2.5 * slope_light, 0.65, 1.25);
+        result *= clamp(1.0 + 0.85 * slope_light, 0.82, 1.16);
     }
     if water {
         let eye_dir = normalize(-v.position);
         let reflection = reflect(-normalize(scene.light.xyz), radial);
-        result += vec3(0.55, 0.75, 0.85) * pow(max(0.0, dot(reflection, eye_dir)), 65.0) * 0.55;
+        result += vec3(0.35, 0.48, 0.49) * pow(max(0.0, dot(reflection, eye_dir)), 55.0) * 0.10;
     }
     let limb = pow(1.0 - max(0.0, dot(radial, normalize(-v.position))), 5.0);
-    result = mix(result, vec3(0.29, 0.52, 0.70), limb * 0.23);
+    result = mix(result, vec3(0.29, 0.43, 0.51), limb * 0.10);
     return vec4(result, 1.0);
 }

@@ -144,3 +144,29 @@ test('camera cancellation releases dispatch slots before the worker acknowledges
   assert.equal(stream.jobs.size, 3);
   assert.equal(messages.filter((m) => m.type === 'load').length, 6);
 });
+
+test('future detail leaves a slot for new visible demand without cancelling useful jobs', () => {
+  const { messages, stream, context, requests } = setup();
+  stream.update(requests.slice(0, 3), { ...context, critical: new Set() });
+  const original = messages.filter((m) => m.type === 'load');
+  assert.equal(original.length, 2);
+  // The centre changes before either speculative fetch completes.
+  const centre = requests[3];
+  stream.update([centre, ...requests.slice(0, 3)], { ...context, critical: new Set([centre.key]) });
+  assert.ok(messages.some((m) => m.type === 'load' && m.key === centre.key));
+  assert.equal(stream.jobs.size, 3);
+  assert.equal(messages.filter((m) => m.type === 'cancel').length, 0);
+  for (const job of original) assert.ok(stream.jobs.has(job.id));
+  assert.equal(messages.filter((m) => m.type === 'load' && m.key === '3').length, 0);
+});
+
+test('all three slots remain usable for visible demand and a partial quartet can finish', () => {
+  const { messages, stream, context, requests, respond } = setup();
+  const critical = new Set(requests.slice(0, 4).map((tile) => tile.key));
+  stream.update(requests, { ...context, critical });
+  assert.deepEqual(messages.filter((m) => m.type === 'load').map((m) => m.key), ['1', '2', '3']);
+  respond(messages.find((m) => m.type === 'load' && m.key === '1'));
+  assert.ok(messages.some((m) => m.type === 'load' && m.key === '4'));
+  assert.equal(stream.jobs.size, 3);
+  assert.equal(messages.filter((m) => m.type === 'load' && m.key === '5').length, 0);
+});

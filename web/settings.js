@@ -8,6 +8,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   detail_m: 140,
   coast_detail_ratio: 0.30,
   coast_reference_spacing_m: 0.25,
+  fjord_strength: 0.65,
+  archipelago_density: 0.6,
+  regional_lake_density: 0.55,
   lake_min_basin_depth_m: 8,
   axial_tilt_deg: 23.4,
   gravity_m_s2: 3,
@@ -25,12 +28,17 @@ export const PRESETS = Object.freeze({
   preview: { label: 'Essai rapide', description: 'Atlas 64 et 4 étapes : calcul court pour choisir une graine.', config: { resolution: 64, erosion_steps: 4, geological_years: 200000 } },
   mountains: { label: 'Relief marqué', description: 'Relief de 10 km, davantage de terres et 12 étapes sur 650 000 ans.', config: { relief_m: 10000, detail_m: 220, ocean_fraction: 0.45, erosion_steps: 12, geological_years: 650000, uplift_m_per_year: 0.0002 } },
   oceanic: { label: 'Monde océanique', description: '82 % d’océan visé, relief de 3,5 km et 6 étapes sur 250 000 ans.', config: { ocean_fraction: 0.82, relief_m: 3500, detail_m: 90, erosion_steps: 6, geological_years: 250000 } },
+  fjords: { label: 'Fjords', description: 'Fjords renforcés aux hautes latitudes, avec un relief de 8 km.', config: { fjord_strength: 1, archipelago_density: 0.45, relief_m: 8000, detail_m: 160 } },
+  archipelagos: { label: 'Archipels', description: 'Provinces d’îles côtières plus denses et 72 % d’océan visé.', config: { archipelago_density: 1, fjord_strength: 0.4, ocean_fraction: 0.72, relief_m: 4500, detail_m: 110, erosion_steps: 6, geological_years: 250000 } },
+  wetlands: { label: 'Lacs et marais', description: 'Provinces humides riches en petits lacs, avec un relief plus doux.', config: { regional_lake_density: 1, relief_m: 4500, detail_m: 90, erosion_steps: 6, geological_years: 200000 } },
 });
 
 const fields = [
   ['seed', 'seed', 1], ['resolution', 'resolution', 1], ['radius_m', 'radius', 1000],
   ['ocean_fraction', 'ocean-fraction', 0.01], ['relief_m', 'relief', 1], ['detail_m', 'detail', 1],
   ['coast_detail_ratio', 'coast-detail', 0.01], ['coast_reference_spacing_m', 'coast-spacing', 1],
+  ['fjord_strength', 'fjord-strength', 0.01], ['archipelago_density', 'archipelago-density', 0.01],
+  ['regional_lake_density', 'regional-lake-density', 0.01],
   ['lake_min_basin_depth_m', 'lake-depth', 1], ['axial_tilt_deg', 'tilt', 1],
   ['gravity_m_s2', 'gravity', 1], ['erosion_steps', 'erosion-steps', 1],
   ['geological_years', 'geological-years', 1000000], ['uplift_m_per_year', 'uplift', 0.001],
@@ -43,6 +51,9 @@ const constraints = [
   ['ocean_fraction', 'La fraction océanique', 0.05, 0.95],
   ['coast_detail_ratio', 'Le détail côtier', 0, 1],
   ['coast_reference_spacing_m', 'L’échelle des côtes (m)', 0.25, 10000],
+  ['fjord_strength', 'La force des fjords', 0, 1],
+  ['archipelago_density', 'La densité des archipels', 0, 1],
+  ['regional_lake_density', 'La densité des petits lacs', 0, 1],
   ['lake_min_basin_depth_m', 'La profondeur minimale des bassins (m)', 0, 500],
   ['axial_tilt_deg', 'L’inclinaison axiale (°)', 0, 90],
   ['gravity_m_s2', 'La gravité (m/s²)', 0.05, 100],
@@ -129,6 +140,9 @@ export function setupSettings(document, onError = () => {}) {
     $('water-volume').required = volume;
     $('ocean-value').value = `${format($('ocean-fraction').value)} %`;
     $('coast-detail-value').value = `${format($('coast-detail').value)} %`;
+    for (const id of ['fjord-strength', 'archipelago-density', 'regional-lake-density']) {
+      $(`${id}-value`).value = `${format($(id).value)} %`;
+    }
     $('config-cost').textContent = `${format(6 * Number($('resolution').value) ** 2, 0)} cellules d’atlas · le coût augmente avec la résolution`;
     $('relief').max = String(Number($('radius').value) * 1000 * 0.08);
     $('detail').max = $('relief').value;

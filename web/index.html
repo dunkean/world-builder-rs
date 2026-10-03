@@ -20,7 +20,7 @@
         <form id="generator">
           <div class="form-fields">
             <label for="preset">Point de départ</label>
-            <select id="preset"><option value="custom">Personnalisé</option><option value="balanced">Équilibré</option><option value="preview">Essai rapide</option><option value="mountains">Relief marqué</option><option value="oceanic">Monde océanique</option></select>
+            <select id="preset"><option value="custom">Personnalisé</option><option value="balanced">Équilibré</option><option value="preview">Essai rapide</option><option value="mountains">Relief marqué</option><option value="oceanic">Monde océanique</option><option value="fjords">Fjords</option><option value="archipelagos">Archipels</option><option value="wetlands">Lacs et marais</option></select>
             <p id="preset-description" class="hint">Les réglages prennent effet à la prochaine génération.</p>
             <label for="seed">Graine</label>
             <div class="seed-row"><input id="seed" name="seed" value="42" type="number" min="0" max="9007199254740991" step="1" required><button id="randomize" class="icon-button" type="button" aria-label="Tirer une nouvelle graine" title="Nouvelle graine">↻</button></div>
@@ -34,6 +34,8 @@
               <label class="slider-label" for="coast-detail">Détail côtier <output id="coast-detail-value">30 %</output></label><input id="coast-detail" type="range" min="0" max="100" step="0.1" value="30">
               <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="0.25" min="0.25" max="10000" step="any" required>
               <p class="hint">Le détail côtier règle la déformation des côtes. L’échelle minimale reste fixe, quel que soit le zoom.</p>
+              <label class="slider-label" for="fjord-strength">Fjords polaires <output id="fjord-strength-value">65 %</output></label><input id="fjord-strength" type="range" min="0" max="100" step="0.1" value="65">
+              <label class="slider-label" for="archipelago-density">Densité des archipels <output id="archipelago-density-value">60 %</output></label><input id="archipelago-density" type="range" min="0" max="100" step="0.1" value="60">
             </details>
             <details class="settings-section"><summary>Érosion et géologie</summary>
               <div class="field-pair"><div><label for="erosion-steps">Étapes de calcul</label><input id="erosion-steps" type="number" value="8" min="0" max="256" step="1" required></div><div><label for="geological-years">Durée <span>millions d’années</span></label><input id="geological-years" type="number" value="0.35" min="0.000001" max="100" step="any" required></div></div>
@@ -47,7 +49,8 @@
               <div id="ocean-control"><label class="slider-label" for="ocean-fraction">Surface océanique <output id="ocean-value">58 %</output></label><input id="ocean-fraction" type="range" min="5" max="95" step="0.1" value="58"></div>
               <div id="volume-control" hidden><label for="water-volume">Volume d’eau <span>km³</span></label><input id="water-volume" type="number" value="1000000" min="0" step="any" disabled></div>
               <div class="field-pair"><div><label for="lake-depth">Profondeur minimale des bassins <span>m</span></label><input id="lake-depth" type="number" value="8" min="0" max="500" step="any" required></div><div><label for="lake-fill">Durée de remplissage <span>ans</span></label><input id="lake-fill" type="number" value="25" min="0.01" max="10000" step="any" required></div></div>
-              <p class="hint">Les petits bassins sont drainés pendant le calcul du terrain. Leur profondeur minimale ne masque pas l’eau après génération.</p>
+              <label class="slider-label" for="regional-lake-density">Petits lacs et marais <output id="regional-lake-density-value">55 %</output></label><input id="regional-lake-density" type="range" min="0" max="100" step="0.1" value="55">
+              <p class="hint">Le seuil de profondeur concerne les bassins de l’atlas. Les petits lacs sont répartis dans les provinces humides.</p>
             </details>
             <details class="settings-section"><summary>Climat</summary>
               <label for="tilt">Inclinaison axiale <span>°</span></label><input id="tilt" type="number" value="23.4" min="0" max="90" step="any" required>
@@ -71,8 +74,9 @@
           <label class="slider-label" for="view-tilt">Inclinaison de la vue <output id="view-tilt-value">0°</output></label><input id="view-tilt" type="range" min="0" max="35" value="0" step="1">
           <p class="hint">×1 conserve les dimensions physiques. Ces réglages s’appliquent immédiatement.</p>
           <div class="section-divider"></div>
-          <label for="destination">Lieu à explorer</label><div class="destination-row"><select id="destination"><option value="">Choisir un lieu</option></select><button class="icon-button" id="fly" type="button" aria-label="Explorer le lieu choisi">↗</button></div>
+          <label for="destination">Lieu à explorer</label><div class="destination-row"><select id="destination"><option value="">Choisir un lieu</option></select><button class="icon-button" id="fly" type="button" aria-label="Explorer le lieu choisi" disabled>↗</button></div>
           <label for="visit-altitude">Altitude au-dessus du terrain <span>m</span></label><div class="destination-row"><input id="visit-altitude" type="number" value="30000" min="1" max="700000000" step="any"><button class="icon-button" id="go-altitude" type="button" aria-label="Appliquer l’altitude à la vue actuelle" title="Appliquer à la vue actuelle">↗</button></div>
+          <p class="hint">Un lieu propose une altitude adaptée ; vous pouvez ensuite la modifier.</p>
           <button class="secondary" id="reset" type="button">Revenir à la vue orbitale</button>
           <p class="hint">Glisser pour tourner · Molette pour changer d’altitude</p>
           <div hidden><input id="conservative-refinement" type="checkbox"><p id="contract-status" hidden></p></div>

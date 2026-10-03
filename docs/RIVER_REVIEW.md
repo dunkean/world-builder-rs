@@ -158,6 +158,88 @@ géométrique, sans prouver la monotonie du champ composite. Les 1 200 points
 partagés des deux parcours L0→L24 restent identiques. Ces relevés concernent
 ce monde, pas tous les terrains ou toutes les graines.
 
+## Destinations d'exploration et visibilité
+
+Les anciens raccourcis utilisaient le maximum de débit de l'aperçu ou le
+début d'une polyligne, avec l'altitude générale de 30 km. Ils pouvaient viser
+un nœud sec, un lac ou une section trop petite pour le maillage visible.
+`/rivers.destinations` fournit maintenant des points intérieurs vérifiés par
+`World.sample` : propriétaire fluvial exact, hors mer et lac, profondeur
+d'au moins 10 cm. L'altitude conseillée vaut 18 largeurs réelles, bornée
+entre 600 et 5 000 m. La vallée choisit une pente modérée plutôt que le
+plus grand dénivelé. Aucun débit ni chenal n'est agrandi pour l'affichage.
+
+La sélection active aussi le calque des rivières, qui commande la visibilité
+de leur eau locale. Une altitude modifiée ensuite par l'utilisateur reste
+respectée. La recherche CPU des destinations et des segments ne bloque plus
+le worker asynchrone de l'API. La régression vérifie qu'un maximum sec ne
+devient pas une destination et que chaque cible est à l'intérieur de son
+chenal, à l'altitude adaptée à sa largeur.
+
+Sur l'atlas 0.8 ci-dessus, avant ajout des nouveaux districts géographiques,
+la Grande rivière sélectionnée mesure 188,018 m de large et 2,393 m de
+profondeur ; la visite conseille 3 384 m. La vallée proposée mesure
+187,459 m de large et 2,389 m de profondeur, à 3 374 m d'altitude de visite.
+Les deux points sont mouillés avec `river = 1`, hors mer et lac. Les
+20 tests géométriques et `cargo check -p world-app` passent. Ces contrôles
+numériques ne remplacent pas le contrôle du rendu après compilation WASM.
+
+Les courbes actuelles lissent le graphe atlas, dont les récepteurs suivent
+huit directions voisines à plusieurs kilomètres d'intervalle. Cette base
+explique encore des tronçons assez rectilignes. Des méandres locaux exigent
+une courbe commune à l'incision, au profil et au rendu ; la réparation des
+destinations ne modifie pas cette géométrie.
+
+## Certification après ajout des districts 0.9
+
+L'atlas **`d8d1261ca22a1815f74f`**, graine 2386084681, contient les nouveaux
+champs fixes de fjords, d'archipels et de microbassins. Les deux destinations
+fluviales ci-dessus restent exactement mouillées avec les mêmes profondeurs
+après leur intégration. Le relevé initial 0.9 de 15 364 centres effectivement fluviaux,
+sur 512 grands tronçons, trouve une profondeur maximale de 2,393 m et aucun
+cas au-dessus de 10 m ; les points marins ou lacustres sont exclus.
+
+`/landforms` certifie aussi ses lieux de visite. Un fjord doit être marin ;
+si son point proposé est sec, la recherche essaie les segments intérieurs
+du chenal. L'archipel cadre jusqu'à trois îles réellement émergées proches
+du centre de la chaîne. Le pays des lacs vise un microbassin effectivement
+mouillé, identifié dans la plage réservée `[2⁴⁰, 2⁴¹[`, au lieu d'un centre
+de province éventuellement sec. Le sondage s'arrête au premier bassin valide,
+avec au plus huit districts par type et 288 points locaux supplémentaires
+par district lacustre. Aucun scan dense de la planète n'est nécessaire.
+
+| Visite certifiée sur cet atlas | Résultat |
+| --- | ---: |
+| Fjord : lit / niveau marin ; altitude de visite | −53,756 m / 0 m ; 22 km |
+| Archipel : altitude cadrant trois îles | 81,761 km |
+| Microbassin recertifié après protection des réservoirs : profondeur ; altitude de visite | 0,900 m ; 8 km |
+| Découverte géographique froide, catalogue hydraulique compris | 4,95–6,01 s |
+| Même découverte en cache | 2,34–2,79 ms |
+| Recherche fluviale après compilation du catalogue | 2,13–2,86 ms |
+
+Les durées proviennent de deux exécutions avec d'autres validations
+concurrentes ; la dernière découverte froide, après protection des réservoirs,
+prend 4,951 s. Les directions suivantes sont celles de ce dernier contrôle :
+
+| Destination | Direction cartésienne normalisée |
+| --- | --- |
+| Fjord | `[0.659379813, -0.745814634, -0.094756501]` |
+| Archipel | `[-0.380366336, 0.665703614, 0.641997001]` |
+| Pays des lacs | `[0.413550226, -0.791462030, -0.450071178]` |
+| Grande rivière | `[-0.014522241, -0.749026368, 0.662381011]` |
+| Vallée fluviale | `[-0.003027440, -0.748985546, 0.662579419]` |
+
+L'API recertifie les destinations sur le champ courant ; ces coordonnées
+constituent un relevé ponctuel et peuvent évoluer si les contraintes des
+microbassins changent. Trois nouvelles régressions couvrent le repli du fjord,
+le cadrage de l'archipel et la présence effective d'un microbassin :
+huit tests géographiques et vingt tests fluviaux passent. Le scan initial 0.9,
+avant les dernières protections des réservoirs, examine 4 802 points autour
+du fjord et du microbassin. Il n'a localisé aucun contact
+mouillé entre propriétaires distincts ; il n'a donc mesuré aucune marche
+de plan d'eau à ces endroits. Cela ne certifie pas les contacts de tous
+les districts, ni toutes les graines ou le rendu GPU.
+
 ## Revue indépendante et reproduction
 
 La [revue CLI Opus 5.5](REVIEWS/OPUS_RIVER_PROFILE_2026-10-03.md) a réellement

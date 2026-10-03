@@ -61,8 +61,11 @@ impl World {
         }
 
         let shoreline_datum = water_datum(self, &patch);
-        let datum = shoreline_datum;
-        let amplitude = detail_amplitude(self, &patch, erodability, patch.height);
+        let feature_weight = geographic_feature_weight(self, &patch);
+        let amplitude = detail_amplitude(self, &patch, erodability, patch.height)
+            * (1.0
+                - feature_weight
+                    * (1.0 - crate::landforms::detail_multiplier(self, patch.atlas_direction)));
         let natural = patch.height
             + if amplitude > 0.0 {
                 fractal_detail(self, p, erodability) * amplitude
@@ -70,6 +73,22 @@ impl World {
                 0.0
             };
         let natural = lake_divide_height(self, &patch, natural, amplitude);
+        let natural = natural
+            + feature_weight
+                * (crate::landforms::terrain(self, patch.atlas_direction, natural) - natural);
+        let local_water = local_water_at(self, p, &patch, natural);
+        let natural = local_water.map_or(natural, |water| water.height_m);
+        let datum = if shoreline_datum.is_some_and(|d| d.id != 0) {
+            shoreline_datum
+        } else {
+            local_water
+                .filter(|water| water.lake || water.height_m >= water.level_m)
+                .map(|water| WaterDatum {
+                    level: water.level_m,
+                    id: water.id,
+                })
+                .or(shoreline_datum)
+        };
         let mut height = natural;
         let mut channel: Option<(Channel, f64)> = None;
         let mut dry_channel: Option<(Channel, f64)> = None;
@@ -114,13 +133,19 @@ impl World {
                     }) {
                         channel = Some((candidate, wet_shape));
                     }
-                } else if radial < 1.1
-                    && dry_channel.is_none_or(|(old, old_radius)| {
-                        radial < old_radius || (radial == old_radius && candidate.id < old.id)
-                    })
-                {
-                    dry_channel = Some((candidate, radial));
                 }
+            }
+            if wet_shape == 0.0
+                && (radial < 1.1 || local_water.is_some_and(|water| !water.lake))
+                && dry_channel.is_none_or(|(old, old_radius)| {
+                    radial < old_radius || (radial == old_radius && candidate.id < old.id)
+                })
+            {
+                // Include the whole carved dry valley when it intersects a
+                // local lake fringe, even outside the bank blending weights.
+                // Its zero-depth channel datum prevents the lake plane from
+                // rendering false water over a lower, independent dry bank.
+                dry_channel = Some((candidate, radial));
             }
         }
         let coverage = 1.0 - dry_weight;
@@ -135,10 +160,15 @@ impl World {
         let mut ocean = false;
         let mut lake = false;
         let mut river = 0.0;
+        let local_dry = local_water
+            .is_some_and(|local| !local.lake && datum.is_some_and(|datum| datum.id == local.id));
+        // A dry procedural fringe must not retain a water plane above its
+        // surface after an independent valley has lowered the terrain.
+        let datum = datum.filter(|water| !local_dry || height >= water.level);
         let mut water_level = datum.map(|d| d.level);
         let mut water_id = datum.map(|d| d.id);
         if let Some(water) = datum {
-            if height < water.level {
+            if height < water.level && !local_dry {
                 ocean = water.id == 0;
                 lake = water.id != 0;
             }
@@ -189,9 +219,20 @@ impl World {
             if matches!(biome, Biome::Ocean | Biome::Lake) {
                 biome = land_biome(temperature, moisture);
             }
+            refine_biome_boundaries(self.config.seed, self.config.radius_m, p, &mut biome_mix);
             if river > 0.15 && matches!(biome, Biome::Desert | Biome::Grassland) {
                 biome = Biome::Wetland;
                 biome_mix[Biome::Wetland as usize] += 0.25;
+            }
+            if let Some(water) = local_water {
+                let wetland = (0.85 * water.wetland_weight) as f32;
+                for weight in &mut biome_mix {
+                    *weight *= 1.0 - wetland;
+                }
+                biome_mix[Biome::Wetland as usize] += wetland;
+                if wetland > 0.45 {
+                    biome = Biome::Wetland;
+                }
             }
             let sum: f32 = biome_mix.iter().sum();
             if sum > 0.0 {
@@ -427,6 +468,12 @@ fn coastal_reconstruction(world: &World, p: [f64; 3]) -> Patch {
     reconstruction(world, crate::coast::remap(&world.config, p))
 }
 
+/// Frozen atlas reconstruction only: province compilation cannot consult its
+/// own cached geographic objects or recursively enter river compilation.
+pub(crate) fn atlas_height(world: &World, p: [f64; 3]) -> f64 {
+    reconstruction(world, p).height
+}
+
 fn detail_amplitude(world: &World, patch: &Patch, erodability: f64, height: f64) -> f64 {
     let nominal = world.config.detail_m * (1.3 - 0.4 * erodability).clamp(0.3, 1.4);
     let mut lake_weight = 0.0;
@@ -517,13 +564,111 @@ fn lake_divide_height(world: &World, patch: &Patch, natural: f64, detail_bound: 
 pub(crate) fn natural_height(world: &World, p: [f64; 3]) -> f64 {
     let p = normalize(p);
     let patch = coastal_reconstruction(world, p);
+    let natural = geographic_height(world, p, &patch);
+    local_water_at(world, p, &patch, natural).map_or(natural, |water| water.height_m)
+}
+
+fn geographic_height(world: &World, p: [f64; 3], patch: &Patch) -> f64 {
     let erodability = patch.attributes[..patch.attribute_count]
         .iter()
         .map(|&(index, weight)| weight * f64::from(world.cells[index].erodability))
         .sum::<f64>();
-    let amplitude = detail_amplitude(world, &patch, erodability, patch.height);
+    let feature_weight = geographic_feature_weight(world, patch);
+    let amplitude = detail_amplitude(world, patch, erodability, patch.height)
+        * (1.0
+            - feature_weight
+                * (1.0 - crate::landforms::detail_multiplier(world, patch.atlas_direction)));
     let natural = patch.height + fractal_detail(world, p, erodability) * amplitude;
-    lake_divide_height(world, &patch, natural, amplitude)
+    let natural = lake_divide_height(world, patch, natural, amplitude);
+    natural
+        + feature_weight
+            * (crate::landforms::terrain(world, patch.atlas_direction, natural) - natural)
+}
+
+fn geographic_feature_weight(world: &World, patch: &Patch) -> f64 {
+    smooth(
+        (crate::lake_geometry::geographic_clearance(world, patch.atlas_direction) / 3_000.0)
+            .clamp(0.0, 1.0),
+    )
+}
+
+fn local_environment(
+    world: &World,
+    patch: &Patch,
+    natural: f64,
+) -> crate::local_water::LocalWaterEnvironment {
+    let mut temperature = 0.0;
+    let mut moisture = 0.0;
+    for &(index, weight) in &patch.attributes[..patch.attribute_count] {
+        let (annual_temperature, annual_moisture) =
+            crate::annual_cell_climate(world, &world.cells[index]);
+        temperature += annual_temperature * weight;
+        moisture += annual_moisture * weight;
+    }
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    let mut protected = if natural < 35.0
+        || crate::lake_geometry::geographic_clearance(world, patch.atlas_direction) <= 2_301.0
+    {
+        1.0
+    } else {
+        0.0
+    };
+    for &index in &patch.nearby[..patch.nearby_count] {
+        let cell = &world.cells[index];
+        let h = f64::from(cell.height_m);
+        low = low.min(h);
+        high = high.max(h);
+        if cell.discharge < 120.0 || cell.ocean || cell.lake {
+            continue;
+        }
+        let Some(receiver) = cell.receiver else {
+            continue;
+        };
+        let a = cell.position;
+        let b = world.cells[receiver].position;
+        let v = std::array::from_fn::<_, 3, _>(|i| b[i] - a[i]);
+        let delta = std::array::from_fn::<_, 3, _>(|i| patch.atlas_direction[i] - a[i]);
+        let t = (dot(delta, v) / dot(v, v).max(1e-30)).clamp(0.0, 1.0);
+        let offset = std::array::from_fn::<_, 3, _>(|i| delta[i] - t * v[i]);
+        if dot(offset, offset).sqrt() * world.config.radius_m
+            < 450.0 + 18.0 * f64::from(cell.discharge).sqrt()
+        {
+            protected = 1.0;
+        }
+    }
+    crate::local_water::LocalWaterEnvironment {
+        natural_height_m: natural,
+        province_weight: crate::landforms::lake_province_weight(world, patch.atlas_direction),
+        temperature_c: temperature,
+        moisture,
+        roughness: (high - low) / (6.0 * patch.spacing_m).max(1.0),
+        protected_water_weight: protected,
+    }
+}
+
+fn local_water_at(
+    world: &World,
+    _p: [f64; 3],
+    patch: &Patch,
+    natural: f64,
+) -> Option<crate::local_water::LocalWaterSample> {
+    if world.config.regional_lake_density <= 0.0
+        || natural < 0.0
+        || lake_datum(world, patch).is_some()
+        || !crate::landforms::near_lake_province(world, patch.atlas_direction)
+    {
+        return None;
+    }
+    let environment = local_environment(world, patch, natural);
+    // All geographic objects share the atlas domain. This makes the full
+    // support exclusion and province halo independent of coastal distortion.
+    crate::local_water::sample(world, patch.atlas_direction, environment, |point| {
+        let p = crate::coast::inverse(&world.config, point);
+        let patch = reconstruction(world, point);
+        let natural = geographic_height(world, p, &patch);
+        local_environment(world, &patch, natural)
+    })
 }
 
 fn fractal_detail(world: &World, p: [f64; 3], erodability: f64) -> f64 {
@@ -722,10 +867,71 @@ fn land_biome(temperature: f64, moisture: f64) -> Biome {
     }
 }
 
+/// Reweight existing terrestrial transitions, rather than inventing climate or
+/// changing a water owner. Fixed metric bands keep their locations at every LOD;
+/// zero fractions remain zero and pure biome interiors remain pure.
+fn refine_biome_boundaries(seed: u64, radius: f64, p: [f64; 3], mix: &mut [f32; 10]) {
+    if mix[2..].iter().filter(|&&w| w > 0.0).count() < 2 {
+        return;
+    }
+    for (i, weight) in mix.iter_mut().enumerate().skip(2) {
+        if *weight <= 0.0 {
+            continue;
+        }
+        let key = seed ^ 0xb10_7e5 ^ (i as u64).wrapping_mul(104_729);
+        let perturbation = [(30_000.0, 0.85), (3_000.0, 0.50), (300.0, 0.25)]
+            .into_iter()
+            .enumerate()
+            .map(|(band, (metres, amplitude))| {
+                amplitude * noise(key ^ (band as u64 * 193), p, radius / metres)
+            })
+            .sum::<f64>();
+        *weight *= perturbation.exp() as f32;
+    }
+    let total: f32 = mix[2..].iter().sum();
+    if total > 0.0 {
+        for fraction in &mut mix[2..] {
+            *fraction /= total;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Material, WorldConfig};
+
+    #[test]
+    fn biome_boundary_detail_is_continuous_seeded_and_preserves_water_exclusion() {
+        let p = normalize([0.43, 0.61, -0.37]);
+        let mut mix = [0.0; 10];
+        mix[Biome::Grassland as usize] = 0.5;
+        mix[Biome::Forest as usize] = 0.5;
+        let mut a = mix;
+        refine_biome_boundaries(2386084681, 1_737_000.0, p, &mut a);
+        let mut repeat = mix;
+        refine_biome_boundaries(2386084681, 1_737_000.0, p, &mut repeat);
+        assert_eq!(a, repeat);
+        assert_eq!(a[Biome::Ocean as usize], 0.0);
+        assert_eq!(a[Biome::Lake as usize], 0.0);
+        assert!(a.iter().all(|w| w.is_finite() && *w >= 0.0));
+        assert!((a.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        let mut another_seed = mix;
+        refine_biome_boundaries(1, 1_737_000.0, p, &mut another_seed);
+        assert_ne!(a, another_seed);
+        let mut adjacent = mix;
+        refine_biome_boundaries(
+            2386084681,
+            1_737_000.0,
+            normalize([p[0] + 0.001 / 1_737_000.0, p[1], p[2]]),
+            &mut adjacent,
+        );
+        assert!((a[5] - adjacent[5]).abs() < 1e-5);
+        let mut pure = [0.0; 10];
+        pure[Biome::Forest as usize] = 1.0;
+        refine_biome_boundaries(1, 1_737_000.0, p, &mut pure);
+        assert_eq!(pure[Biome::Forest as usize], 1.0);
+    }
 
     fn synthetic() -> World {
         let mut world = World::generate(WorldConfig {

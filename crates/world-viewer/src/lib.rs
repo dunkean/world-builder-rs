@@ -20,6 +20,7 @@ const STREAM_SEGMENTS: usize = 64;
 // Halving a tile's grid requires twice the tile frequency for the same
 // physical vertex spacing, hence up to four times as many visible leaves.
 const MAX_VISIBLE_TILES: usize = 256;
+const MAX_PREFETCH_TILES: usize = 64;
 const MORPH_DURATION_SECONDS: f64 = 0.16;
 
 fn shader_source() -> String {
@@ -46,6 +47,8 @@ fn cut_prepare_budget(motion_age: f64, render_ms: f64, prepare_ms: f64) -> f64 {
 
 #[derive(Clone, Deserialize)]
 struct Config {
+    #[serde(default)]
+    seed: u64,
     radius_m: f64,
     resolution: usize,
 }
@@ -510,18 +513,72 @@ fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
 
 fn biome_color(biome: &str) -> [f32; 3] {
     match biome {
-        "Ocean" => [0.08, 0.25, 0.40],
-        "Lake" => [0.12, 0.39, 0.48],
-        "Ice" => [0.87, 0.92, 0.93],
-        "Tundra" => [0.47, 0.53, 0.41],
-        "Desert" => [0.79, 0.64, 0.39],
-        "Grassland" => [0.43, 0.56, 0.26],
-        "Forest" => [0.20, 0.39, 0.22],
-        "Rainforest" => [0.09, 0.31, 0.20],
-        "Wetland" => [0.25, 0.48, 0.34],
-        "Rock" => [0.52, 0.49, 0.43],
-        _ => [0.49, 0.54, 0.37],
+        // Linear RGB: restrained inks, warm rock/sand and cool ivory ice.
+        "Ocean" => [0.035, 0.16, 0.25],
+        "Lake" => [0.06, 0.28, 0.30],
+        "Ice" => [0.78, 0.83, 0.80],
+        "Tundra" => [0.32, 0.37, 0.24],
+        "Desert" => [0.65, 0.47, 0.25],
+        "Grassland" => [0.32, 0.43, 0.19],
+        "Forest" => [0.10, 0.24, 0.115],
+        "Rainforest" => [0.055, 0.17, 0.085],
+        "Wetland" => [0.18, 0.31, 0.22],
+        "Rock" => [0.40, 0.35, 0.28],
+        _ => [0.32, 0.40, 0.22],
     }
+}
+
+fn mix_color(a: [f32; 3], b: [f32; 3], weight: f64) -> [f32; 3] {
+    std::array::from_fn(|i| (f64::from(a[i]) * (1.0 - weight) + f64::from(b[i]) * weight) as f32)
+}
+
+fn cartographic_land_color(sample: &Sample) -> [f32; 3] {
+    let weight: f64 = sample.biome_mix[2..].iter().sum();
+    let mut color = if weight > 0.0 {
+        let mut result = [0.0; 3];
+        for (name, amount) in BIOMES.into_iter().zip(sample.biome_mix).skip(2) {
+            let c = biome_color(name);
+            for i in 0..3 {
+                result[i] += c[i] * (amount / weight) as f32;
+            }
+        }
+        result
+    } else if sample.biome == "Ocean" || sample.biome == "Lake" {
+        biome_color("Wetland")
+    } else {
+        biome_color(&sample.biome)
+    };
+    // The hydraulic datum identifies a real nearby shore. Tint its dry bank,
+    // without changing either geometry or the shoreline/water clipping.
+    if let Some((id, level)) = water_body(sample) {
+        let above = sample.height_m - level;
+        if above >= 0.0 {
+            let (width, bank, strength) = if id == 0 {
+                (14.0, [0.66, 0.56, 0.36], 0.72)
+            } else {
+                (3.0, [0.25, 0.32, 0.19], 0.28)
+            };
+            let t = (above / width).clamp(0.0, 1.0);
+            let warmth = ((sample.temperature_c + 8.0) / 14.0).clamp(0.0, 1.0);
+            color = mix_color(
+                color,
+                bank,
+                strength * warmth * warmth * (3.0 - 2.0 * warmth) * (1.0 - t * t * (3.0 - 2.0 * t)),
+            );
+        }
+    }
+    color
+}
+
+fn water_style(sample: &Sample) -> f32 {
+    match water_body(sample) {
+        Some((id, _)) if id >= RIVER_BODY => -2.0,
+        _ => sample.river as f32,
+    }
+}
+
+fn cartography_seed(seed: u64) -> [u32; 4] {
+    [seed as u32, (seed >> 32) as u32, 0, 0]
 }
 
 fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Vertex {
@@ -535,41 +592,13 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
     let high = position.as_vec3();
     let low = (position - high.as_dvec3()).as_vec3();
     let color = if water {
-        if sample.ocean {
-            [0.045, 0.26, 0.43]
+        if water_body(sample).is_some_and(|(id, _)| id == 0) {
+            biome_color("Ocean")
         } else {
-            [0.06, 0.37, 0.45]
+            biome_color("Lake")
         }
     } else {
-        let weight: f64 = sample.biome_mix[2..].iter().sum();
-        if weight > 0.0 {
-            let names = [
-                "Ocean",
-                "Lake",
-                "Ice",
-                "Tundra",
-                "Desert",
-                "Grassland",
-                "Forest",
-                "Rainforest",
-                "Wetland",
-                "Rock",
-            ];
-            let mut result = [0.0; 3];
-            for (name, amount) in names.into_iter().zip(sample.biome_mix).skip(2) {
-                let c = biome_color(name);
-                for i in 0..3 {
-                    result[i] += c[i] * (amount / weight) as f32;
-                }
-            }
-            result
-        } else {
-            if sample.biome == "Ocean" || sample.biome == "Lake" {
-                biome_color("Wetland")
-            } else {
-                biome_color(&sample.biome)
-            }
-        }
+        cartographic_land_color(sample)
     };
     let river = if sample.river > 0.0 {
         sample.river
@@ -591,7 +620,11 @@ fn vertex(sample: &Sample, radius: f64, exaggeration: f64, water: bool) -> Verte
         fields: [
             sample.temperature_c as f32,
             sample.moisture as f32,
-            river as f32,
+            if water {
+                water_style(sample)
+            } else {
+                river as f32
+            },
             (water_height(sample) - sample.height_m) as f32,
         ],
         morph: [
@@ -823,11 +856,11 @@ fn append_water_geometry(
                     if flowing {
                         v.fields[2] = -2.0;
                     }
-                    v.color[..3].copy_from_slice(if id == 0 {
-                        &[0.045, 0.26, 0.43]
+                    v.color[..3].copy_from_slice(&biome_color(if id == 0 {
+                        "Ocean"
                     } else {
-                        &[0.06, 0.37, 0.45]
-                    });
+                        "Lake"
+                    }));
                     (v, depth, local_level)
                 })
                 .collect();
@@ -1060,6 +1093,66 @@ fn frontier_keys(
     out
 }
 
+/// Warm one more frontier while the immediate quartets are being received.
+/// Projection uses complete requested families, never mutates the displayed cut,
+/// and runs only once even when the forecast target is many levels deeper.
+fn prefetch_keys(
+    cut: &HashSet<TileKey>,
+    targets: &[TileKey],
+    level: u8,
+    direction: DVec3,
+) -> Vec<TileKey> {
+    let immediate = frontier_keys(cut, targets, level, direction, false);
+    let mut projected = cut.clone();
+    for quartet in immediate.chunks_exact(4) {
+        let parent = lod::parent(quartet[0]).expect("frontier children have a parent");
+        if quartet == lod::children(parent) && cut.contains(&parent) {
+            lod::split(&mut projected, parent);
+        }
+    }
+    let following = frontier_keys(&projected, targets, level, direction, false);
+    let (face, u, v) = face_uv(direction);
+    let centers = [
+        lod::covering_key(cut, face as u8, u, v),
+        lod::covering_key(&projected, face as u8, u, v),
+    ];
+    let mut out = Vec::with_capacity(immediate.len() + following.len());
+    let mut seen = HashSet::new();
+    // Only speculative ordering changes: keep the central dependency and then
+    // its next quartet before forecast fringes can consume the bounded budget.
+    for center in centers.into_iter().flatten() {
+        if let Some(quartet) = immediate
+            .chunks_exact(4)
+            .chain(following.chunks_exact(4))
+            .find(|quartet| lod::parent(quartet[0]) == Some(center))
+        {
+            out.extend(quartet.iter().copied().filter(|key| seen.insert(*key)));
+        }
+    }
+    out.extend(
+        immediate
+            .into_iter()
+            .chain(following)
+            .filter(|key| seen.insert(*key)),
+    );
+    out
+}
+
+/// Deduplicate before budgeting so the existing real frontier stays intact and
+/// every admitted forecast quartet is complete across the combined request list.
+fn append_prefetch(keys: &mut Vec<TileKey>, future: &[TileKey]) {
+    let mut seen: HashSet<_> = keys.iter().copied().collect();
+    let mut remaining = MAX_PREFETCH_TILES;
+    for quartet in future.chunks_exact(4) {
+        let missing = quartet.iter().filter(|key| !seen.contains(key)).count();
+        if missing > remaining {
+            continue;
+        }
+        remaining -= missing;
+        keys.extend(quartet.iter().copied().filter(|key| seen.insert(*key)));
+    }
+}
+
 /// Under pressure, only the reserved quartet can survive until its siblings
 /// arrive. Fetching later quartets would immediately evict and request them again.
 fn pressure_frontier(
@@ -1207,8 +1300,8 @@ fn mesh_from_samples_inner(
         mesh.vertices
             .extend(samples.iter().enumerate().map(|(index, s)| {
                 let mut v = vertex(s, radius, exaggeration, water);
-                v.fields[2] = if water && water_body(s).is_some_and(|(id, _)| id >= RIVER_BODY) {
-                    -2.0
+                v.fields[2] = if water {
+                    water_style(s)
                 } else {
                     s.river as f32
                 };
@@ -1793,7 +1886,7 @@ fn object_mesh(rivers: &RiverLayer, human: &HumanLayer, radius: f64, exaggeratio
             river.width_m.max(3.0),
             radius,
             exaggeration,
-            [0.13, 0.66, 0.81],
+            [0.07, 0.39, 0.51],
             100.0,
         );
     }
@@ -1865,6 +1958,7 @@ mod browser {
         eye_low: [f32; 4],
         light: [f32; 4],
         options: [f32; 4],
+        cartography: [u32; 4],
         clips: [TileClip; 32],
     }
 
@@ -2250,9 +2344,13 @@ mod browser {
             )
         }
         fn requests_at(&self, direction: DVec3, altitude: f64) -> Vec<TileKey> {
+            let (cpu, gpu) = self.cache_bytes();
+            if cpu >= 768 * 1024 * 1024 * 4 / 5 || gpu >= 768 * 1024 * 1024 * 4 / 5 {
+                return Vec::new();
+            }
             let level = self.level_for(direction, altitude);
             let targets = footprint_keys(direction, level, self.aspect(), altitude, self.view_tilt);
-            frontier_keys(&self.active_set, &targets, level, direction, false)
+            prefetch_keys(&self.active_set, &targets, level, direction)
         }
         fn staged_parent(&self) -> Option<TileKey> {
             self.active_set
@@ -2270,7 +2368,7 @@ mod browser {
                     })
                 })
         }
-        fn requests(&self) -> Vec<TileKey> {
+        fn requests(&self) -> (Vec<TileKey>, usize) {
             let mut keys = frontier_keys(
                 &self.active_set,
                 &self.desired,
@@ -2278,15 +2376,17 @@ mod browser {
                 self.direction(),
                 true,
             );
-            let mut seen: HashSet<_> = keys.iter().copied().collect();
             let (cpu, gpu) = self.cache_bytes();
-            if cpu < 768 * 1024 * 1024 * 4 / 5 && gpu < 768 * 1024 * 1024 * 4 / 5 {
-                let future = self.requests_at(self.direction(), self.altitude * 0.5);
-                keys.extend(future.into_iter().filter(|key| seen.insert(*key)).take(64));
-            } else {
+            let prefetch = cpu < 768 * 1024 * 1024 * 4 / 5 && gpu < 768 * 1024 * 1024 * 4 / 5;
+            if !prefetch {
                 keys = pressure_frontier(keys, &self.active_set, self.staged_parent());
             }
-            keys
+            let essential_count = keys.len();
+            if prefetch {
+                let future = self.requests_at(self.direction(), self.altitude * 0.5);
+                append_prefetch(&mut keys, &future);
+            }
+            (keys, essential_count)
         }
         fn direction(&self) -> DVec3 {
             DVec3::new(
@@ -2497,7 +2597,7 @@ mod browser {
                 pinned.extend(p.children.iter().copied());
                 pinned.extend(p.jobs.iter().map(|v| v.0));
             }
-            let wanted: HashSet<_> = self.requests().into_iter().collect();
+            let wanted: HashSet<_> = self.requests().0.into_iter().collect();
             loop {
                 let (cpu, gpu) = self.cache_bytes();
                 if cpu <= CPU_LIMIT && gpu <= GPU_LIMIT {
@@ -3240,10 +3340,16 @@ mod browser {
                 light: inspection_light(dir, self.altitude).extend(time).to_array(),
                 options: [
                     self.mode,
-                    0.0,
+                    self.world
+                        .as_ref()
+                        .map_or(1_737_000.0, |world| world.config.radius_m)
+                        as f32,
                     if self.show_rivers { 1.0 } else { 0.0 },
                     if self.show_human { 1.0 } else { 0.0 },
                 ],
+                cartography: cartography_seed(
+                    self.world.as_ref().map_or(42, |world| world.config.seed),
+                ),
                 clips,
             };
             self.queue
@@ -3847,11 +3953,11 @@ mod browser {
             let count = 1u32 << level;
             let x = (((u + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
             let y = (((v + 1.0) * 0.5 * count as f64) as u32).min(count - 1);
-            let requests = r.requests();
+            let (requests, essential_count) = r.requests();
             serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level":lod::covering_key(&r.active_set,face as u8,u,v).map(|key|key.level), "active_tiles": r.active_keys.len(), "draw_tiles":r.draw_keys.len(),
                 "cpu_bytes":r.cache_bytes().0,"gpu_bytes":r.cache_bytes().1,"cpu_budget_bytes":768*1024*1024u64,"gpu_budget_bytes":768*1024*1024u64,"resident_keys":r.tiles.iter().map(|tile|tile.key).collect::<Vec<_>>(),
                 "pending_tiles":r.pending.as_ref().map_or(0,|p|p.jobs.len()-p.cursor),"mesh_builds":r.metrics.mesh_builds,"uploads":r.metrics.uploads,"upload_bytes":r.metrics.upload_bytes,
-                "cut_commits":r.metrics.cut_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"surface_fallbacks":r.metrics.surface_fallbacks,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"requests": requests }).to_string()
+                "cut_commits":r.metrics.cut_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"surface_fallbacks":r.metrics.surface_fallbacks,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"essential_count": essential_count,"requests": requests }).to_string()
         })
     }
 }
@@ -3862,6 +3968,90 @@ pub use browser::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cartographic_palette_preserves_biome_mixtures_and_real_shore_levels() {
+        let mut sample = Sample {
+            direction: DVec3::Z.to_array(),
+            height_m: 100.0,
+            water_m: 100.0,
+            temperature_c: 20.0,
+            biome: "Forest".into(),
+            ..Default::default()
+        };
+        sample.biome_mix[5] = 0.4;
+        sample.biome_mix[6] = 0.6;
+        let expected = mix_color(biome_color("Grassland"), biome_color("Forest"), 0.6);
+        let color = cartographic_land_color(&sample);
+        for i in 0..3 {
+            assert!((color[i] - expected[i]).abs() < 1e-6);
+        }
+        sample.height_m = 1.0;
+        sample.water_level_m = Some(0.0);
+        sample.water_body_id = Some(0);
+        let shore = vertex(&sample, 1_737_000.0, 1.0, false);
+        assert!(shore.color[0] > color[0]);
+        assert_eq!(shore.fields[3], -1.0);
+        assert_eq!(shore.color[3], 0.0);
+        assert_eq!(sample.height_m, 1.0);
+        assert_eq!(sample.water_level_m, Some(0.0));
+    }
+
+    #[test]
+    fn water_palette_retains_opaque_flags_real_depth_and_river_markers() {
+        let marine = Sample {
+            direction: DVec3::Z.to_array(),
+            height_m: -0.001,
+            water_m: 0.0,
+            water_level_m: Some(0.0),
+            water_body_id: Some(0),
+            ocean: true,
+            ..Default::default()
+        };
+        let mut fresh = marine.clone();
+        fresh.height_m = 99.999;
+        fresh.water_m = 100.0;
+        fresh.water_level_m = Some(100.0);
+        fresh.water_body_id = Some(77);
+        fresh.ocean = false;
+        fresh.lake = true;
+        let mut river = fresh.clone();
+        river.lake = false;
+        river.water_body_id = Some(RIVER_BODY + 77);
+        river.river = 0.8;
+        let sea_vertex = vertex(&marine, 1_737_000.0, 1.0, true);
+        let lake_vertex = vertex(&fresh, 1_737_000.0, 1.0, true);
+        let river_vertex = vertex(&river, 1_737_000.0, 1.0, true);
+        assert!(sea_vertex.color[2] > sea_vertex.color[1] * 1.3);
+        assert!(lake_vertex.color[2] < lake_vertex.color[1] * 1.3);
+        for v in [sea_vertex, lake_vertex, river_vertex] {
+            assert_eq!(v.color[3], 1.0);
+            assert!((v.fields[3] - 0.001).abs() < 1e-7);
+            assert!(v.color[..3]
+                .iter()
+                .all(|c| c.is_finite() && *c > 0.0 && *c < 1.0));
+        }
+        assert_eq!(river_vertex.fields[2], -2.0);
+        assert_eq!(sea_vertex.fields[2], 0.0);
+        assert_eq!(lake_vertex.fields[2], 0.0);
+    }
+
+    #[test]
+    fn cartographic_seed_keeps_the_full_imported_integer() {
+        let config: Config = serde_json::from_str(
+            r#"{"seed":9007199254740991,"radius_m":1737000,"resolution":128}"#,
+        )
+        .unwrap();
+        let words = cartography_seed(config.seed);
+        assert_eq!(
+            u64::from(words[0]) | (u64::from(words[1]) << 32),
+            config.seed
+        );
+        assert_ne!(
+            cartography_seed(config.seed),
+            cartography_seed(config.seed + (1 << 32))
+        );
+    }
 
     fn prepared_test_tile() -> Tile {
         let side = 9;
@@ -4385,6 +4575,7 @@ mod tests {
         }
         let world = World {
             config: Config {
+                seed: 42,
                 radius_m: 2_000_000.0,
                 resolution: 512,
             },
@@ -4410,6 +4601,7 @@ mod tests {
     fn planetary_interpolation_does_not_expand_a_river_profile_into_a_lake() {
         let world = World {
             config: Config {
+                seed: 42,
                 radius_m: 2_000_000.0,
                 resolution: 2,
             },
@@ -4825,6 +5017,136 @@ mod tests {
             assert!(lod::coarsen(&mut cut, requests[0]));
         }
         assert_eq!(cut, lod::initial_leaves());
+    }
+
+    #[test]
+    fn prefetch_projects_one_requested_frontier_without_changing_the_real_cut() {
+        let target = TileKey {
+            face: 4,
+            level: 18,
+            x: 209715,
+            y: 141557,
+        };
+        let direction = tile_center(target);
+        let mut cut = lod::initial_leaves();
+        for level in 0..target.level {
+            let parent = lod::ancestor(target, level).unwrap();
+            let before = cut.clone();
+            let essential = frontier_keys(&cut, &[target], target.level, direction, true);
+            let future = prefetch_keys(&cut, &[target], target.level, direction);
+            let mut requests = essential.clone();
+            append_prefetch(&mut requests, &future);
+            assert_eq!(&requests[..essential.len()], essential);
+            assert_eq!(cut, before, "forecast changed the displayed partition");
+            let mut expected: HashSet<_> = lod::children(parent).into_iter().collect();
+            if level + 1 < target.level {
+                let next = lod::ancestor(target, level + 1).unwrap();
+                expected.extend(lod::children(next));
+            }
+            assert_eq!(future.iter().copied().collect::<HashSet<_>>(), expected);
+            assert_eq!(future.len(), expected.len());
+            assert!(future
+                .iter()
+                .all(|key| { key.level > level && key.level <= (level + 2).min(target.level) }));
+            assert!(lod::split(&mut cut, parent));
+        }
+        assert!(prefetch_keys(&cut, &[target], target.level, direction).is_empty());
+    }
+
+    #[test]
+    fn forecast_center_keeps_its_next_quartet_when_new_fringes_exceed_the_budget() {
+        let mut cut = lod::initial_leaves();
+        for level in 0..3 {
+            let parents: Vec<_> = cut
+                .iter()
+                .copied()
+                .filter(|key| key.face == 4 && key.level == level)
+                .collect();
+            for parent in parents {
+                assert!(lod::split(&mut cut, parent));
+            }
+        }
+        let targets: Vec<_> = (0..8)
+            .flat_map(|y| {
+                (0..8).map(move |x| TileKey {
+                    face: 4,
+                    level: 8,
+                    x: x * 32 + 16,
+                    y: y * 32 + 16,
+                })
+            })
+            .collect();
+        let current = targets[0];
+        let forecast = targets[36];
+        let direction = tile_center(forecast);
+        let essential = frontier_keys(&cut, &[current], 8, tile_center(current), true);
+        let immediate = frontier_keys(&cut, &targets, 8, direction, false);
+        assert!(immediate.len() > MAX_PREFETCH_TILES);
+        let future = prefetch_keys(&cut, &targets, 8, direction);
+        let mut requests = essential.clone();
+        append_prefetch(&mut requests, &future);
+        let extras = &requests[essential.len()..];
+        let central = lod::children(lod::ancestor(forecast, 3).unwrap());
+        let following = lod::children(lod::ancestor(forecast, 4).unwrap());
+        assert_eq!(&requests[..essential.len()], essential);
+        assert_eq!(&extras[..4], central);
+        assert_eq!(&extras[4..8], following);
+        assert_eq!(extras.len(), MAX_PREFETCH_TILES);
+        let unique: HashSet<_> = requests.iter().copied().collect();
+        assert_eq!(unique.len(), requests.len());
+        for quartet in future.chunks_exact(4) {
+            if quartet.iter().any(|key| unique.contains(key)) {
+                assert!(quartet.iter().all(|key| unique.contains(key)));
+            }
+        }
+        assert!(future.iter().all(|key| key.level == 4 || key.level == 5));
+    }
+
+    #[test]
+    fn prefetch_budget_deduplicates_before_admitting_complete_families() {
+        let families: Vec<_> = (0..17)
+            .map(|x| {
+                lod::children(TileKey {
+                    face: 4,
+                    level: 5,
+                    x,
+                    y: 0,
+                })
+            })
+            .collect();
+        let future: Vec<_> = families.iter().flatten().copied().collect();
+        let first = families[0][0];
+        let mut requests = vec![first];
+        append_prefetch(&mut requests, &future);
+        assert_eq!(requests[0], first);
+        assert_eq!(requests.len(), 64);
+        let unique: HashSet<_> = requests.iter().copied().collect();
+        assert_eq!(unique.len(), requests.len());
+        assert!(families[..16]
+            .iter()
+            .flatten()
+            .all(|key| unique.contains(key)));
+        assert!(families[16].iter().all(|key| !unique.contains(key)));
+    }
+
+    #[test]
+    fn forecast_does_not_reload_a_deep_cut_during_zoom_out_or_before_initialization() {
+        let target = TileKey {
+            face: 4,
+            level: 18,
+            x: 209715,
+            y: 141557,
+        };
+        let direction = tile_center(target);
+        assert!(prefetch_keys(&HashSet::new(), &[target], 18, direction).is_empty());
+        let mut cut = lod::initial_leaves();
+        for level in 0..target.level {
+            assert!(lod::split(&mut cut, lod::ancestor(target, level).unwrap()));
+        }
+        let orbital = lod::ancestor(target, 3).unwrap();
+        let before = cut.clone();
+        assert!(prefetch_keys(&cut, &[orbital], 3, direction).is_empty());
+        assert_eq!(cut, before);
     }
 
     #[test]

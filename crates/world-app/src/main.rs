@@ -26,7 +26,7 @@ mod preview;
 mod regions;
 
 // Render-field revision changes tile caches without rewriting physical atlases.
-const SURFACE_REVISION: &str = "spherical-coast-7";
+const SURFACE_REVISION: &str = "spherical-coast-9";
 
 #[derive(Parser)]
 #[command(
@@ -267,6 +267,7 @@ async fn main() -> Result<()> {
                 .route("/api/worlds/{id}/families/{face}/{level}/{x}/{y}", get(family))
                 .route("/api/worlds/{id}/sample", get(sample))
                 .route("/api/worlds/{id}/rivers", get(rivers))
+                .route("/api/worlds/{id}/landforms", get(landforms))
                 .route("/api/worlds/{id}/lakes", get(lakes))
                 .route("/api/worlds/{id}/regions/reports", get(region_reports))
                 .route("/api/worlds/{id}/human", get(human))
@@ -914,9 +915,18 @@ async fn rivers(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let world = find_world(&app, &id).await?;
-    Ok(Json(
-        serde_json::json!({"world_id":world.id,"segments":world.river_segments(256),"display_reach_limit":256,"discharge_model":"annual mean runoff"}),
-    ))
+    let data = tokio::task::spawn_blocking(move || {
+        serde_json::json!({
+            "world_id":world.id,
+            "segments":world.river_segments(256),
+            "destinations":world_core::river_geometry::exploration_destinations(&world),
+            "display_reach_limit":256,
+            "discharge_model":"annual mean runoff"
+        })
+    })
+    .await
+    .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(data))
 }
 async fn lakes(
     State(app): State<App>,
@@ -929,6 +939,21 @@ async fn lakes(
         "direction":world.cells[lake.control_cell].position,"cell_count":lake.cells.len()
     })).collect::<Vec<_>>();
     Ok(Json(serde_json::json!({"world_id":world.id,"lakes":lakes})))
+}
+async fn landforms(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let world = find_world(&app, &id).await?;
+    let data = tokio::task::spawn_blocking(move || {
+        serde_json::json!({
+            "world_id": world.id,
+            "features": world_core::landforms::destinations(&world)
+        })
+    })
+    .await
+    .map_err(|error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(data))
 }
 async fn region_reports(
     State(app): State<App>,

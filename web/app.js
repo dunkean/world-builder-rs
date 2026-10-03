@@ -56,22 +56,20 @@ function loadWorld(world) {
   destinations.clear();
   predictor.reset();
   $('destination').replaceChildren(new Option('Choisir un lieu', ''));
+  $('fly').disabled = true;
   let peak;
-  let river;
   let barePeak;
   let coast;
   for (const cell of world.cells) {
     if (!cell.ocean && !cell.lake) {
       if (!peak || cell.height_m > peak.height_m) peak = cell;
       if (cell.biome !== 'Ice' && (!barePeak || cell.height_m > barePeak.height_m)) barePeak = cell;
-      if (!river || cell.discharge > river.discharge) river = cell;
       if (cell.biome !== 'Ice' && cell.water_body_id === 0 && cell.height_m >= 0 && (!coast || cell.height_m < coast.height_m)) coast = cell;
     }
   }
-  if (peak) addDestination('peak', 'Sommet · continent', peak.position ?? peak.direction);
-  if (barePeak) addDestination('relief', 'Relief · sans glace', barePeak.position ?? barePeak.direction);
-  if (coast) addDestination('coast', 'Côte', coast.position ?? coast.direction);
-  if (river && river.discharge > 0) addDestination('river', 'Grande rivière', river.position ?? river.direction);
+  if (peak) addDestination('peak', 'Sommet · continent', peak.position ?? peak.direction, 15000);
+  if (barePeak) addDestination('relief', 'Relief · sans glace', barePeak.position ?? barePeak.direction, 5000);
+  if (coast) addDestination('coast', 'Côte', coast.position ?? coast.direction, 1500);
   lastTile = undefined;
   loadedTiles.clear();
   renderEpoch += 1; tileStream?.reset(renderEpoch);
@@ -104,9 +102,15 @@ function loadWorld(world) {
   $('status').textContent = 'Monde chargé · exploration disponible';
 }
 
-function addDestination(id, label, direction) {
-  destinations.set(id, direction);
-  if (![...$('destination').options].some((option) => option.value === id)) $('destination').add(new Option(label, id));
+function addDestination(id, label, direction, altitude_m = 30000, kind = 'terrain') {
+  if (typeof id !== 'string' || !id || typeof label !== 'string'
+    || !Array.isArray(direction) || direction.length !== 3 || !direction.every(Number.isFinite)
+    || direction.every((value) => value === 0)) return;
+  const altitude = Number.isFinite(altitude_m) && altitude_m > 0 ? altitude_m : 30000;
+  destinations.set(id, { direction, altitude_m: altitude, kind });
+  const option = [...$('destination').options].find((entry) => entry.value === id);
+  if (option) option.textContent = label;
+  else $('destination').add(new Option(label, id));
 }
 
 async function loadOverlays(worldId) {
@@ -114,17 +118,22 @@ async function loadOverlays(worldId) {
     api(`/api/worlds/${worldId}/rivers`).then((data) => {
       if (activeWorld?.id !== worldId) return;
       riverData = JSON.stringify(data); viewer.set_rivers(riverData);
-      const river = data.segments?.filter((s) => s.start_height_m > 80 && s.end_height_m > 20 && s.end_height_m < s.start_height_m)
-        .sort((a, b) => b.discharge_m3_s - a.discharge_m3_s)[0];
-      if (river) addDestination('river', 'Grande rivière', river.start);
-      const valley = data.segments?.filter((s) => s.discharge_m3_s > 1000 && s.end_height_m > 20 && s.start_height_m > s.end_height_m)
-        .sort((a, b) => (b.start_height_m - b.end_height_m) - (a.start_height_m - a.end_height_m))[0];
-      if (valley) addDestination('valley', 'Vallée fluviale', valley.start);
+      // Canonical interior points are verified wet by the server. An atlas cell
+      // or the start of a segment can lie beside the visible, warped channel.
+      for (const place of data.destinations ?? []) {
+        addDestination(place.id, place.label, place.direction, place.altitude_m, 'river');
+      }
     }),
     api(`/api/worlds/${worldId}/lakes`).then((data) => {
       if (activeWorld?.id !== worldId) return;
       const lake = data.lakes?.filter((l) => l.volume_m3 > 0).sort((a, b) => b.area_m2 - a.area_m2)[0];
-      if (lake) addDestination('lake', 'Grand lac', lake.direction);
+      if (lake) addDestination('lake', 'Grand lac', lake.direction, Math.max(1200, Math.min(30000, Math.sqrt(lake.area_m2) * 1.8)), 'lake');
+    }),
+    api(`/api/worlds/${worldId}/landforms`).then((data) => {
+      if (activeWorld?.id !== worldId || (data.world_id && data.world_id !== worldId)) return;
+      for (const place of data.features ?? []) {
+        addDestination(place.id, place.label, place.direction, place.altitude_m, place.kind);
+      }
     }),
   ]);
   for (const result of results) if (result.status === 'rejected') console.warn('Couche indisponible', result.reason);
@@ -195,27 +204,31 @@ function updateDetail() {
   // The viewer orders essential ancestors and visible refinement before
   // future detail. Preserve that order: a finest tile is useless without its
   // resident ancestry. Prediction never modifies the camera/render cut.
-  const essential = info.requests ?? [info];
-  const memoryPressure = info.cpu_bytes >= (info.cpu_budget_bytes ?? Infinity) * 0.8;
+  const ordered = info.requests ?? [info];
+  const critical = new Set(ordered.slice(0, info.essential_count ?? ordered.length).map(keyOf));
+  const memoryPressure = info.cpu_bytes >= (info.cpu_budget_bytes ?? Infinity) * 0.8
+    || info.gpu_bytes >= (info.gpu_budget_bytes ?? Infinity) * 0.8;
   // Coarsening can require an evicted parent above the new target level.
   // Keep every cut-maintenance request even under memory pressure.
-  const requests = [...essential];
+  const requests = [...ordered];
   renderMetrics.forecast_requests = 0;
   const forecast = predictor.sample(info, performance.now(), activeWorld.config.radius_m);
   if (forecast && !memoryPressure && typeof viewer.prediction_requests === 'function') {
     const future = JSON.parse(viewer.prediction_requests(JSON.stringify(forecast.direction), forecast.altitude_m));
     const seen = new Set(requests.map(keyOf));
     let added = 0;
+    const allowance = Math.max(0, 64 - (ordered.length - critical.size));
     for (const tile of future) {
+      if (added >= allowance) break;
       const key = keyOf(tile);
-      if (!seen.has(key) && !loadedTiles.has(key)) { requests.push(tile); seen.add(key); if (++added >= 64) break; }
+      if (!seen.has(key) && !loadedTiles.has(key)) { requests.push(tile); seen.add(key); added += 1; }
     }
     renderMetrics.forecast_requests = added;
   }
   tileStream.update(requests, {
-    epoch: renderEpoch, keyOf, residentKeys: info.resident_keys, radius: activeWorld.config.radius_m,
+    epoch: renderEpoch, keyOf, critical, residentKeys: info.resident_keys, radius: activeWorld.config.radius_m,
     exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
-    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=64&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-7'}`, location.origin).href,
+    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=64&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-9'}`, location.origin).href,
   });
   if (info.level >= 0) {
     $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;
@@ -253,7 +266,26 @@ function visit(direction) {
   message('');
   $('status').textContent = `Arrivée à ${number(altitude)} m au-dessus du terrain`;
 }
-$('fly').addEventListener('click', () => visit(destinations.get($('destination').value)));
+function selectDestination() {
+  const place = destinations.get($('destination').value);
+  $('fly').disabled = !place;
+  if (place) {
+    $('visit-altitude').value = String(Math.min(place.altitude_m, activeWorld.config.radius_m * 7));
+    if (place.kind === 'river') {
+      $('show-rivers').checked = true;
+      viewer.set_overlays(true, false);
+    }
+  }
+}
+$('destination').addEventListener('change', selectDestination);
+$('fly').addEventListener('click', () => {
+  const place = destinations.get($('destination').value);
+  if (place?.kind === 'river') {
+    $('show-rivers').checked = true;
+    viewer.set_overlays(true, false);
+  }
+  visit(place?.direction);
+});
 $('go-altitude').addEventListener('click', () => {
   if (!activeWorld) return;
   visit(JSON.parse(viewer.view_info()).direction);

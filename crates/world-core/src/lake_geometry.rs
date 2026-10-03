@@ -11,10 +11,25 @@ struct Body {
 }
 
 #[derive(Debug)]
+struct Guard {
+    label: u32,
+    cell: usize,
+    radius_m: f64,
+}
+
+const GUARD_HALO_M: f64 = 20_000.0;
+fn guard_key(p: [f64; 3], radius: f64, spacing: f64) -> [i64; 3] {
+    p.map(|v| (v * radius / spacing).floor() as i64)
+}
+
+#[derive(Debug)]
 pub(crate) struct LakeDomains {
     labels: Box<[u32]>,
     bodies: Vec<Body>,
     spill_controls: HashMap<usize, u32>,
+    guards: Vec<Guard>,
+    guard_buckets: HashMap<[i64; 3], Vec<u32>>,
+    guard_spacing_m: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -76,10 +91,58 @@ impl LakeDomains {
             });
             labels[index] = label;
         }
+        // A separate spatial index covers full procedural-object support, even
+        // when a nearby lake falls outside the bounded interpolation stencil.
+        let guard_spacing_m =
+            (2.0 * world.config.radius_m / f64::from(world.config.resolution)).max(16_384.0);
+        let mut guards = Vec::new();
+        for (cell, &label) in labels.iter().enumerate() {
+            if label != 0 {
+                guards.push(Guard {
+                    label,
+                    cell,
+                    radius_m: 1.3 * 0.85 * world.cells[cell].area_m2.sqrt(),
+                });
+            }
+        }
+        let mut controls: Vec<_> = spill_controls.iter().collect();
+        controls.sort_unstable_by_key(|(index, _)| **index);
+        for (&cell, &label) in controls {
+            guards.push(Guard {
+                label,
+                cell,
+                radius_m: 0.8 * world.cells[cell].area_m2.sqrt(),
+            });
+        }
+        let mut guard_buckets: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+        for (i, guard) in guards.iter().enumerate() {
+            let cell = &world.cells[guard.cell];
+            let extent = (guard.radius_m + GUARD_HALO_M) / world.config.radius_m;
+            let lo = guard_key(
+                cell.position.map(|v| v - extent),
+                world.config.radius_m,
+                guard_spacing_m,
+            );
+            let hi = guard_key(
+                cell.position.map(|v| v + extent),
+                world.config.radius_m,
+                guard_spacing_m,
+            );
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        guard_buckets.entry([x, y, z]).or_default().push(i as u32);
+                    }
+                }
+            }
+        }
         Self {
             labels: labels.into_boxed_slice(),
             bodies,
             spill_controls,
+            guards,
+            guard_buckets,
+            guard_spacing_m,
         }
     }
 
@@ -100,6 +163,31 @@ impl LakeDomains {
             (cell.lake && !cell.ocean && id == body.id).then_some(f64::from(cell.water_m))
         }
     }
+}
+
+/// Clearance from the retaining domain and external spill controls in atlas
+/// coordinates. A full-object exclusion can use a conservative metric support;
+/// no camera/LOD or procedural terrain cache is involved.
+pub(crate) fn geographic_clearance(world: &World, q: [f64; 3]) -> f64 {
+    let domains = world
+        .hydraulic_cache
+        .get_or_init(|| Arc::new(LakeDomains::compile(world)));
+    let key = guard_key(q, world.config.radius_m, domains.guard_spacing_m);
+    let Some(indices) = domains.guard_buckets.get(&key) else {
+        return GUARD_HALO_M;
+    };
+    let mut clearance = GUARD_HALO_M;
+    for &i in indices {
+        let guard = &domains.guards[i as usize];
+        let body = &domains.bodies[guard.label as usize - 1];
+        if domains.level(world, body).is_none() {
+            continue;
+        }
+        let delta = std::array::from_fn(|j| q[j] - world.cells[guard.cell].position[j]);
+        clearance =
+            clearance.min(dot(delta, delta).sqrt() * world.config.radius_m - guard.radius_m);
+    }
+    clearance
 }
 
 pub(crate) fn control_level(world: &World, index: usize) -> Option<f64> {
@@ -214,6 +302,28 @@ mod tests {
                 assert!((radius - old).abs() < 1e-12);
             } else {
                 reference = Some(radius);
+            }
+        }
+    }
+
+    #[test]
+    fn procedural_clearance_index_matches_full_spherical_domain_distance() {
+        let (world, index) = single_lake();
+        let center = world.cells[index].position;
+        let east = normalize(cross([0.0, 1.0, 0.0], center));
+        let north = cross(center, east);
+        let body_radius = 1.3 * 0.85 * world.cells[index].area_m2.sqrt();
+        for phi in 0..64 {
+            let theta = phi as f64 * std::f64::consts::TAU / 64.0;
+            for offset in [-1.0, 0.0, 0.001, 1000.0, 2301.0, 19_999.0, 20_001.0] {
+                let chord = body_radius + offset;
+                let angle = 2.0 * (chord / (2.0 * world.config.radius_m)).asin();
+                let p = normalize(std::array::from_fn(|j| {
+                    center[j] * angle.cos()
+                        + (east[j] * theta.cos() + north[j] * theta.sin()) * angle.sin()
+                }));
+                let expected = offset.min(GUARD_HALO_M);
+                assert!((geographic_clearance(&world, p) - expected).abs() < 1e-7);
             }
         }
     }

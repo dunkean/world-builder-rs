@@ -11,6 +11,119 @@ use std::collections::{HashMap, VecDeque};
 
 pub const MIN_RIVER_DISCHARGE_M3_S: f64 = 120.0;
 
+/// An inspection target on actual flowing water, rather than an atlas node or
+/// a display-polyline endpoint that can lie in a lake or outside the wet bed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RiverDestination {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub kind: &'static str,
+    pub direction: [f64; 3],
+    pub altitude_m: f64,
+    pub width_m: f64,
+    pub water_depth_m: f64,
+    pub discharge_m3_s: f64,
+    pub from: usize,
+    pub to: usize,
+}
+
+/// Find visible examples without enlarging the physical rivers. The inspection
+/// altitude resolves their true width on the existing fine terrain/water mesh.
+pub fn exploration_destinations(world: &World) -> Vec<RiverDestination> {
+    let catalogue = world.river_cache.get_or_init(|| compile(world));
+    let mut reaches: Vec<_> = catalogue.iter().flatten().map(Box::as_ref).collect();
+    reaches.sort_by(|a, b| {
+        b.discharge_m3_s
+            .total_cmp(&a.discharge_m3_s)
+            .then(a.from.cmp(&b.from))
+    });
+    let mut destinations = Vec::new();
+    if let Some(destination) = reaches
+        .iter()
+        .take(512)
+        .find_map(|reach| inspection_target(world, reach, "river", "Grande rivière"))
+    {
+        destinations.push(destination);
+    }
+
+    // The old maximum endpoint drop chose the steepest incision. Prefer a
+    // substantial inland river with a moderate longitudinal gradient instead.
+    let mut valleys: Vec<_> = reaches
+        .iter()
+        .copied()
+        .filter(|reach| {
+            let slope = longitudinal_slope(reach);
+            reach.discharge_m3_s >= 600.0
+                && !reach.marine_mouth
+                && !reach.lake_inlet
+                && !reach.lake_outlet
+                && reach.start_level_m - reach.end_level_m > 5.0
+                && (0.001..=0.06).contains(&slope)
+                && destinations
+                    .first()
+                    .is_none_or(|target| target.from != reach.from)
+        })
+        .collect();
+    let score = |reach: &RiverReach| {
+        reach.discharge_m3_s.sqrt() / (1.0 + (longitudinal_slope(reach) / 0.01).ln().abs())
+    };
+    valleys.sort_by(|a, b| score(b).total_cmp(&score(a)).then(a.from.cmp(&b.from)));
+    if let Some(destination) = valleys
+        .iter()
+        .take(512)
+        .find_map(|reach| inspection_target(world, reach, "valley", "Vallée fluviale"))
+    {
+        destinations.push(destination);
+    }
+    destinations
+}
+
+fn longitudinal_slope(reach: &RiverReach) -> f64 {
+    let chord = std::array::from_fn(|axis| reach.end[axis] - reach.start[axis]);
+    let length = dot(chord, chord).sqrt() * reach.radius_m;
+    (reach.start_level_m - reach.end_level_m).max(0.0) / length.max(1.0)
+}
+
+fn inspection_target(
+    world: &World,
+    reach: &RiverReach,
+    id: &'static str,
+    label: &'static str,
+) -> Option<RiverDestination> {
+    for t in [0.55, 0.45, 0.65, 0.35, 0.75, 0.25, 0.85, 0.15] {
+        let direction = reach.position(t);
+        // The explorer clamps pitch to +/-1.55 rad. Do not advertise a point
+        // beyond that navigable cap as if fly_to could centre on its channel.
+        if direction[1].abs() > 1.54_f64.sin() {
+            continue;
+        }
+        let sample = world.sample(direction);
+        let depth = f64::from(sample.water_m) - f64::from(sample.height_m);
+        if sample.ocean
+            || sample.lake
+            || sample.river <= 0.5
+            || depth < 0.10
+            || sample.water_body_id != Some((1_u64 << 52) + reach.from as u64 + 1)
+        {
+            continue;
+        }
+        let width = reach.width(t);
+        return Some(RiverDestination {
+            id,
+            label,
+            kind: "river",
+            direction,
+            altitude_m: (18.0 * width).clamp(600.0, 5000.0),
+            width_m: width,
+            water_depth_m: depth,
+            discharge_m3_s: reach.discharge_m3_s,
+            from: reach.from,
+            to: reach.to,
+        });
+    }
+    None
+}
+
 #[derive(Clone, Debug)]
 pub struct RiverReach {
     pub from: usize,
@@ -929,6 +1042,57 @@ mod tests {
             cell.water_m = 300.0;
         }
         world
+    }
+
+    #[test]
+    fn river_destinations_use_wet_interior_points_and_resolve_the_true_width() {
+        let mut world = synthetic();
+        let previous_radius = world.config.radius_m;
+        world.config.radius_m = 100_000.0;
+        world.config.detail_m = 0.0;
+        world.config.fjord_strength = 0.0;
+        world.config.archipelago_density = 0.0;
+        world.config.regional_lake_density = 0.0;
+        for cell in &mut world.cells {
+            cell.area_m2 *= (world.config.radius_m / previous_radius).powi(2);
+        }
+        let a = cell_index(4, 3, 3, 8);
+        let b = cell_index(4, 4, 3, 8);
+        let c = cell_index(4, 5, 3, 8);
+        for (index, height, discharge, receiver) in [
+            (a, 180.0, 3000.0, Some(b)),
+            (b, 140.0, 4000.0, Some(c)),
+            (c, 100.0, 5000.0, None),
+        ] {
+            world.cells[index].height_m = height;
+            world.cells[index].water_m = height;
+            world.cells[index].discharge = discharge;
+            world.cells[index].receiver = receiver;
+        }
+        // The preview maximum used to be selected without verifying a channel.
+        let dry_maximum = cell_index(0, 3, 3, 8);
+        world.cells[dry_maximum].discharge = 1_000_000.0;
+        world.invalidate_geometry();
+        let destinations = exploration_destinations(&world);
+        assert_eq!(destinations.len(), 2);
+        for destination in destinations {
+            assert_ne!(destination.from, dry_maximum);
+            let sample = world.sample(destination.direction);
+            assert!(!sample.ocean && !sample.lake);
+            assert!(sample.river > 0.5 && sample.water_m - sample.height_m >= 0.1);
+            assert_eq!(
+                sample.water_body_id,
+                Some((1_u64 << 52) + destination.from as u64 + 1)
+            );
+            let reach = world.river_reach(destination.from).unwrap();
+            let (distance, t) = reach.closest(destination.direction);
+            assert!(distance < 0.001 && (0.14..0.86).contains(&t));
+            assert_eq!(
+                destination.altitude_m,
+                (18.0 * destination.width_m).clamp(600.0, 5000.0)
+            );
+            assert!(destination.altitude_m < 30_000.0);
+        }
     }
 
     #[test]

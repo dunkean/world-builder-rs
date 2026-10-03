@@ -53,12 +53,18 @@ export class TileStream {
     if (!this.context) return;
     const queued = new Set([...this.jobs.values()].filter((job) => !job.cancelled && job.epoch === this.epoch).map((job) => job.key));
     for (const tile of this.ready) queued.add(tile.key);
+    const critical = this.context.critical;
+    let speculative = critical ? [...this.jobs.values()].filter((job) => !critical.has(job.key)).length : 0;
     for (const [key, tile] of this.desired) {
       if (this.jobs.size >= 3 || this.ready.length + this.jobs.size >= 6 || this.metrics.ready_bytes >= 48 * 1024 * 1024) break;
       if (this.loaded.has(key) || queued.has(key) || (this.failures.get(key) ?? 0) > Date.now()) continue;
+      // Leave one slot available for a new visible quartet while its future
+      // detail is loading. Camera reprioritization does not cancel useful jobs.
+      if (critical && !critical.has(key) && speculative >= 2) continue;
       const id = ++this.sequence;
       const job = { key, epoch: this.epoch, cancelled: false };
       this.jobs.set(id, job); queued.add(key);
+      if (critical && !critical.has(key)) speculative += 1;
       this.worker.postMessage({ type: 'load', id, key, epoch: this.epoch,
         url: this.context.urlOf(tile), radius: this.context.radius, exaggeration: this.context.exaggeration,
         format: this.context.format });

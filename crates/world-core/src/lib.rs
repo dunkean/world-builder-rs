@@ -6,6 +6,8 @@ pub mod erosion;
 pub mod geometry;
 pub mod hydrology;
 mod lake_geometry;
+pub mod landforms;
+pub mod local_water;
 mod regions;
 pub mod river_geometry;
 mod sampler;
@@ -23,7 +25,7 @@ use std::{
     sync::OnceLock,
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.8.0";
+pub const GENERATOR_VERSION: &str = "prototype-0.9.0";
 
 /// Optional native diagnostic; it never changes the generated data.
 #[derive(Default)]
@@ -69,6 +71,12 @@ pub struct WorldConfig {
     pub coast_detail_ratio: f64,
     /// Smallest wavelength used to displace the canonical coastline, in metres.
     pub coast_reference_spacing_m: f64,
+    /// Intensity of seeded branched glacial inlets in high-latitude provinces.
+    pub fjord_strength: f64,
+    /// Density of seeded coastal island chains and smaller satellite islands.
+    pub archipelago_density: f64,
+    /// Density of small fixed basins and wetlands in glaciated shield provinces.
+    pub regional_lake_density: f64,
     /// Depressions shallower than this are drained before reservoirs are built.
     pub lake_min_basin_depth_m: f64,
     pub axial_tilt_deg: f64,
@@ -95,6 +103,9 @@ impl Default for WorldConfig {
             detail_m: 140.0,
             coast_detail_ratio: 0.30,
             coast_reference_spacing_m: 0.25,
+            fjord_strength: 0.65,
+            archipelago_density: 0.60,
+            regional_lake_density: 0.55,
             lake_min_basin_depth_m: 8.0,
             axial_tilt_deg: 23.4,
             gravity_m_s2: 3.0,
@@ -128,6 +139,14 @@ impl WorldConfig {
         }
         for (name, value, min, max) in [
             ("coast_detail_ratio", self.coast_detail_ratio, 0.0, 1.0),
+            ("fjord_strength", self.fjord_strength, 0.0, 1.0),
+            ("archipelago_density", self.archipelago_density, 0.0, 1.0),
+            (
+                "regional_lake_density",
+                self.regional_lake_density,
+                0.0,
+                1.0,
+            ),
             (
                 "coast_reference_spacing_m",
                 self.coast_reference_spacing_m,
@@ -305,6 +324,10 @@ pub struct World {
     pub river_cache: OnceLock<Vec<Option<Box<river_geometry::RiverReach>>>>,
     #[serde(skip)]
     pub(crate) hydraulic_cache: OnceLock<std::sync::Arc<lake_geometry::LakeDomains>>,
+    #[serde(skip)]
+    pub(crate) landform_cache: OnceLock<std::sync::Arc<landforms::Landforms>>,
+    #[serde(skip)]
+    pub(crate) local_water_cache: OnceLock<std::sync::Arc<local_water::LocalWaterAtlas>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -675,6 +698,29 @@ fn climate(cells: &mut [Cell], config: &WorldConfig) {
     ClimateField::compile(cells, config).apply(cells);
 }
 
+/// Geography uses annual forcing even when a presentation clone contains
+/// seasonal climate. Ordinary worlds retain their stored, authoritative values.
+pub(crate) fn annual_cell_climate(world: &World, cell: &Cell) -> (f64, f64) {
+    if world.seasonal_phase.is_none() {
+        return (f64::from(cell.temperature_c), f64::from(cell.moisture));
+    }
+    let tilt = world.config.axial_tilt_deg.to_radians();
+    let latitude = cell.position[1].asin().abs();
+    let latitude_deg = latitude.to_degrees();
+    let temperature = 30.0
+        + 300.0 * (annual_insolation(latitude, tilt) - annual_insolation(0.0, tilt))
+        - 0.0065 * f64::from(cell.height_m.max(0.0));
+    let equatorial = (-((latitude_deg - 6.0) / 18.0).powi(2)).exp();
+    let temperate = (-((latitude_deg - 52.0) / 17.0).powi(2)).exp();
+    let dryness = (-((latitude_deg - 28.0) / 10.0).powi(2)).exp();
+    let moisture = 0.35 + 0.60 * equatorial + 0.35 * temperate - 0.34 * dryness
+        + 0.22 * fbm(world.config.seed ^ 0x8142, cell.position, 5.0, 3);
+    (
+        f64::from(temperature as f32),
+        f64::from(moisture.clamp(0.01, 1.0) as f32),
+    )
+}
+
 fn classify(cell: &Cell) -> Biome {
     if cell.ocean {
         return Biome::Ocean;
@@ -710,6 +756,8 @@ impl World {
     pub fn invalidate_geometry(&mut self) {
         self.river_cache.take();
         self.hydraulic_cache.take();
+        self.landform_cache.take();
+        self.local_water_cache.take();
     }
 
     pub fn river_reach(&self, index: usize) -> Option<&river_geometry::RiverReach> {
@@ -971,6 +1019,8 @@ impl World {
             erosion,
             river_cache: OnceLock::new(),
             hydraulic_cache: OnceLock::new(),
+            landform_cache: OnceLock::new(),
+            local_water_cache: OnceLock::new(),
         };
         world.validate()?;
         profile.mark("stats_validation");
