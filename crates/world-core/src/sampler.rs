@@ -571,10 +571,37 @@ fn channel_from_reach(
     p: [f64; 3],
     spacing: f64,
 ) -> Option<Channel> {
+    Some(channel_from_projection(
+        reach,
+        river_projection(world, reach, p, spacing)?,
+    ))
+}
+
+/// Geometry stays fixed during longitudinal profile fitting. Keep its expensive
+/// closest-point projection separate from the changing hydraulic stage.
+#[derive(Clone, Copy)]
+pub(crate) struct RiverProjection {
+    distance_m: f64,
+    t: f64,
+    valley_width_m: f64,
+}
+
+pub(crate) fn river_projection(
+    world: &World,
+    reach: &crate::river_geometry::RiverReach,
+    p: [f64; 3],
+    spacing: f64,
+) -> Option<RiverProjection> {
     let cell = &world.cells[reach.from];
     let spacing = cell.area_m2.sqrt().max(spacing * 0.1);
     let widest = reach.width_start_m.max(reach.width_end_m) * 0.5;
-    let valley_width = (widest * 24.0).max(spacing * 0.28).min(spacing * 0.8);
+    // Coarse atlas spacing must not turn every routed edge into a kilometre-wide
+    // canyon. The support follows the actual hydraulic width while preserving
+    // a complete channel, banks and floodplain even for unusually broad rivers.
+    let valley_width = (widest * 6.0 + 30.0)
+        .max(80.0)
+        .min(spacing * 0.35)
+        .max(widest * 5.0 + 20.0);
     let delta = std::array::from_fn::<_, 3, _>(|j| reach.end[j] - reach.start[j]);
     let length2 = dot(delta, delta);
     if length2 <= 1e-24 {
@@ -595,15 +622,31 @@ fn channel_from_reach(
     if distance_m >= valley_width {
         return None;
     }
-    Some(Channel {
+    Some(RiverProjection {
+        distance_m,
+        t,
+        valley_width_m: valley_width,
+    })
+}
+
+fn channel_from_projection(
+    reach: &crate::river_geometry::RiverReach,
+    projection: RiverProjection,
+) -> Channel {
+    let RiverProjection {
+        distance_m,
+        t,
+        valley_width_m,
+    } = projection;
+    Channel {
         distance_m,
         half_width_m: reach.width(t) * 0.5,
-        valley_width_m: valley_width,
+        valley_width_m,
         water_level_m: reach.level(t),
         depth_m: reach.depth(t),
         discharge: reach.discharge_m3_s,
         id: RIVER_ID_BASE + reach.from as u64 + 1,
-    })
+    }
 }
 
 fn carve(candidate: Channel, natural: f64) -> f64 {
@@ -611,6 +654,15 @@ fn carve(candidate: Channel, natural: f64) -> f64 {
     // valley blends back into the natural terrain, with the same C1 kernel
     // during catalogue fitting and actual terrain reconstruction.
     let floodplain = (3.4 * candidate.half_width_m + 7.0).min(candidate.valley_width_m * 0.65);
+    // A shallow alluvial valley retains its full floodplain. Where a coarse
+    // river crosses a much higher reconstructed ridge, flattening that whole
+    // strip creates an artificial canyon and a steep recovery at its border.
+    // Keep the wet section exact, but restore the natural sides over more of
+    // the available dry support instead of carving a deep flat terrace.
+    let dry_span = (candidate.valley_width_m - candidate.half_width_m).max(1.0);
+    let incision = (natural - candidate.water_level_m).max(0.0);
+    let flatness = 1.0 - smooth((incision / (dry_span * 0.6)).clamp(0.0, 1.0));
+    let floodplain = candidate.half_width_m + (floodplain - candidate.half_width_m) * flatness;
     let influence = smooth(
         ((candidate.valley_width_m - candidate.distance_m)
             / (candidate.valley_width_m - floodplain))
@@ -640,20 +692,18 @@ pub(crate) fn river_neighbourhood(world: &World, p: [f64; 3]) -> ([usize; 48], u
 /// cap against its free surface, never its bed: a mutual bed cap would lower
 /// both reaches by another depth on every iteration. No own reach is included
 /// by the caller, and no compiled river-cache is consulted here.
-pub(crate) fn other_river_surface(
-    world: &World,
+pub(crate) fn other_river_surface_from_projection(
     reach: &crate::river_geometry::RiverReach,
-    p: [f64; 3],
+    projection: RiverProjection,
     natural: f64,
-    spacing: f64,
-) -> Option<f64> {
-    let candidate = channel_from_reach(world, reach, p, spacing)?;
+) -> f64 {
+    let candidate = channel_from_projection(reach, projection);
     let surface = carve(candidate, natural);
-    Some(if candidate.distance_m < candidate.half_width_m {
+    if candidate.distance_m < candidate.half_width_m {
         surface.max(candidate.water_level_m)
     } else {
         surface
-    })
+    }
 }
 
 fn land_biome(temperature: f64, moisture: f64) -> Biome {
@@ -1192,6 +1242,30 @@ mod tests {
             assert!((sample.water_m - 160.0).abs() < 0.0001);
             assert!(sample.river > 0.0);
         }
+    }
+
+    #[test]
+    fn coarse_atlas_spacing_does_not_spread_a_small_river_across_the_continent() {
+        let mut world = synthetic();
+        let a = geometry::cell_index(4, 3, 3, 8);
+        let b = geometry::cell_index(4, 4, 3, 8);
+        world.cells[a].receiver = Some(b);
+        world.cells[a].discharge = 1000.0;
+        world.cells[b].discharge = 1000.0;
+        let reach = crate::river_geometry::reach(&world, a).unwrap();
+        let center = reach.position(0.5);
+        let along = normalize(std::array::from_fn(|i| reach.end[i] - reach.start[i]));
+        let across = normalize(geometry::cross(center, along));
+        let at = |distance: f64| {
+            normalize(std::array::from_fn(|i| {
+                center[i] + across[i] * distance / world.config.radius_m
+            }))
+        };
+        let width = reach.width(0.5);
+        let spacing = world.cells[a].area_m2.sqrt();
+        assert!(river_projection(&world, &reach, at(width * 0.49), spacing).is_some());
+        assert!(river_projection(&world, &reach, at(width * 2.0), spacing).is_some());
+        assert!(river_projection(&world, &reach, at(width * 20.0), spacing).is_none());
     }
 
     #[test]

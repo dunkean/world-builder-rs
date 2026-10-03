@@ -60,7 +60,6 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
         if facing < 0.0 { discard; }
         return vec4(v.color.rgb, 1.0);
     }
-    let lod = f32(v.flags / 2u);
     let water = (v.flags & 1u) == 1u;
     let p = normalize(v.normal_height.xyz);
     let a = abs(p);
@@ -75,12 +74,11 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
         if p.z > 0.0 { face = 4u; uv = vec2<f32>(p.x, p.y) / p.z; }
         else { face = 5u; uv = vec2<f32>(-p.x, p.y) / -p.z; }
     }
-    if water && v.fields.w <= 0.01 { discard; }
+    // Keep the actual shoreline even on almost flat beaches. A fixed depth
+    // cutoff shifts it by metres and hides the sea during close zooms.
+    if water && v.fields.w <= 0.0 { discard; }
     if water && v.fields.z < -1.5 && scene.options.z < 0.5 { discard; }
     var color = v.color.rgb;
-    if scene.options.x < 0.5 && lod > 0.0 && scene.options.z > 0.5 {
-        color = mix(color, vec3(0.05, 0.34, 0.44), smoothstep(0.6, 0.9, v.fields.z));
-    }
     let mode = u32(scene.options.x);
     if mode == 1u {
         color = ramp((v.normal_height.w + 2.0) / 8.0, vec3(0.08, 0.20, 0.34), vec3(0.96, 0.91, 0.75));

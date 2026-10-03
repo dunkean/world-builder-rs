@@ -6,14 +6,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   ocean_fraction: 0.58,
   relief_m: 6000,
   detail_m: 140,
-  coast_detail_ratio: 0.16,
-  coast_reference_spacing_m: 1,
+  coast_detail_ratio: 0.30,
+  coast_reference_spacing_m: 0.25,
   lake_min_basin_depth_m: 8,
   axial_tilt_deg: 23.4,
   gravity_m_s2: 3,
   water_volume_m3: null,
-  erosion_steps: 24,
-  geological_years: 2000000,
+  erosion_steps: 8,
+  geological_years: 350000,
   uplift_m_per_year: 0.00015,
   stream_power_k_per_year: 0.000008,
   hillslope_diffusivity_m2_per_year: 0.8,
@@ -21,10 +21,10 @@ export const DEFAULT_CONFIG = Object.freeze({
 });
 
 export const PRESETS = Object.freeze({
-  balanced: { label: 'Équilibré', description: 'Atlas 128, relief de 6 km et 24 étapes d’érosion.', config: {} },
-  preview: { label: 'Essai rapide', description: 'Atlas 64 et 12 étapes : moins de calcul global pour choisir une graine.', config: { resolution: 64, erosion_steps: 12 } },
-  mountains: { label: 'Relief marqué', description: 'Relief de 10 km, davantage de terres et 48 étapes d’érosion.', config: { relief_m: 10000, detail_m: 220, ocean_fraction: 0.45, erosion_steps: 48, uplift_m_per_year: 0.0002 } },
-  oceanic: { label: 'Monde océanique', description: '82 % d’océan visé, relief de 3,5 km et 32 étapes d’érosion.', config: { ocean_fraction: 0.82, relief_m: 3500, detail_m: 90, erosion_steps: 32 } },
+  balanced: { label: 'Équilibré', description: 'Atlas 128, relief de 6 km et 8 étapes sur 350 000 ans.', config: {} },
+  preview: { label: 'Essai rapide', description: 'Atlas 64 et 4 étapes : calcul court pour choisir une graine.', config: { resolution: 64, erosion_steps: 4, geological_years: 200000 } },
+  mountains: { label: 'Relief marqué', description: 'Relief de 10 km, davantage de terres et 12 étapes sur 650 000 ans.', config: { relief_m: 10000, detail_m: 220, ocean_fraction: 0.45, erosion_steps: 12, geological_years: 650000, uplift_m_per_year: 0.0002 } },
+  oceanic: { label: 'Monde océanique', description: '82 % d’océan visé, relief de 3,5 km et 6 étapes sur 250 000 ans.', config: { ocean_fraction: 0.82, relief_m: 3500, detail_m: 90, erosion_steps: 6, geological_years: 250000 } },
 });
 
 const fields = [

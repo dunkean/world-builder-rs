@@ -215,7 +215,7 @@ function updateDetail() {
   tileStream.update(requests, {
     epoch: renderEpoch, keyOf, residentKeys: info.resident_keys, radius: activeWorld.config.radius_m,
     exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
-    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=64&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-6'}`, location.origin).href,
+    urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=64&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-7'}`, location.origin).href,
   });
   if (info.level >= 0) {
     $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;

@@ -6,8 +6,8 @@ test('older and wrapped configuration imports acquire new physical defaults', ()
   const config = normalizeConfig({ config: { seed: 2386084681, resolution: 512 } });
   assert.equal(config.seed, 2386084681);
   assert.equal(config.resolution, 512);
-  assert.equal(config.coast_detail_ratio, 0.16);
-  assert.equal(config.coast_reference_spacing_m, 1);
+  assert.equal(config.coast_detail_ratio, 0.30);
+  assert.equal(config.coast_reference_spacing_m, 0.25);
   assert.equal(config.lake_min_basin_depth_m, 8);
   assert.equal(config.water_volume_m3, null);
   assert.equal(normalizeConfig({ coast_reference_spacing_m: 32 }).coast_reference_spacing_m, 32);

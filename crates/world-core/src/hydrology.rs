@@ -101,14 +101,11 @@ impl PartialOrd for Entry {
     }
 }
 
-pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
+/// Marine membership alone is enough before uplift; avoid building a drainage
+/// graph whose elevations are about to change.
+pub(crate) fn mark_ocean(cells: &mut [Cell], n: u32) {
     for c in cells.iter_mut() {
         c.ocean = false;
-        c.lake = false;
-        c.lake_id = None;
-        c.receiver = None;
-        c.water_m = c.height_m;
-        c.routing_height_m = c.height_m;
     }
     let start = (0..cells.len())
         .min_by(|&a, &b| {
@@ -128,14 +125,22 @@ pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
             }
         }
     }
+}
+
+pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
+    mark_ocean(cells, n);
+    // Flooding touches millions of cells in heap order. Work on compact arrays
+    // instead of repeatedly loading the much larger climate/material Cell.
+    // Traversal order and f32 spill arithmetic remain unchanged.
+    let mut levels: Vec<f32> = cells.iter().map(|c| c.height_m).collect();
+    let mut receivers = vec![usize::MAX; cells.len()];
     let mut visited = vec![false; cells.len()];
     let mut heap = BinaryHeap::new();
     let mut order = Vec::with_capacity(cells.len());
-    for (i, c) in cells.iter_mut().enumerate() {
+    for (i, c) in cells.iter().enumerate() {
         if c.ocean {
             visited[i] = true;
-            c.water_m = 0.0;
-            c.routing_height_m = 0.0;
+            levels[i] = 0.0;
             order.push(i);
         }
     }
@@ -143,10 +148,10 @@ pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
         for j in neighbours8(i, n) {
             if !visited[j] {
                 visited[j] = true;
-                cells[j].receiver = Some(i);
-                cells[j].routing_height_m = cells[j].height_m.max(0.0);
+                receivers[j] = i;
+                levels[j] = levels[j].max(0.0);
                 heap.push(Entry {
-                    level: cells[j].routing_height_m,
+                    level: levels[j],
                     index: j,
                 });
             }
@@ -157,10 +162,10 @@ pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
         for j in neighbours8(index, n) {
             if !visited[j] {
                 visited[j] = true;
-                cells[j].receiver = Some(index);
-                cells[j].routing_height_m = cells[j].height_m.max(level);
+                receivers[j] = index;
+                levels[j] = levels[j].max(level);
                 heap.push(Entry {
-                    level: cells[j].routing_height_m,
+                    level: levels[j],
                     index: j,
                 });
             }
@@ -175,20 +180,27 @@ pub(crate) fn route_potential(cells: &mut [Cell], n: u32) -> Vec<usize> {
         if cells[i].ocean {
             continue;
         }
-        let mut best = cells[i].receiver.unwrap();
+        let mut best = receivers[i];
         let mut slope = f64::NEG_INFINITY;
         for j in neighbours8(i, n) {
             if rank[j] >= rank[i] {
                 continue;
             }
-            let candidate = f64::from(cells[i].routing_height_m - cells[j].routing_height_m)
-                / distance(&cells[i], &cells[j], 1.0).max(1e-15);
+            let candidate =
+                f64::from(levels[i] - levels[j]) / distance(&cells[i], &cells[j], 1.0).max(1e-15);
             if candidate > slope {
                 slope = candidate;
                 best = j;
             }
         }
-        cells[i].receiver = Some(best);
+        receivers[i] = best;
+    }
+    for (i, cell) in cells.iter_mut().enumerate() {
+        cell.lake = false;
+        cell.lake_id = None;
+        cell.receiver = (receivers[i] != usize::MAX).then_some(receivers[i]);
+        cell.water_m = if cell.ocean { 0.0 } else { cell.height_m };
+        cell.routing_height_m = levels[i];
     }
     order
 }
@@ -470,6 +482,39 @@ pub(crate) fn physical_water(cells: &mut [Cell], config: &WorldConfig) -> (Vec<L
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocean_only_pass_keeps_graph_and_excludes_isolated_subsea_pits() {
+        let mut cells = crate::World::generate(WorldConfig {
+            resolution: 8,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap()
+        .cells;
+        for (i, cell) in cells.iter_mut().enumerate() {
+            cell.height_m = 20.0;
+            cell.ocean = true;
+            cell.receiver = Some((i + 1) % 384);
+            cell.lake = true;
+            cell.lake_id = Some(123);
+            cell.water_m = 30.0;
+            cell.routing_height_m = 35.0;
+        }
+        cells[0].height_m = -10.0;
+        cells[1].height_m = -3.0;
+        cells[2].height_m = 0.0;
+        cells[200].height_m = -5.0;
+        mark_ocean(&mut cells, 8);
+        for (i, cell) in cells.iter().enumerate() {
+            assert_eq!(cell.ocean, i <= 2);
+            assert_eq!(cell.receiver, Some((i + 1) % 384));
+            assert!(cell.lake);
+            assert_eq!(cell.lake_id, Some(123));
+            assert_eq!(cell.water_m, 30.0);
+            assert_eq!(cell.routing_height_m, 35.0);
+        }
+    }
 
     #[test]
     fn open_reservoir_exports_its_budget_once_and_keeps_a_real_outgoing_reach() {

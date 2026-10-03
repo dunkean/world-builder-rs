@@ -31,12 +31,12 @@
             </details>
             <details class="settings-section" open><summary>Relief et côtes</summary>
               <div class="field-pair"><div><label for="relief">Amplitude du relief <span>m</span></label><input id="relief" type="number" value="6000" min="10" step="any" required></div><div><label for="detail">Détail du terrain <span>m</span></label><input id="detail" type="number" value="140" min="0" step="any" required></div></div>
-              <label class="slider-label" for="coast-detail">Détail côtier <output id="coast-detail-value">16 %</output></label><input id="coast-detail" type="range" min="0" max="100" step="0.1" value="16">
-              <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="1" min="0.25" max="10000" step="any" required>
+              <label class="slider-label" for="coast-detail">Détail côtier <output id="coast-detail-value">30 %</output></label><input id="coast-detail" type="range" min="0" max="100" step="0.1" value="30">
+              <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="0.25" min="0.25" max="10000" step="any" required>
               <p class="hint">Le détail côtier règle la déformation des côtes. L’échelle minimale reste fixe, quel que soit le zoom.</p>
             </details>
             <details class="settings-section"><summary>Érosion et géologie</summary>
-              <div class="field-pair"><div><label for="erosion-steps">Étapes de calcul</label><input id="erosion-steps" type="number" value="24" min="0" max="256" step="1" required></div><div><label for="geological-years">Durée <span>millions d’années</span></label><input id="geological-years" type="number" value="2" min="0.000001" max="100" step="any" required></div></div>
+              <div class="field-pair"><div><label for="erosion-steps">Étapes de calcul</label><input id="erosion-steps" type="number" value="8" min="0" max="256" step="1" required></div><div><label for="geological-years">Durée <span>millions d’années</span></label><input id="geological-years" type="number" value="0.35" min="0.000001" max="100" step="any" required></div></div>
               <label for="uplift">Soulèvement <span>mm/an</span></label><input id="uplift" type="number" value="0.15" min="0" max="10" step="any" required>
               <label for="stream-power">Coefficient d’incision fluviale <span>10⁻⁶/an</span></label><input id="stream-power" type="number" value="8" min="0" max="10000" step="any" required>
               <label for="diffusivity">Diffusion des versants <span>m²/an</span></label><input id="diffusivity" type="number" value="0.8" min="0" max="1000" step="any" required>
@@ -66,7 +66,7 @@
         <div class="pane-content">
           <label for="layer">Champ visible</label><select id="layer"><option value="0">Biomes et eaux</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage</option></select>
           <label class="slider-label" for="season">Saison <output id="season-value">Moyenne annuelle</output></label><input id="season" type="range" min="0" max="12" value="0" step="1">
-          <label class="checkbox-label"><input id="show-rivers" type="checkbox"> Afficher les rivières</label>
+          <label class="checkbox-label"><input id="show-rivers" type="checkbox" checked> Afficher les rivières</label>
           <label class="slider-label" for="exaggeration">Amplification visuelle du relief <output id="exaggeration-value">×1</output></label><input id="exaggeration" type="range" min="1" max="30" value="1">
           <label class="slider-label" for="view-tilt">Inclinaison de la vue <output id="view-tilt-value">0°</output></label><input id="view-tilt" type="range" min="0" max="35" value="0" step="1">
           <p class="hint">×1 conserve les dimensions physiques. Ces réglages s’appliquent immédiatement.</p>

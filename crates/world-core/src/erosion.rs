@@ -9,7 +9,7 @@
 use crate::{
     geometry::neighbours,
     hydrology::{self, YEAR_SECONDS},
-    Cell, Material, WorldConfig,
+    Cell, ClimateField, GenerationProfile, Material, WorldConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -155,7 +155,12 @@ fn breach_minor_basins(
     generated
 }
 
-pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport {
+pub(crate) fn evolve(
+    cells: &mut [Cell],
+    config: &WorldConfig,
+    climate: &ClimateField,
+) -> ErosionReport {
+    let mut profile = GenerationProfile::new();
     let mut report = ErosionReport {
         steps: config.erosion_steps,
         simulated_years: if config.erosion_steps == 0 {
@@ -169,8 +174,12 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
     let mut bedrock = initial.clone();
     let mut sediment = vec![0.0; cells.len()];
     let dt = config.geological_years / f64::from(config.erosion_steps.max(1));
+    profile.mark("erosion_state");
     for _ in 0..config.erosion_steps {
-        hydrology::route_potential(cells, config.resolution);
+        // Only marine membership is consumed before uplift. The full priority
+        // flood is performed once the new elevations are written below.
+        hydrology::mark_ocean(cells, config.resolution);
+        profile.mark("erosion_ocean");
         for (i, c) in cells.iter().enumerate() {
             if !c.ocean {
                 let uplift = f64::from(c.uplift_m_per_year) * dt;
@@ -179,7 +188,9 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
             }
         }
         write_heights(cells, &bedrock, &sediment);
+        profile.mark("erosion_uplift");
         let mut order = hydrology::route_potential(cells, config.resolution);
+        profile.mark("erosion_route");
         // A minor DEM sink is opened by incision of its spill corridor, not painted
         // as a full lake. Every excavated kilogram enters sediment transport.
         let mut generated = breach_minor_basins(
@@ -190,9 +201,15 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
             &mut sediment,
             &mut report,
         );
-        write_heights(cells, &bedrock, &sediment);
-        order = hydrology::route_potential(cells, config.resolution);
-        crate::climate(cells, config);
+        profile.mark("erosion_breach");
+        // Without an excavated spill corridor neither the graph nor its ranks
+        // changed; another complete priority flood would return the same graph.
+        if generated.iter().any(|mass| *mass > 0.0) {
+            write_heights(cells, &bedrock, &sediment);
+            order = hydrology::route_potential(cells, config.resolution);
+        }
+        climate.apply(cells);
+        profile.mark("erosion_reroute_climate");
         let mut water: Vec<f64> = cells.iter().map(hydrology::local_runoff).collect();
         let mut contributing: Vec<f64> = cells.iter().map(|c| c.area_m2).collect();
         let previous_surface: Vec<f64> = (0..cells.len())
@@ -204,6 +221,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
                 contributing[j] += contributing[i];
             }
         }
+        profile.mark("erosion_accumulate_runoff");
         let mut incision = vec![0.0; cells.len()];
         for &i in &order {
             if cells[i].ocean {
@@ -236,6 +254,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
             }
             generated[i] += remove(i, depth, cells, &mut bedrock, &mut sediment, &mut report);
         }
+        profile.mark("erosion_incise");
         // Incision destabilizes the immediately resolved banks. Material leaves
         // the bank and enters the adjacent stream, rather than reappearing there
         // as a compensating pile. This reduced undercutting closure is conservative
@@ -260,6 +279,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
                 report.bank_mobilized_kg += mass;
             }
         }
+        profile.mark("erosion_banks");
         let mut flux = generated;
         let mut marine_pool = 0.0;
         let mut incoming_ceiling = vec![f64::INFINITY; cells.len()];
@@ -341,6 +361,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
             report.marine_deposited_kg += deposited;
             report.sediment_exported_kg += marine_pool - deposited;
         }
+        profile.mark("erosion_sediment");
         // Pairwise hillslope transfers conserve mass even with unequal cell area
         // and bedrock density. A local cap prevents explicit-step overshoot.
         if config.hillslope_diffusivity_m2_per_year > 0.0 {
@@ -381,6 +402,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
             / report.bedrock_eroded_kg.max(1.0);
         report.max_step_mass_balance_relative_error =
             report.max_step_mass_balance_relative_error.max(residual);
+        profile.mark("erosion_hillslope");
     }
     // Last deposition/diffusion can leave a new sub-resolution one-cell dam.
     // Open these actual spill corridors after the split step, and send every
@@ -420,6 +442,7 @@ pub(crate) fn evolve(cells: &mut [Cell], config: &WorldConfig) -> ErosionReport 
         report.max_height_change_m = report.max_height_change_m.max(change.abs());
     }
     report.rms_height_change_m = (rms / area).sqrt();
+    profile.mark("erosion_finish");
     report
 }
 

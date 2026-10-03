@@ -7,7 +7,7 @@
   "detail_m": 120.0,
   "axial_tilt_deg": 23.5,
   "gravity_m_s2": 3.0,
-  "erosion_steps": 24,
-  "geological_years": 2000000.0,
+  "erosion_steps": 8,
+  "geological_years": 350000.0,
   "lake_fill_years": 25.0
 }

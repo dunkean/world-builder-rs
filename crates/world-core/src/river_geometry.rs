@@ -267,48 +267,110 @@ pub fn compile(world: &World) -> Vec<Option<Box<RiverReach>>> {
 /// Read a complete immutable pass before publishing the next one; native and
 /// WASM therefore use the same arithmetic regardless of thread scheduling.
 fn fit_neighbouring_valleys(world: &World, channels: &mut [Option<Box<RiverReach>>]) {
+    // Forty bytes per actual interaction, instead of retaining every geographic
+    // point or evaluating its fixed terrain/projection on all three passes.
+    struct PreparedCap {
+        projection: crate::sampler::RiverProjection,
+        natural: f64,
+        other: u32,
+        knot: u16,
+    }
     let active: Vec<_> = channels
         .iter()
         .enumerate()
         .filter_map(|(index, reach)| reach.as_ref().map(|_| index))
         .collect();
-    for _ in 0..3 {
-        let fitted = |&index: &usize| {
-            let reach = channels[index].as_ref().unwrap();
-            let old = reach.level_profile.as_deref().unwrap();
-            let mut profile = old.to_vec();
-            let segments = profile.len() - 1;
-            for (j, value) in profile.iter_mut().enumerate().take(segments).skip(1) {
-                let t = j as f64 / segments as f64;
-                let (center, along, _) = reach.derivatives(t);
-                let across = normalize(crate::geometry::cross(center, along));
-                let half_width = reach.width(t) * 0.5 / world.config.radius_m;
-                for side in [-1.0, 0.0, 1.0] {
-                    let point = normalize(std::array::from_fn(|axis| {
-                        center[axis] + side * half_width * across[axis]
-                    }));
-                    let (nearby, count, spacing) =
-                        crate::sampler::river_neighbourhood(world, point);
-                    let mut natural = None;
-                    for &other_index in &nearby[..count] {
-                        if other_index == index {
-                            continue;
-                        }
-                        let Some(other) = channels[other_index].as_deref() else {
-                            continue;
-                        };
-                        let natural = *natural
-                            .get_or_insert_with(|| crate::sampler::natural_height(world, point));
-                        if let Some(cap) = crate::sampler::other_river_surface(
-                            world, other, point, natural, spacing,
-                        ) {
-                            // The downstream endpoint is also the base level
-                            // for this reach; fixed marine/lake planes and all
-                            // shared hydraulic nodes must remain unchanged.
-                            *value = value.min(cap.max(reach.end_level_m));
-                        }
+    let prepare = |&index: &usize| {
+        let reach = channels[index].as_ref().unwrap();
+        let profile = reach.level_profile.as_deref().unwrap();
+        let segments = profile.len() - 1;
+        let mut caps = Vec::new();
+        for (j, &initial) in profile.iter().enumerate().take(segments).skip(1) {
+            let mut value = initial;
+            // Nothing can lower this knot without changing the shared base
+            // level. Flat terminal portions need no neighbourhood queries.
+            if value <= reach.end_level_m {
+                continue;
+            }
+            let t = j as f64 / segments as f64;
+            let (center, along, _) = reach.derivatives(t);
+            let across = normalize(crate::geometry::cross(center, along));
+            let half_width = reach.width(t) * 0.5 / world.config.radius_m;
+            for side in [-1.0, 0.0, 1.0] {
+                let point = normalize(std::array::from_fn(|axis| {
+                    center[axis] + side * half_width * across[axis]
+                }));
+                let (nearby, count, spacing) = crate::sampler::river_neighbourhood(world, point);
+                let mut natural = None;
+                for &other_index in &nearby[..count] {
+                    if other_index == index {
+                        continue;
+                    }
+                    let Some(other) = channels[other_index].as_deref() else {
+                        continue;
+                    };
+                    let natural = *natural
+                        .get_or_insert_with(|| crate::sampler::natural_height(world, point));
+                    // Outside its wet section another bank is at or above
+                    // its downstream level; inside, the cap is its free
+                    // surface. The blended dry valley is therefore bounded
+                    // below by min(natural, end_level), before projection.
+                    if value <= natural.min(other.end_level_m) {
+                        continue;
+                    }
+                    if let Some(projection) =
+                        crate::sampler::river_projection(world, other, point, spacing)
+                    {
+                        let cap = crate::sampler::other_river_surface_from_projection(
+                            other, projection, natural,
+                        );
+                        caps.push(PreparedCap {
+                            projection,
+                            natural,
+                            other: other_index as u32,
+                            knot: j as u16,
+                        });
+                        // Simulating the first pass here also excludes
+                        // interactions that cannot affect any later pass:
+                        // every published knot can only become lower.
+                        value = value.min(cap.max(reach.end_level_m));
                     }
                 }
+            }
+        }
+        (index, caps)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let prepared: Vec<_> = active.par_iter().map(prepare).collect();
+    #[cfg(target_arch = "wasm32")]
+    let prepared: Vec<_> = active.iter().map(prepare).collect();
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("WB_RIVER_CAP_STATS").is_some() {
+        let records: usize = prepared.iter().map(|(_, caps)| caps.len()).sum();
+        let capacity: usize = prepared.iter().map(|(_, caps)| caps.capacity()).sum();
+        eprintln!(
+            "river cap preparation: {} reaches, {records} projections, {:.2} MiB temporary",
+            active.len(),
+            (capacity * std::mem::size_of::<PreparedCap>()) as f64 / (1024.0 * 1024.0)
+        );
+    }
+    for _ in 0..3 {
+        let fitted = |(index, caps): &(usize, Vec<PreparedCap>)| {
+            let reach = channels[*index].as_ref().unwrap();
+            let mut profile = reach.level_profile.as_deref().unwrap().to_vec();
+            let segments = profile.len() - 1;
+            for cap in caps {
+                let knot = usize::from(cap.knot);
+                if profile[knot] <= reach.end_level_m {
+                    continue;
+                }
+                let other = channels[cap.other as usize].as_ref().unwrap();
+                let surface = crate::sampler::other_river_surface_from_projection(
+                    other,
+                    cap.projection,
+                    cap.natural,
+                );
+                profile[knot] = profile[knot].min(surface.max(reach.end_level_m));
             }
             let mut ceiling = reach.start_level_m;
             for value in profile.iter_mut().take(segments).skip(1) {
@@ -317,12 +379,12 @@ fn fit_neighbouring_valleys(world: &World, channels: &mut [Option<Box<RiverReach
             }
             profile[0] = reach.start_level_m;
             profile[segments] = reach.end_level_m;
-            (index, profile.into_boxed_slice())
+            (*index, profile.into_boxed_slice())
         };
         #[cfg(not(target_arch = "wasm32"))]
-        let fitted: Vec<_> = active.par_iter().map(fitted).collect();
+        let fitted: Vec<_> = prepared.par_iter().map(fitted).collect();
         #[cfg(target_arch = "wasm32")]
-        let fitted: Vec<_> = active.iter().map(fitted).collect();
+        let fitted: Vec<_> = prepared.iter().map(fitted).collect();
         for (index, profile) in fitted {
             channels[index].as_mut().unwrap().level_profile = Some(profile);
         }
@@ -868,6 +930,7 @@ mod tests {
         }
         world
     }
+
     #[test]
     fn coast_transport_keeps_hydraulic_nodes_and_confluences_in_the_same_frame() {
         let mut world = synthetic();

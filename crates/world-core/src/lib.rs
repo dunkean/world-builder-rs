@@ -23,7 +23,38 @@ use std::{
     sync::OnceLock,
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.7.0";
+pub const GENERATOR_VERSION: &str = "prototype-0.8.0";
+
+/// Optional native diagnostic; it never changes the generated data.
+#[derive(Default)]
+struct GenerationProfile {
+    #[cfg(not(target_arch = "wasm32"))]
+    last: Option<std::time::Instant>,
+}
+
+impl GenerationProfile {
+    fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return Self {
+                last: std::env::var_os("WB_PROFILE_GENERATION").map(|_| std::time::Instant::now()),
+            };
+        }
+        #[cfg(target_arch = "wasm32")]
+        Self::default()
+    }
+
+    fn mark(&mut self, phase: &str) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(last) = self.last.as_mut() {
+            let elapsed = last.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("generation_phase {phase} {elapsed:.3} ms");
+            *last = std::time::Instant::now();
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = phase;
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -62,14 +93,14 @@ impl Default for WorldConfig {
             ocean_fraction: 0.58,
             relief_m: 6_000.0,
             detail_m: 140.0,
-            coast_detail_ratio: 0.16,
-            coast_reference_spacing_m: 1.0,
+            coast_detail_ratio: 0.30,
+            coast_reference_spacing_m: 0.25,
             lake_min_basin_depth_m: 8.0,
             axial_tilt_deg: 23.4,
             gravity_m_s2: 3.0,
             water_volume_m3: None,
-            erosion_steps: 24,
-            geological_years: 2_000_000.0,
+            erosion_steps: 8,
+            geological_years: 350_000.0,
             uplift_m_per_year: 0.00015,
             stream_power_k_per_year: 0.000008,
             hillslope_diffusivity_m2_per_year: 0.8,
@@ -597,23 +628,51 @@ fn annual_insolation(latitude: f64, tilt: f64) -> f64 {
         / 12.0
 }
 
-fn climate(cells: &mut [Cell], config: &WorldConfig) {
-    let tilt = config.axial_tilt_deg.to_radians();
-    let equator_flux = annual_insolation(0.0, tilt);
-    for cell in cells {
-        let latitude = cell.position[1].asin().abs();
-        let latitude_deg = latitude.to_degrees();
-        let temperature = 30.0 + 300.0 * (annual_insolation(latitude, tilt) - equator_flux)
-            - 0.0065 * f64::from(cell.height_m.max(0.0));
-        // Latitude circulation bands plus spatial variability. No claim of a GCM.
-        let equatorial = (-((latitude_deg - 6.0) / 18.0).powi(2)).exp();
-        let temperate = (-((latitude_deg - 52.0) / 17.0).powi(2)).exp();
-        let dryness = (-((latitude_deg - 28.0) / 10.0).powi(2)).exp();
-        let precipitation = 0.35 + 0.60 * equatorial + 0.35 * temperate - 0.34 * dryness
-            + 0.22 * fbm(config.seed ^ 0x8142, cell.position, 5.0, 3);
-        cell.temperature_c = temperature as f32;
-        cell.moisture = precipitation.clamp(0.01, 1.0) as f32;
+/// Latitude, tilt and seeded precipitation stay fixed while erosion changes
+/// altitude. Keep the unrounded temperature baseline so each application is
+/// identical to evaluating the full climate expression at the new height.
+pub(crate) struct ClimateField {
+    sea_level_temperature_c: Vec<f64>,
+}
+
+impl ClimateField {
+    fn compile(cells: &mut [Cell], config: &WorldConfig) -> Self {
+        let tilt = config.axial_tilt_deg.to_radians();
+        let equator_flux = annual_insolation(0.0, tilt);
+        let sea_level_temperature_c = cells
+            .par_iter_mut()
+            .map(|cell| {
+                let latitude = cell.position[1].asin().abs();
+                let latitude_deg = latitude.to_degrees();
+                let temperature = 30.0 + 300.0 * (annual_insolation(latitude, tilt) - equator_flux);
+                // Latitude circulation bands plus spatial variability; not a GCM.
+                let equatorial = (-((latitude_deg - 6.0) / 18.0).powi(2)).exp();
+                let temperate = (-((latitude_deg - 52.0) / 17.0).powi(2)).exp();
+                let dryness = (-((latitude_deg - 28.0) / 10.0).powi(2)).exp();
+                let precipitation = 0.35 + 0.60 * equatorial + 0.35 * temperate - 0.34 * dryness
+                    + 0.22 * fbm(config.seed ^ 0x8142, cell.position, 5.0, 3);
+                cell.moisture = precipitation.clamp(0.01, 1.0) as f32;
+                temperature
+            })
+            .collect();
+        Self {
+            sea_level_temperature_c,
+        }
     }
+
+    pub(crate) fn apply(&self, cells: &mut [Cell]) {
+        cells
+            .par_iter_mut()
+            .zip(&self.sea_level_temperature_c)
+            .for_each(|(cell, &temperature)| {
+                cell.temperature_c =
+                    (temperature - 0.0065 * f64::from(cell.height_m.max(0.0))) as f32;
+            });
+    }
+}
+
+fn climate(cells: &mut [Cell], config: &WorldConfig) {
+    ClimateField::compile(cells, config).apply(cells);
 }
 
 fn classify(cell: &Cell) -> Biome {
@@ -764,6 +823,7 @@ impl World {
     }
 
     pub fn generate(config: WorldConfig) -> Result<Self> {
+        let mut profile = GenerationProfile::new();
         config.validate()?;
         let fingerprint = serde_json::to_vec(&config).context("serialize world config")?;
         let mut hasher = blake3::Hasher::new();
@@ -821,25 +881,31 @@ impl World {
                 }
             })
             .collect();
+        profile.mark("initial_terrain");
         let mut sea_level_m = choose_sea_level(&cells, &config);
         for cell in &mut cells {
             cell.height_m -= sea_level_m;
             cell.bedrock_m = cell.height_m;
         }
-        hydrology::route_potential(&mut cells, n);
-        climate(&mut cells, &config);
-        let mut erosion = erosion::evolve(&mut cells, &config);
+        profile.mark("initial_sea_level");
+        let climate_field = ClimateField::compile(&mut cells, &config);
+        profile.mark("initial_climate");
+        let mut erosion = erosion::evolve(&mut cells, &config, &climate_field);
+        profile.mark("erosion");
         let datum_shift = choose_sea_level(&cells, &config);
         sea_level_m += datum_shift;
         for cell in &mut cells {
             cell.height_m -= datum_shift;
             cell.bedrock_m -= datum_shift;
         }
+        profile.mark("final_sea_level");
         erosion::finish_minor_basins(&mut cells, &config, &mut erosion);
-        hydrology::route_potential(&mut cells, n);
-        climate(&mut cells, &config);
+        profile.mark("finish_minor_basins");
+        climate_field.apply(&mut cells);
+        profile.mark("final_climate");
         let (lakes, total_runoff, outlet_discharge) =
             hydrology::physical_water(&mut cells, &config);
+        profile.mark("physical_water");
         let lake_evaporation: f64 = lakes.iter().map(|l| l.evaporation_m3_s).sum();
         let lake_infiltration: f64 = lakes.iter().map(|l| l.infiltration_m3_s).sum();
         let lake_storage_change: f64 = lakes.iter().map(|l| l.storage_change_m3_s).sum();
@@ -907,6 +973,7 @@ impl World {
             hydraulic_cache: OnceLock::new(),
         };
         world.validate()?;
+        profile.mark("stats_validation");
         Ok(world)
     }
 
@@ -1053,6 +1120,34 @@ mod tests {
             ..Default::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn cached_climate_keeps_exact_analytic_values_after_height_changes() {
+        let config = WorldConfig {
+            resolution: 8,
+            erosion_steps: 0,
+            ..Default::default()
+        };
+        let mut cells = World::generate(config.clone()).unwrap().cells;
+        let field = ClimateField::compile(&mut cells, &config);
+        let moisture: Vec<_> = cells.iter().map(|c| c.moisture.to_bits()).collect();
+        let tilt = config.axial_tilt_deg.to_radians();
+        let equator_flux = annual_insolation(0.0, tilt);
+        for height_offset in [-20_000.0, 350.25, 10_000.0] {
+            for (i, cell) in cells.iter_mut().enumerate() {
+                cell.height_m = height_offset + i as f32 * 0.25;
+            }
+            field.apply(&mut cells);
+            for (i, cell) in cells.iter().enumerate() {
+                let latitude = cell.position[1].asin().abs();
+                let expected = (30.0 + 300.0 * (annual_insolation(latitude, tilt) - equator_flux)
+                    - 0.0065 * f64::from(cell.height_m.max(0.0)))
+                    as f32;
+                assert_eq!(cell.temperature_c.to_bits(), expected.to_bits());
+                assert_eq!(cell.moisture.to_bits(), moisture[i]);
+            }
+        }
     }
 
     #[test]
@@ -1204,6 +1299,7 @@ mod tests {
         })
         .unwrap();
         let mut max_jump = 0.0f32;
+        let mut max_case = None;
         let mut checked = 0;
         for river in world.rivers().into_iter().take(1000) {
             assert!(river.end_height_m <= river.start_height_m + 0.002);
@@ -1228,15 +1324,40 @@ mod tests {
                 };
                 let before = world.sample(point(bank_angle - offset));
                 let after = world.sample(point(bank_angle + offset));
-                max_jump = max_jump.max((before.height_m - after.height_m).abs());
                 assert!((before.biome_mix.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+                let jump = (before.height_m - after.height_m).abs();
+                if jump > max_jump {
+                    max_jump = jump;
+                    max_case = Some((river.from, river.to, point(bank_angle), before, after));
+                }
                 checked += 1;
             }
         }
         assert!(checked > 100);
+        if max_jump >= 1.0 {
+            let (_, _, center, before, after) = max_case.as_ref().unwrap();
+            let tangent = normalize(std::array::from_fn(|i| {
+                after.direction[i] - before.direction[i]
+            }));
+            let mut natural = world.clone();
+            for cell in &mut natural.cells {
+                cell.receiver = None;
+            }
+            natural.invalidate_geometry();
+            for span in [0.2, 0.02, 0.002, 0.0002] {
+                let offset = span * 0.5 / world.config.radius_m;
+                let left = normalize(std::array::from_fn(|i| center[i] - tangent[i] * offset));
+                let right = normalize(std::array::from_fn(|i| center[i] + tangent[i] * offset));
+                eprintln!(
+                    "bank_span {span}m carved_difference {}m natural_difference {}m",
+                    (world.sample(left).height_m - world.sample(right).height_m).abs(),
+                    (natural.sample(left).height_m - natural.sample(right).height_m).abs()
+                );
+            }
+        }
         assert!(
             max_jump < 1.0,
-            "fine river bank jumped {max_jump}m over 20cm"
+            "fine river bank jumped {max_jump}m over 20cm: {max_case:?}"
         );
     }
 

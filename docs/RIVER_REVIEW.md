@@ -65,7 +65,7 @@ marins restent prioritaires. Ce mélange est une reconstruction géométrique
 bornée, pas un solveur hydraulique de confluence. Le couplage des profils est
 compilé une fois par monde, pas à chaque tuile ou déplacement.
 
-## Validation de cette révision
+## Validation historique de la révision 0.7
 
 Atlas `32ede09abc580c1b3049`, graine **2386084681**, résolution **512² par face**,
 coupure côtière de 1 m ; mesures du programme CPU `quality_probe` :
@@ -103,6 +103,61 @@ une limite de l'approximation aux contacts avec les berges voisines ; le
 catalogue conserve ses contrôles nodaux, mais son niveau isolé ne certifie pas
 le niveau de chaque point de la surface mélangée.
 
+## Catalogue et incision de la révision 0.8
+
+Les trois passes réutilisent désormais les projections courbes et le terrain
+fixe, préparés une seule fois. Les nœuds déjà au niveau aval et les interactions
+incapables de les abaisser sont exclus avant les calculs coûteux. La préparation
+de l'ancien atlas 512 conserve 55 120 interactions dans 3,00 Mio temporaires,
+libérés après compilation. Le catalogue a été mesuré à 1,41 s sur cet atlas,
+contre 5,43 s pour les passes antérieures et 9,87 s pendant des builds concurrents.
+Les profils, leurs nœuds et les contrôles restent partagés.
+
+Le support d'une vallée suit maintenant la largeur du chenal :
+`max(80 m, 6 × demi-largeur + 30 m)`, limité à 0,35 fois le pas atlas,
+avec un minimum de `5 × demi-largeur + 20 m` pour conserver la section.
+La grille grossière n'impose plus à chaque petit cours d'eau une vallée
+de plusieurs kilomètres. Les vallées peu incisées gardent leur plaine
+alluviale ; lorsque le terrain reconstruit est beaucoup plus haut que le
+profil, le versant retrouve progressivement le terrain naturel sur une
+plus grande partie du support sec. Le chenal mouillé reste exact. Cette
+adaptation évite les terrasses profondes et leurs parois à la sortie du fondu.
+
+Le test de continuité des berges conserve sa borne de 1 m sur 20 cm ; les
+19 régressions de profil et d'embouchure passent aussi. La réduction du
+support possède une régression sur un petit cours d'eau dans un atlas
+très grossier. Les mesures de la section précédente restent historiques :
+les nouvelles torsions côtières et les nouveaux paramètres d'érosion
+nécessitent un atlas 0.8 pour évaluer la génération par défaut.
+
+Le nouvel atlas **`79eda9537bcefc9fb77d`**, graine 2386084681, utilise 512²
+cellules par face, 8 étapes d'érosion sur 350 000 ans et une coupure côtière
+de 0,25 m. La génération `World::generate` est mesurée à environ 20,12 s ;
+la commande complète `worldctl`, incluant validation, sérialisation,
+écriture atomique et checksum, prend 24,98 s. Le catalogue contient
+9 847 tronçons et prépare 56 536 projections dans 3,06 Mio temporaires ;
+sa compilation froide prend 2,79 s pendant la validation navigateur, avec
+d'autres tâches concurrentes.
+
+| Contrôle du nouvel atlas 0.8 | Résultat |
+| --- | ---: |
+| Centres sur les 512 grands tronçons | 15 872 |
+| Profondeur fluviale maximale | 2,3930 m |
+| Profil à plus de 10 m au-dessus du terrain naturel | 0 |
+| Écart positif maximal profil/terrain naturel | 0,8376 m |
+| Voisinages avec différence catalogue/champ mélangé | 20 |
+| Positions / interfaces localisées dans ces voisinages | 57 960 / 996 |
+| Maximum sol / eau sur les interfaces | 0,610 mm / 0,122 mm |
+| Sauts supérieurs à 10 cm | 0 |
+| Interfaces près des lacs / paires mouillées | 12 067 / 3 |
+| Différence d'eau aux interfaces lacustres | 0 à la précision f32 |
+
+Les 20 différences catalogue/champ mélangé sont au même propriétaire ;
+leur maximum baisse à 0,523 m. Elles restent une limite de la reconstruction
+géométrique, sans prouver la monotonie du champ composite. Les 1 200 points
+partagés des deux parcours L0→L24 restent identiques. Ces relevés concernent
+ce monde, pas tous les terrains ou toutes les graines.
+
 ## Revue indépendante et reproduction
 
 La [revue CLI Opus 5.5](REVIEWS/OPUS_RIVER_PROFILE_2026-10-03.md) a réellement
@@ -122,12 +177,15 @@ nécessiterait aussi de revoir la connectivité hydraulique.
 
 ```sh
 cargo test -p world-core
-cargo run --release -p world-core --example quality_probe -- data/worlds/32ede09abc580c1b3049/atlas.json --overlap-reference=examples/overlap-regression-2386084681.json
+cargo run --release -p world-core --example quality_probe -- data/worlds/79eda9537bcefc9fb77d/atlas.json
 ```
 
 La [fixture des dix voisinages](../examples/overlap-regression-2386084681.json)
 conserve leurs coordonnées et la configuration ; ses indices ne s'appliquent
-qu'à cet atlas 512². La validation finale comprend 144 tests Rust et 18 tests
+qu'à l'ancien atlas 0.7. Pour rejouer ce diagnostic historique, utiliser
+son fichier `32ede09abc580c1b3049/atlas.json` et ajouter
+`--overlap-reference=examples/overlap-regression-2386084681.json`.
+La validation 0.7 comprenait 144 tests Rust et 18 tests
 JavaScript, les compilations native et WASM, et un contrôle du navigateur sur
 RTX 3090. Les parois observées aux confluences ciblées disparaissent :
 [avant](screenshots/confluence-before-0.7.png),

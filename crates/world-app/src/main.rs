@@ -26,7 +26,7 @@ mod preview;
 mod regions;
 
 // Render-field revision changes tile caches without rewriting physical atlases.
-const SURFACE_REVISION: &str = "spherical-coast-6";
+const SURFACE_REVISION: &str = "spherical-coast-7";
 
 #[derive(Parser)]
 #[command(

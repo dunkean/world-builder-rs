@@ -20,7 +20,9 @@ CUDA requiert le pilote NVIDIA et NVRTC, fourni par le CUDA Toolkit. Le script L
 
 Le panneau Génération expose tous les paramètres : planète, relief, détail côtier, érosion, océans, profondeur minimale des bassins et climat. Les préréglages et l’import/export JSON conservent la graine ; un indicateur distingue les réglages modifiés de ceux du monde chargé. Commencer avec un atlas 64 ou 128 par face. L'API accepte jusqu'à 1024, avec un coût CPU, RAM et stockage croissant. Le maillage d'aperçu reste plafonné à 128 par face, indépendamment de l'atlas physique.
 
-Faire glisser pour tourner, utiliser la molette pour descendre ou « Aller à… » pour rejoindre un relief sans glace, une côte, un lac, une rivière ou une vallée fluviale. Incliner la vue jusqu’à 35° pour observer les pentes. Les saisons actualisent climat et biomes simplifiés ; les débits restent annuels. La couche rivières peut être activée dans l’onglet Vue. Villes et routes sont retirées de cette interface pour concentrer le prototype sur la planète. Le relief ×1 garde ses dimensions physiques.
+Faire glisser pour tourner, utiliser la molette pour descendre ou « Aller à… » pour rejoindre un relief sans glace, une côte, un lac, une rivière ou une vallée fluviale. Incliner la vue jusqu’à 35° pour observer les pentes. Les saisons actualisent climat et biomes simplifiés ; les débits restent annuels. La couche rivières est activée par défaut et se règle dans l’onglet Vue. Villes et routes sont retirées de cette interface pour concentrer le prototype sur la planète. Le relief ×1 garde ses dimensions physiques.
+
+Les réglages par défaut utilisent **8 étapes sur 350 000 ans**, un détail côtier de **30 %** et une échelle minimale de **0,25 m**. Augmenter la durée géologique augmente l’incision ; augmenter le nombre d’étapes augmente aussi le coût. Le préréglage « Essai rapide » utilise un atlas 64 et quatre étapes.
 
 Relief et côtes combinent un atlas évolué par érosion et des bandes fractales adressées par position globale. L’exploration utilise `generator=coherent` : le globe orbital et toutes les tuiles évaluent le même champ, sans activation d’une nouvelle région érodée au zoom. Le raffinement révèle des sommets intermédiaires ; il ne change pas les sommets communs. Le générateur régional `spatial` reste accessible par API pour les expériences ultérieures. Le déplacement horizontal de la côte est calculé une fois par position, avec une échelle minimale configurable ; le détail vertical ne change pas son signe terre/mer. La protection du détail autour des lacs varie continûment, sans marche carrée au bord des cellules. Les lacs ont un niveau horizontal et un budget d’eau ; les dépressions peu profondes sont drainées géométriquement pendant la génération.
 
@@ -38,6 +40,7 @@ cargo run --release -p world-app -- serve --port 8001
 cargo test --workspace
 node --test web/*.test.mjs
 cargo run --release -p world-core --example benchmark -- 128 1337
+cargo run --release -p world-core --example generation_benchmark -- 512 2386084681
 ./scripts/build-web.sh
 ```
 
@@ -65,6 +68,8 @@ Les atlas, régions et checksums vivent dans `data/worlds/<id>/`. Les régions c
 
 ## Portée
 
-La version 0.7 améliore les vallées globales, les lacs, la continuité et les réglages. Pour la graine `2386084681`, atlas 512² × 6, 25 étapes : **115,7 s** sur cette machine, **284 lacs** contre 1 109 auparavant. Les relevés et limites sont dans [la comparaison avec Burgmap](docs/QUALITY_REFERENCE.md), [la validation de l’érosion](docs/EROSION_VALIDATION.md) et [l’audit Sonnet](docs/AUDIT_BUGS_PERFORMANCE.md). Les [mesures de navigation](docs/PERFORMANCE_0_7.md) détaillent mémoire, cache et attente du raffinement ; la [revue des lacs](docs/LAKE_REVIEW.md) explique leurs contraintes de reconstruction. Le terrain local de `city_generator` évolue à environ 64 m ; notre atlas 512 a un espacement moyen de 4,91 km. Le maillage fin ne remplace pas encore cette simulation locale.
+La version **0.8** réduit l’érosion par défaut et accélère la préparation. Pour la graine `2386084681`, atlas **512² × 6** : **20,12 s de génération**, **24,98 s avec validation et sauvegarde**, contre 103,76 s de génération avec les anciens paramètres. Le changement d’altitude RMS baisse de **980,54 à 284,84 m**. Ces gains combinent optimisations du calcul et durée géologique réduite ; la résolution de l’atlas reste identique. Les [mesures 0.8](docs/PERFORMANCE_0_8.md), la [revue côtière](docs/COAST_REVIEW.md) et le [rapport des rivières](docs/RIVER_REVIEW.md) donnent les contrôles et leurs limites.
+
+La [comparaison avec Burgmap](docs/QUALITY_REFERENCE.md), la [validation de l’érosion 0.7](docs/EROSION_VALIDATION.md) et l’[audit Sonnet](docs/AUDIT_BUGS_PERFORMANCE.md) conservent les relevés antérieurs. La [revue des lacs](docs/LAKE_REVIEW.md) explique leurs contraintes de reconstruction. Le terrain local de `city_generator` évolue à environ 64 m ; notre atlas 512 a un espacement moyen de 4,91 km. Le maillage fin ne remplace pas encore cette simulation locale.
 
 L'[architecture de recherche](docs/DESIGN_MONDE_MULTIECHELLE.md) dépasse les capacités actuelles. Les bilans sont mesurables, mais lois et coefficients restent simplifiés. L'érosion régionale simule une pluie finie ; son horloge n'est pas calibrée sur l'histoire géologique. Climat paramétrique, réservoirs sans hiérarchie Fill–Spill–Merge complète et absence de restriction conservatrice exacte entre niveaux restent des limites explicites. Le mode natif et le modèle appris ne sont pas implémentés.
