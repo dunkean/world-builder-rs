@@ -5,7 +5,11 @@ use crate::{
     random, World,
 };
 use serde::Serialize;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FeatureDestination {
@@ -63,8 +67,75 @@ impl Frame {
 struct Trough {
     a: [f64; 2],
     b: [f64; 2],
+    control_a: [f64; 2],
+    control_b: [f64; 2],
     width: f64,
     floor: f64,
+}
+impl Trough {
+    fn point(&self, t: f64) -> [f64; 2] {
+        let u = 1.0 - t;
+        std::array::from_fn(|i| {
+            u * u * u * self.a[i]
+                + 3.0 * u * u * t * self.control_a[i]
+                + 3.0 * u * t * t * self.control_b[i]
+                + t * t * t * self.b[i]
+        })
+    }
+    fn controls(&self) -> [[f64; 2]; 4] {
+        [self.a, self.control_a, self.control_b, self.b]
+    }
+    fn distance(&self, p: [f64; 2]) -> f64 {
+        let chord = [self.b[0] - self.a[0], self.b[1] - self.a[1]];
+        let mut t = ((p[0] - self.a[0]) * chord[0] + (p[1] - self.a[1]) * chord[1])
+            / (chord[0] * chord[0] + chord[1] * chord[1]).max(1.0);
+        t = t.clamp(0.0, 1.0);
+        for _ in 0..6 {
+            let u = 1.0 - t;
+            let at = self.point(t);
+            let first = std::array::from_fn::<_, 2, _>(|i| {
+                3.0 * (u * u * (self.control_a[i] - self.a[i])
+                    + 2.0 * u * t * (self.control_b[i] - self.control_a[i])
+                    + t * t * (self.b[i] - self.control_b[i]))
+            });
+            let second = std::array::from_fn::<_, 2, _>(|i| {
+                6.0 * (u * (self.control_b[i] - 2.0 * self.control_a[i] + self.a[i])
+                    + t * (self.b[i] - 2.0 * self.control_b[i] + self.control_a[i]))
+            });
+            let delta = [at[0] - p[0], at[1] - p[1]];
+            let denominator = first[0] * first[0]
+                + first[1] * first[1]
+                + delta[0] * second[0]
+                + delta[1] * second[1];
+            if denominator.abs() < 1e-9 {
+                break;
+            }
+            t = (t - (delta[0] * first[0] + delta[1] * first[1]) / denominator).clamp(0.0, 1.0);
+        }
+        [self.point(t), self.a, self.b]
+            .iter()
+            .map(|at| (at[0] - p[0]).hypot(at[1] - p[1]))
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+fn curved_troughs(points: &[[f64; 2]], width: f64, floor: f64) -> Vec<Trough> {
+    (0..points.len().saturating_sub(1))
+        .map(|i| {
+            let before = points[i.saturating_sub(1)];
+            let after = points[(i + 2).min(points.len() - 1)];
+            let a = points[i];
+            let b = points[i + 1];
+            Trough {
+                a,
+                b,
+                control_a: std::array::from_fn(|k| a[k] + (b[k] - before[k]) / 6.0),
+                control_b: std::array::from_fn(|k| b[k] - (after[k] - a[k]) / 6.0),
+                width,
+                floor,
+            }
+        })
+        .collect()
 }
 #[derive(Debug)]
 struct Island {
@@ -94,6 +165,7 @@ struct District {
 pub(crate) struct Landforms {
     districts: Vec<District>,
     buckets: HashMap<[i16; 3], Vec<usize>>,
+    islands: IslandField,
 }
 const BUCKET: f64 = 0.08;
 fn bucket(p: [f64; 3]) -> [i16; 3] {
@@ -112,12 +184,426 @@ fn distance(a: [f64; 3], b: [f64; 3], r: f64) -> f64 {
         * r
 }
 
-fn safe_trough(world: &World, frame: &Frame, a: [f64; 2], b: [f64; 2], width: f64) -> bool {
-    let midpoint = frame.point((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
+fn safe_trough(world: &World, frame: &Frame, trough: &Trough) -> bool {
+    let midpoint = [
+        (trough.a[0] + trough.b[0]) * 0.5,
+        (trough.a[1] + trough.b[1]) * 0.5,
+    ];
     // Gnomonic projection contracts chord lengths. Clearance is 1-Lipschitz,
-    // so the complete capsule stays outside physical reservoirs and controls.
-    let support = (b[0] - a[0]).hypot(b[1] - a[1]) * 0.5 + width + 3_000.0;
-    crate::lake_geometry::geographic_clearance(world, midpoint) > support
+    // so a disc around the complete Bezier control hull protects its full U valley.
+    let support = trough
+        .controls()
+        .iter()
+        .map(|p| (p[0] - midpoint[0]).hypot(p[1] - midpoint[1]))
+        .fold(0.0, f64::max)
+        + trough.width
+        + 3_000.0;
+    crate::lake_geometry::geographic_clearance(world, frame.point(midpoint[0], midpoint[1]))
+        > support
+}
+
+const ISLAND_SUPPORT: f64 = 2.2;
+const ISLAND_CACHE_BUCKETS: usize = 512;
+const ISLAND_FRONT_BUCKETS: usize = 8;
+
+/// Cover the entire object, including the 3 km feature fade. Clearance saturates
+/// at 20 km; subdividing large footprints preserves the same Lipschitz proof.
+fn safe_island(world: &World, frame: &Frame, island: &Island) -> bool {
+    let support = ISLAND_SUPPORT * island.long;
+    let center = frame.point(island.at[0], island.at[1]);
+    if support + 3_000.0 < 20_000.0 {
+        return crate::lake_geometry::geographic_clearance(world, center) > support + 3_000.0;
+    }
+    let step = 18_000.0;
+    let covering_radius = step * 0.5 * 2.0_f64.sqrt();
+    let rings = (support / step + 0.5).ceil() as i32;
+    for y in -rings..=rings {
+        for x in -rings..=rings {
+            let offset = [f64::from(x) * step, f64::from(y) * step];
+            if offset[0].hypot(offset[1]) > support + covering_radius {
+                continue;
+            }
+            let p = frame.point(island.at[0] + offset[0], island.at[1] + offset[1]);
+            if crate::lake_geometry::geographic_clearance(world, p) <= covering_radius + 3_000.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn island_height(world: &World, q: [f64; 3], x: f64, y: f64, natural: f64, island: &Island) -> f64 {
+    let dx = x - island.at[0];
+    let dy = y - island.at[1];
+    if dx.abs() > island.long * ISLAND_SUPPORT || dy.abs() > island.long * ISLAND_SUPPORT {
+        return natural;
+    }
+    let (s, c) = island.angle.sin_cos();
+    let u = (dx * c + dy * s) / island.long;
+    let v = (-dx * s + dy * c) / island.short;
+    let angle = v.atan2(u);
+    let phase = random(island.seed) * std::f64::consts::TAU;
+    let outline = 1.0
+        + 0.16 * (3.0 * angle + phase).sin()
+        + 0.11 * (5.0 * angle + random(island.seed ^ 0x937) * std::f64::consts::TAU).sin()
+        + 0.065 * (11.0 * angle - phase * 2.0).sin()
+        + 0.04 * (23.0 * angle + phase * 3.0).sin();
+    let radial = u.hypot(v) / outline;
+    if radial >= 1.55 {
+        return natural;
+    }
+    let support = 1.0 - smooth((radial - 1.0) / 0.55);
+    let texture =
+        1.0 + 0.25 * crate::noise(island.seed, q, world.config.radius_m / island.short * 4.0);
+    let flank = island.peak.abs().max(island.short * 0.25).max(1.0);
+    let target = (island.peak - flank * radial * radial) * texture;
+    natural.max(natural + (target - natural) * support)
+}
+
+#[derive(Debug)]
+struct FieldIsland {
+    frame: Frame,
+    shape: Island,
+}
+
+#[derive(Debug)]
+struct IslandLevel {
+    basis: [[f64; 3]; 3],
+    max_radius: f64,
+    spacing: f64,
+    probability: f64,
+    max_height: f64,
+}
+impl IslandLevel {
+    fn key(&self, world: &World, q: [f64; 3]) -> [i64; 3] {
+        self.basis
+            .map(|axis| (dot(axis, q) * world.config.radius_m / self.spacing).floor() as i64)
+    }
+    fn direction(&self, p: [f64; 3]) -> [f64; 3] {
+        normalize(std::array::from_fn(|i| {
+            p[0] * self.basis[0][i] + p[1] * self.basis[1][i] + p[2] * self.basis[2][i]
+        }))
+    }
+}
+
+#[derive(Debug, Default)]
+struct IslandBuckets {
+    entries: HashMap<[i64; 3], Arc<[FieldIsland]>>,
+    order: VecDeque<[i64; 3]>,
+}
+
+#[derive(Debug, Default)]
+struct IslandField {
+    levels: Vec<IslandLevel>,
+    buckets: Mutex<Vec<IslandBuckets>>,
+}
+
+struct IslandFront {
+    // Owning the catalogue prevents a dropped world's allocation address from
+    // being reused while this thread still holds its cached feature buckets.
+    owner: Option<Arc<Landforms>>,
+    bands: Vec<VecDeque<([i64; 3], Arc<[FieldIsland]>)>>,
+}
+thread_local! {
+    static ISLAND_FRONT: RefCell<IslandFront> = const { RefCell::new(IslandFront {
+        owner: None,
+        bands: Vec::new(),
+    }) };
+}
+
+fn remember_island_bucket(
+    owner: &Arc<Landforms>,
+    level: usize,
+    key: [i64; 3],
+    value: Arc<[FieldIsland]>,
+) {
+    ISLAND_FRONT.with(|front| {
+        let mut front = front.borrow_mut();
+        if !front
+            .owner
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, owner))
+        {
+            front.owner = Some(owner.clone());
+            front.bands = (0..owner.islands.levels.len())
+                .map(|_| VecDeque::new())
+                .collect();
+        }
+        let band = &mut front.bands[level];
+        if band.len() >= ISLAND_FRONT_BUCKETS {
+            band.pop_front();
+        }
+        band.push_back((key, value));
+    });
+}
+
+fn island_seed(seed: u64, level: usize, key: [i64; 3]) -> u64 {
+    seed ^ 0x151a_d5ea
+        ^ (level as u64).wrapping_mul(0x9e3779b97f4a7c15)
+        ^ (key[0] as u64).wrapping_mul(0x8da6b343)
+        ^ (key[1] as u64).wrapping_mul(0xd8163841)
+        ^ (key[2] as u64).wrapping_mul(0xcb1ab31f)
+}
+
+/// A regional ridge field supplies coherent oceanic arcs rather than a uniform
+/// sprinkling. The atlas shoreline adds shelf chains; neither field uses a LOD.
+fn island_region(world: &World, q: [f64; 3]) -> (f64, f64) {
+    let seed = world.config.seed;
+    let province = smooth((crate::noise(seed ^ 0x0cea_71c, q, 4.1) + 0.28) / 0.60);
+    let ridge = 1.0 - smooth((crate::noise(seed ^ 0x71de_a7c, q, 9.3).abs() - 0.045) / 0.22);
+    (province, ridge)
+}
+
+impl IslandField {
+    fn new(world: &World) -> Self {
+        if world.config.archipelago_density == 0.0 {
+            return Self::default();
+        }
+        let scale = (world.config.radius_m / 1_737_000.0).min(1.0);
+        let levels: Vec<_> = [60_000.0, 16_000.0, 4_000.0, 1_000.0, 250.0, 62.5, 16.0]
+            .into_iter()
+            .zip([0.80, 0.58, 0.35, 0.20, 0.14, 0.095, 0.060])
+            .enumerate()
+            .map(|(level, (radius, probability))| {
+                let seed = world.config.seed ^ 0x15_1a7d ^ level as u64 * 1777;
+                let first = normalize(std::array::from_fn(|i| {
+                    2.0 * random(seed ^ i as u64 * 971) - 1.0
+                }));
+                let other = normalize(std::array::from_fn(|i| {
+                    2.0 * random(seed ^ 0xc47 ^ i as u64 * 311) - 1.0
+                }));
+                let second = normalize(cross(first, other));
+                IslandLevel {
+                    basis: [first, second, cross(first, second)],
+                    max_radius: radius * scale,
+                    spacing: radius * scale * 14.0,
+                    probability,
+                    max_height: (14.0 + 1.8 * (radius * scale).powf(0.70))
+                        .min(radius * scale * 0.80 * 0.42)
+                        .min(world.config.relief_m * 0.80)
+                        * 1.25,
+                }
+            })
+            .collect();
+        let buckets = (0..levels.len())
+            .map(|_| IslandBuckets::default())
+            .collect();
+        Self {
+            levels,
+            buckets: Mutex::new(buckets),
+        }
+    }
+
+    fn bucket(&self, world: &World, level: usize, key: [i64; 3]) -> Arc<[FieldIsland]> {
+        let owner = world
+            .landform_cache
+            .get()
+            .filter(|plan| std::ptr::eq(&plan.islands, self));
+        if let Some(owner) = owner {
+            let found = ISLAND_FRONT.with(|front| {
+                let front = front.borrow();
+                front.owner.as_ref().filter(|old| Arc::ptr_eq(old, owner))?;
+                front.bands[level]
+                    .iter()
+                    .find(|(at, _)| *at == key)
+                    .map(|(_, value)| value.clone())
+            });
+            if let Some(found) = found {
+                return found;
+            }
+        }
+        let found = self.buckets.lock().unwrap()[level]
+            .entries
+            .get(&key)
+            .cloned();
+        if let Some(found) = found {
+            if let Some(owner) = owner {
+                remember_island_bucket(owner, level, key, found.clone());
+            }
+            return found;
+        }
+        // Compilation is pure and runs outside the lock. Duplicate concurrent
+        // work yields identical geometry and cannot select a different world.
+        let result: Arc<[FieldIsland]> = self.compile_bucket(world, level, key).into();
+        let mut caches = self.buckets.lock().unwrap();
+        let cache = &mut caches[level];
+        let result = if let Some(found) = cache.entries.get(&key) {
+            found.clone()
+        } else {
+            if cache.entries.len() >= ISLAND_CACHE_BUCKETS {
+                if let Some(oldest) = cache.order.pop_front() {
+                    cache.entries.remove(&oldest);
+                }
+            }
+            cache.order.push_back(key);
+            cache.entries.insert(key, result.clone());
+            result
+        };
+        drop(caches);
+        if let Some(owner) = owner {
+            remember_island_bucket(owner, level, key, result.clone());
+        }
+        result
+    }
+
+    fn compile_bucket(&self, world: &World, level: usize, key: [i64; 3]) -> Vec<FieldIsland> {
+        let band = &self.levels[level];
+        let mut result = Vec::new();
+        for z in -1..=1 {
+            for y in -1..=1 {
+                for x in -1..=1 {
+                    let candidate = [key[0] + x, key[1] + y, key[2] + z];
+                    let seed = island_seed(world.config.seed, level, candidate);
+                    let roll = random(seed ^ 0x951);
+                    if roll > band.probability * world.config.archipelago_density {
+                        continue;
+                    }
+                    let raw = std::array::from_fn(|i| {
+                        (candidate[i] as f64 + random(seed ^ i as u64 * 177 + 13)) * band.spacing
+                    });
+                    if (dot(raw, raw).sqrt() - world.config.radius_m).abs() > band.spacing * 0.45 {
+                        continue;
+                    }
+                    let q = band.direction(raw);
+                    let (province, ridge) = island_region(world, q);
+                    if roll
+                        > band.probability
+                            * world.config.archipelago_density
+                            * (0.10 + 0.90 * province)
+                    {
+                        continue;
+                    }
+                    let base = crate::sampler::atlas_height(world, q);
+                    if base >= -1.0 {
+                        continue;
+                    }
+                    let shelf = 1.0 - smooth((-base - 80.0) / 3_600.0);
+                    let cluster = smooth(
+                        (crate::noise(
+                            world.config.seed ^ 0x5ae1f_u64,
+                            q,
+                            world.config.radius_m / 80_000.0,
+                        ) + 0.25)
+                            / 0.60,
+                    );
+                    let habitat = (0.10 + 0.90 * province)
+                        * (0.72 * shelf * (0.25 + 0.75 * cluster) + 0.70 * ridge).min(1.0);
+                    if roll > band.probability * world.config.archipelago_density * habitat {
+                        continue;
+                    }
+                    let frame = Frame::new(q, world.config.radius_m);
+                    let sample = 5_000.0_f64.min(band.max_radius * 0.4);
+                    let ridge_at = |east, north| {
+                        crate::noise(
+                            world.config.seed ^ 0x71de_a7c,
+                            frame.point(east, north),
+                            9.3,
+                        )
+                    };
+                    let gx = ridge_at(sample, 0.0) - ridge_at(-sample, 0.0);
+                    let gy = ridge_at(0.0, sample) - ridge_at(0.0, -sample);
+                    let bearing = gx.atan2(-gy) + (random(seed ^ 0xabe) - 0.5) * 0.45;
+                    let (s, c) = bearing.sin_cos();
+                    let count = if level < 4 && random(seed ^ 0xcc7) < 0.65 {
+                        3 + (random(seed ^ 0xa71) * 4.0) as usize
+                    } else {
+                        1
+                    };
+                    for member in 0..count {
+                        let member_seed = seed ^ member as u64 * 104_729;
+                        let along = if count == 1 {
+                            0.0
+                        } else {
+                            (member as f64 / (count - 1) as f64 - 0.5) * 6.0 * band.max_radius
+                        };
+                        let across = (random(member_seed ^ 0xac7) - 0.5) * band.max_radius * 0.7
+                            + (along / band.max_radius * 0.5).sin() * band.max_radius * 0.40;
+                        let center = frame.point(c * along - s * across, s * along + c * across);
+                        let long = band.max_radius * (0.28 + 0.72 * random(member_seed ^ 0x10a));
+                        let short = long * (0.32 + 0.48 * random(member_seed ^ 0x510));
+                        let natural = crate::sampler::atlas_height(world, center);
+                        let foundation = self.foundation_height(world, center, natural, level);
+                        // Tiny rocks need a shelf or a larger seamount foundation;
+                        // a 10 m islet cannot grow a 5 km vertical oceanic spike.
+                        if foundation >= -0.5 || foundation < -long * 2.0 {
+                            continue;
+                        }
+                        let peak = (14.0 + 1.8 * long.powf(0.70))
+                            .min(short * 0.42)
+                            .min(world.config.relief_m * 0.80);
+                        let shape = Island {
+                            at: [0.0, 0.0],
+                            long,
+                            short,
+                            angle: bearing + (random(member_seed ^ 0xbca) - 0.5) * 0.8,
+                            peak,
+                            seed: member_seed,
+                        };
+                        let frame = Frame::new(center, world.config.radius_m);
+                        if safe_island(world, &frame, &shape) {
+                            result.push(FieldIsland { frame, shape });
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn foundation_height(&self, world: &World, q: [f64; 3], natural: f64, levels: usize) -> f64 {
+        let parent = self.height_until(world, q, natural, levels);
+        let Some(plan) = world
+            .landform_cache
+            .get()
+            .filter(|plan| std::ptr::eq(&plan.islands, self))
+        else {
+            return parent;
+        };
+        let Some(indices) = plan.buckets.get(&bucket(q)) else {
+            return parent;
+        };
+        let mut height = parent;
+        // Catalogue construction never enters this path. Once initialized, the
+        // static archipelagos are immutable foundations for nearby smaller rocks.
+        // Do not carve fjords here: their final pass keeps the marine network open.
+        for &i in indices {
+            let district = &plan.districts[i];
+            let Kind::Archipelago(islands) = &district.kind else {
+                continue;
+            };
+            if dot(q, district.frame.center) <= 0.0 {
+                continue;
+            }
+            let [x, y] = district.frame.local(q);
+            if x * x + y * y > district.radius * district.radius {
+                continue;
+            }
+            for island in islands {
+                height = height.max(island_height(world, q, x, y, parent, island));
+            }
+        }
+        height
+    }
+
+    fn height_until(&self, world: &World, q: [f64; 3], natural: f64, levels: usize) -> f64 {
+        let mut height = natural;
+        for (level, band) in self.levels.iter().take(levels).enumerate() {
+            // Every blend lies between the input and a target no higher than
+            // this bound. Higher terrain therefore receives exactly zero from
+            // the complete band, including overlapping seamount foundations.
+            if height >= band.max_height {
+                continue;
+            }
+            for island in self.bucket(world, level, band.key(world, q)).iter() {
+                if dot(q, island.frame.center) <= 0.0 {
+                    continue;
+                }
+                let [x, y] = island.frame.local(q);
+                height = height.max(island_height(world, q, x, y, natural, &island.shape));
+            }
+        }
+        height
+    }
 }
 
 impl Landforms {
@@ -125,7 +611,7 @@ impl Landforms {
         let r = world.config.radius_m;
         let scale = (r / 1_737_000.0).min(1.0);
         let n = world.config.resolution;
-        let stride = (world.cells.len() / 40_000).max(1);
+        let stride = (world.cells.len() / 160_000).max(1);
         let mut coast = Vec::new();
         let mut shields = Vec::new();
         for i in (0..world.cells.len()).step_by(stride) {
@@ -150,13 +636,13 @@ impl Landforms {
                 })
                 .fold(0.0, f64::max);
             let (temperature, moisture) = crate::annual_cell_climate(world, c);
-            if c.position[1].abs() > 0.45
+            if c.position[1].abs() > 0.25
                 && temperature > -18.0
-                && temperature < 16.0
-                && moisture > 0.45
-                && (50.0..1000.0).contains(&c.height_m)
-                && c.discharge < 80.0
-                && slope < 0.025
+                && temperature < 20.0
+                && moisture > 0.38
+                && (35.0..1_700.0).contains(&c.height_m)
+                && c.discharge < 100.0
+                && slope < 0.045
                 && crate::lake_geometry::geographic_clearance(world, c.position) > 8_000.0
             {
                 shields.push((
@@ -188,8 +674,9 @@ impl Landforms {
                 let strike = [-outward[1], outward[0]];
                 let mut troughs = Vec::new();
                 let mut visit = frame.center;
-                for root in 0..3u64 {
-                    let shift = (root as f64 - 1.0) * 12_000.0 * scale;
+                let root_count = 2 + (random(seed ^ 0x9a1) * 3.0) as u64;
+                for root in 0..root_count {
+                    let shift = (random(seed ^ root * 177 + 0x11) - 0.5) * 48_000.0 * scale;
                     let offset = std::array::from_fn::<_, 2, _>(|k| strike[k] * shift);
                     // Start at the actual frozen shore, including coarse atlases
                     // whose cell centre can lie tens of kilometres inland.
@@ -224,43 +711,48 @@ impl Landforms {
                     }
                     let shore = (land + sea) * 0.5;
                     let origin = std::array::from_fn::<_, 2, _>(|k| offset[k] + outward[k] * shore);
-                    let inland = (14_000.0 + random(seed ^ root * 119) * 17_000.0) * scale;
-                    let width = (450.0 + 700.0 * random(seed ^ root * 199 + 17))
+                    let inland = (19_000.0 + random(seed ^ root * 119) * 35_000.0) * scale;
+                    let width = (1_600.0 + 3_600.0 * random(seed ^ root * 199 + 17))
                         * scale
                         * world.config.fjord_strength.sqrt();
                     let mut points = Vec::new();
-                    for k in 0..=7 {
-                        let t = k as f64 / 7.0;
-                        let along = -6_000.0 * scale + t * (inland + 6_000.0 * scale);
+                    let phase = random(seed ^ root * 373) * std::f64::consts::TAU;
+                    let amplitude = (2_200.0 + 4_200.0 * random(seed ^ root * 467)) * scale;
+                    for k in 0..=9u64 {
+                        let t = if k == 0 || k == 9 {
+                            k as f64 / 9.0
+                        } else {
+                            (k as f64 + (random(seed ^ root * 777 + k * 61) - 0.5) * 0.7) / 9.0
+                        };
+                        let along = -8_000.0 * scale + t * (inland + 8_000.0 * scale);
                         let bend = (std::f64::consts::PI * t).sin()
-                            * (random(seed ^ root * 373 + k as u64 * 61) - 0.5)
-                            * 4_000.0
-                            * scale;
+                            * amplitude
+                            * ((t * 5.7 + phase).sin() + 0.25 * (t * 13.1 - phase).sin());
                         points.push(std::array::from_fn(|a| {
                             origin[a] - outward[a] * along + strike[a] * bend
                         }));
                     }
-                    if !points
-                        .windows(2)
-                        .all(|pair| safe_trough(world, &frame, pair[0], pair[1], width))
-                    {
+                    let root_troughs = curved_troughs(
+                        &points,
+                        width,
+                        -(80.0 + 180.0 * random(seed ^ root * 33)) * world.config.fjord_strength,
+                    );
+                    if !root_troughs.iter().all(|t| safe_trough(world, &frame, t)) {
                         continue;
                     }
-                    for pair in points.windows(2) {
-                        troughs.push(Trough {
-                            a: pair[0],
-                            b: pair[1],
-                            width,
-                            floor: -(80.0 + 180.0 * random(seed ^ root * 33))
-                                * world.config.fjord_strength,
-                        })
-                    }
+                    troughs.extend(root_troughs);
                     if root == 1 {
                         visit = frame.point(points[4][0], points[4][1]);
                     }
-                    for branch in 0..4u64 {
-                        let start = points[2 + branch as usize];
-                        let side = if branch % 2 == 0 { 1.0 } else { -1.0 };
+                    let branch_count = 2 + (random(seed ^ root * 691) * 4.0) as u64;
+                    for branch in 0..branch_count {
+                        let start =
+                            points[2 + (random(seed ^ branch * 331 + root * 877) * 5.0) as usize];
+                        let side = if random(seed ^ branch * 997 + root * 121) < 0.5 {
+                            1.0
+                        } else {
+                            -1.0
+                        };
                         let branch_length =
                             (4_000.0 + random(seed ^ branch * 197 + root * 177) * 8_000.0) * scale;
                         let end = std::array::from_fn(|a| {
@@ -268,16 +760,20 @@ impl Landforms {
                         });
                         let branch_width =
                             width * (0.30 + 0.30 * random(seed ^ branch * 971 + root * 311));
-                        if !safe_trough(world, &frame, start, end, branch_width) {
+                        let bend =
+                            (random(seed ^ branch * 419 + root * 557) - 0.5) * branch_length * 0.55;
+                        let middle =
+                            std::array::from_fn(|a| (start[a] + end[a]) * 0.5 + outward[a] * bend);
+                        let branch_troughs = curved_troughs(
+                            &[start, middle, end],
+                            branch_width,
+                            -(30.0 + 90.0 * random(seed ^ branch * 661))
+                                * world.config.fjord_strength,
+                        );
+                        if !branch_troughs.iter().all(|t| safe_trough(world, &frame, t)) {
                             continue;
                         }
-                        troughs.push(Trough {
-                            a: start,
-                            b: end,
-                            width: branch_width,
-                            floor: -(30.0 + 90.0 * random(seed ^ branch * 661))
-                                * world.config.fjord_strength,
-                        });
+                        troughs.extend(branch_troughs);
                     }
                 }
                 if troughs.is_empty() {
@@ -286,9 +782,11 @@ impl Landforms {
                 let radius = troughs
                     .iter()
                     .map(|t| {
-                        let a = (t.a[0] * t.a[0] + t.a[1] * t.a[1]).sqrt();
-                        let b = (t.b[0] * t.b[0] + t.b[1] * t.b[1]).sqrt();
-                        a.max(b) + t.width * 1.2
+                        t.controls()
+                            .iter()
+                            .map(|p| p[0].hypot(p[1]))
+                            .fold(0.0, f64::max)
+                            + t.width
                     })
                     .fold(0.0, f64::max);
                 districts.push(District {
@@ -313,7 +811,7 @@ impl Landforms {
                 let c = &world.cells[i];
                 if districts.iter().any(|d| {
                     matches!(d.kind, Kind::Archipelago(_))
-                        && distance(d.frame.center, c.position, r) < 160_000.0 * scale
+                        && distance(d.frame.center, c.position, r) < 90_000.0 * scale
                 }) {
                     continue;
                 }
@@ -323,18 +821,34 @@ impl Landforms {
                 let length = (sea[0] * sea[0] + sea[1] * sea[1]).sqrt().max(1.0);
                 let outward = [sea[0] / length, sea[1] / length];
                 let strike = [-outward[1], outward[0]];
-                let center =
-                    shoreline.point(outward[0] * 22_000.0 * scale, outward[1] * 22_000.0 * scale);
+                // Freeze a real zero crossing, rather than moving 22 km from a
+                // cell centre that may still be well inland at low resolution.
+                let mut land = 0.0;
+                let mut sea = length;
+                for _ in 0..18 {
+                    let mid = (land + sea) * 0.5;
+                    if crate::sampler::atlas_height(
+                        world,
+                        shoreline.point(outward[0] * mid, outward[1] * mid),
+                    ) >= 0.0
+                    {
+                        land = mid;
+                    } else {
+                        sea = mid;
+                    }
+                }
+                let offshore = (land + sea) * 0.5 + 22_000.0 * scale;
+                let center = shoreline.point(outward[0] * offshore, outward[1] * offshore);
                 let frame = Frame::new(center, r);
                 let mut islands = Vec::new();
                 let mut visit = center;
-                for k in 0..70u64 {
+                for k in 0..96u64 {
                     if random(seed ^ k * 891 + 7) > world.config.archipelago_density {
                         continue;
                     }
-                    let major = k < 9;
+                    let major = k < 18;
                     let along = (if major {
-                        (k as f64 - 4.0) * 16_000.0
+                        (k as f64 - 8.5 + random(seed ^ k * 127) - 0.5) * 8_000.0
                     } else {
                         (random(seed ^ k * 739) - 0.5) * 135_000.0
                     }) * scale;
@@ -343,13 +857,13 @@ impl Landforms {
                     let at = std::array::from_fn(|a| strike[a] * along + outward[a] * across);
                     let p = frame.point(at[0], at[1]);
                     let h = crate::sampler::atlas_height(world, p);
-                    if !(-2400.0..-5.0).contains(&h) {
+                    if !(-4000.0..-1.0).contains(&h) {
                         continue;
                     }
                     let long = if major {
-                        2_500.0 + random(seed ^ k * 271) * 5_500.0
+                        2_000.0 + random(seed ^ k * 271) * 13_000.0
                     } else {
-                        90.0 + random(seed ^ k * 271).powi(2) * 2200.0
+                        25.0 + random(seed ^ k * 271).powi(2) * 3500.0
                     };
                     let short = long * (0.25 + 0.4 * random(seed ^ k * 73)) * scale;
                     let peak = if major {
@@ -357,17 +871,21 @@ impl Landforms {
                     } else {
                         15.0 + random(seed ^ k * 277) * 180.0
                     } * scale;
-                    if crate::lake_geometry::geographic_clearance(world, p) < 2.2 * long * scale {
+                    if h < -long * scale * 2.0 {
                         continue;
                     }
-                    islands.push(Island {
+                    let island = Island {
                         at,
                         long: long * scale,
                         short,
                         angle: strike[1].atan2(strike[0]) + 0.6 * (random(seed ^ k * 907) - 0.5),
                         peak: peak.min(short * 0.5),
                         seed: seed ^ k * 193,
-                    });
+                    };
+                    if !safe_island(world, &frame, &island) {
+                        continue;
+                    }
+                    islands.push(island);
                     if major {
                         visit = p;
                     }
@@ -377,7 +895,12 @@ impl Landforms {
                 }
                 districts.push(District {
                     frame,
-                    radius: 115_000.0 * scale,
+                    radius: islands
+                        .iter()
+                        .map(|island| {
+                            island.at[0].hypot(island.at[1]) + ISLAND_SUPPORT * island.long
+                        })
+                        .fold(0.0, f64::max),
                     strength: world.config.archipelago_density,
                     kind: Kind::Archipelago(islands),
                     visit,
@@ -386,7 +909,7 @@ impl Landforms {
                     .iter()
                     .filter(|d| matches!(d.kind, Kind::Archipelago(_)))
                     .count()
-                    >= 36
+                    >= 144
                 {
                     break;
                 }
@@ -397,12 +920,12 @@ impl Landforms {
                 let p = world.cells[i].position;
                 if districts.iter().any(|d| {
                     matches!(d.kind, Kind::Shield)
-                        && distance(d.frame.center, p, r) < 180_000.0 * scale
+                        && distance(d.frame.center, p, r) < 120_000.0 * scale
                 }) {
                     continue;
                 }
                 let radius =
-                    (80_000.0 + random(world.config.seed ^ i as u64 ^ 0x773) * 70_000.0) * scale;
+                    (95_000.0 + random(world.config.seed ^ i as u64 ^ 0x773) * 115_000.0) * scale;
                 districts.push(District {
                     frame: Frame::new(p, r),
                     radius,
@@ -414,7 +937,7 @@ impl Landforms {
                     .iter()
                     .filter(|d| matches!(d.kind, Kind::Shield))
                     .count()
-                    >= 32
+                    >= 96
                 {
                     break;
                 }
@@ -438,7 +961,11 @@ impl Landforms {
                 }
             }
         }
-        Self { districts, buckets }
+        Self {
+            districts,
+            buckets,
+            islands: IslandField::new(world),
+        }
     }
 }
 fn catalogue(world: &World) -> &Landforms {
@@ -450,10 +977,13 @@ fn catalogue(world: &World) -> &Landforms {
 /// Called in atlas coordinates after the frozen continuous reconstruction.
 pub(crate) fn terrain(world: &World, q: [f64; 3], natural: f64) -> f64 {
     let plan = catalogue(world);
+    let islands = plan
+        .islands
+        .height_until(world, q, natural, plan.islands.levels.len());
     let Some(indices) = plan.buckets.get(&bucket(q)) else {
-        return natural;
+        return islands;
     };
-    apply_districts(world, q, natural, plan, indices)
+    apply_districts(world, q, islands, plan, indices)
 }
 
 fn apply_districts(
@@ -484,57 +1014,34 @@ fn apply_districts(
                 Kind::Fjord(troughs) => {
                     for t in troughs {
                         let reach = t.width;
-                        if x < t.a[0].min(t.b[0]) - reach
-                            || x > t.a[0].max(t.b[0]) + reach
-                            || y < t.a[1].min(t.b[1]) - reach
-                            || y > t.a[1].max(t.b[1]) + reach
+                        let controls = t.controls();
+                        if x < controls.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min) - reach
+                            || x > controls
+                                .iter()
+                                .map(|p| p[0])
+                                .fold(f64::NEG_INFINITY, f64::max)
+                                + reach
+                            || y < controls.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min)
+                                - reach
+                            || y > controls
+                                .iter()
+                                .map(|p| p[1])
+                                .fold(f64::NEG_INFINITY, f64::max)
+                                + reach
                         {
                             continue;
                         }
-                        let vx = t.b[0] - t.a[0];
-                        let vy = t.b[1] - t.a[1];
-                        let along = (((x - t.a[0]) * vx + (y - t.a[1]) * vy)
-                            / (vx * vx + vy * vy).max(1.0))
-                        .clamp(0.0, 1.0);
-                        let radial = ((x - t.a[0] - along * vx).powi(2)
-                            + (y - t.a[1] - along * vy).powi(2))
-                        .sqrt()
-                            / reach;
+                        let radial = t.distance([x, y]) / reach;
                         if radial < 1.0 {
                             height = height.min(
-                                t.floor
-                                    + (height - t.floor).max(0.0) * smooth((radial - 0.30) / 0.70),
+                                t.floor + (height - t.floor).max(0.0) * smooth(radial * radial),
                             );
                         }
                     }
                 }
                 Kind::Archipelago(islands) => {
                     for island in islands {
-                        let dx = x - island.at[0];
-                        let dy = y - island.at[1];
-                        if dx.abs() > island.long * 2.2 || dy.abs() > island.long * 2.2 {
-                            continue;
-                        }
-                        let (s, c) = island.angle.sin_cos();
-                        let u = (dx * c + dy * s) / island.long;
-                        let v = (-dx * s + dy * c) / island.short;
-                        let angle = v.atan2(u);
-                        let outline = 1.0
-                            + 0.17 * (3.0 * angle + random(island.seed) * 6.28).sin()
-                            + 0.12 * (7.0 * angle + random(island.seed ^ 0x937) * 6.28).sin();
-                        let radial = (u * u + v * v).sqrt() / outline;
-                        if radial < 1.6 {
-                            let support = 1.0 - smooth((radial - 1.0) / 0.60);
-                            let texture = 1.0
-                                + 0.30
-                                    * crate::noise(
-                                        island.seed,
-                                        q,
-                                        world.config.radius_m / island.short * 4.0,
-                                    );
-                            let target = island.peak * (1.0 - radial * radial) * texture;
-                            height = height.max(natural + (target - natural) * support);
-                        }
+                        height = height.max(island_height(world, q, x, y, natural, island));
                     }
                 }
                 Kind::Shield => {}
@@ -590,7 +1097,7 @@ pub(crate) fn near_lake_province(world: &World, q: [f64; 3]) -> bool {
 pub(crate) fn detail_multiplier(world: &World, q: [f64; 3]) -> f64 {
     // Scoured shield districts retain their broad relief, with subdued fine
     // bedrock undulations that can actually hold shallow pools and wetlands.
-    1.0 - 0.96 * lake_province_weight(world, q)
+    1.0 - 0.88 * lake_province_weight(world, q)
 }
 
 pub fn destinations(world: &World) -> Vec<FeatureDestination> {
@@ -621,13 +1128,13 @@ pub fn destinations(world: &World) -> Vec<FeatureDestination> {
                         .map(|(p, _)| p)
                 };
                 let point = marine(d.visit).or_else(|| {
-                    // Each generated root has seven main segments and four
-                    // branches. Prefer its inland segments over the open sea.
+                    // Root and branch lengths vary. Prefer a point beyond the
+                    // open-sea starting segment, then try every curved reach.
                     troughs
                         .iter()
                         .enumerate()
                         .find_map(|(j, t)| {
-                            (j % 11 >= 2).then(|| {
+                            (j >= 2).then(|| {
                                 marine(
                                     d.frame
                                         .point((t.a[0] + t.b[0]) * 0.5, (t.a[1] + t.b[1]) * 0.5),
@@ -785,6 +1292,7 @@ mod tests {
                     visit: center,
                 }],
                 buckets,
+                islands: IslandField::default(),
             }))
             .unwrap();
         world
@@ -796,6 +1304,8 @@ mod tests {
             Kind::Fjord(vec![Trough {
                 a: [8_000.0, 0.0],
                 b: [16_000.0, 0.0],
+                control_a: [10_666.666666666666, 0.0],
+                control_b: [13_333.333333333334, 0.0],
                 width: 800.0,
                 floor: -80.0,
             }]),
@@ -890,6 +1400,8 @@ mod tests {
                 kind: Kind::Fjord(vec![Trough {
                     a: [-4000.0, 0.0],
                     b: [4000.0, 0.0],
+                    control_a: [-1333.3333333333333, 0.0],
+                    control_b: [1333.3333333333333, 0.0],
                     width: 350.0,
                     floor: -70.0,
                 }]),
@@ -912,7 +1424,11 @@ mod tests {
         ];
         world
             .landform_cache
-            .set(Arc::new(Landforms { districts, buckets }))
+            .set(Arc::new(Landforms {
+                districts,
+                buckets,
+                islands: IslandField::default(),
+            }))
             .unwrap();
         for x in points {
             assert!(terrain(&world, frame.point(x, 0.0), -10.0) < 0.0);
@@ -1001,11 +1517,444 @@ mod tests {
                     let base = crate::sampler::atlas_height(&world, q);
                     assert_eq!(
                         terrain(&world, q, base).to_bits(),
-                        apply_districts(&world, q, base, plan, &all).to_bits(),
+                        apply_districts(
+                            &world,
+                            q,
+                            plan.islands
+                                .height_until(&world, q, base, plan.islands.levels.len()),
+                            plan,
+                            &all
+                        )
+                        .to_bits(),
                         "district index omitted a feature at {q:?}"
                     );
                 }
             }
         }
+    }
+
+    fn marine_fixture(depth: f32) -> World {
+        let mut world = World::generate(crate::WorldConfig {
+            resolution: 8,
+            erosion_steps: 0,
+            fjord_strength: 0.0,
+            regional_lake_density: 0.0,
+            archipelago_density: 1.0,
+            ..Default::default()
+        })
+        .unwrap();
+        world.lakes.clear();
+        for cell in &mut world.cells {
+            cell.height_m = depth;
+            cell.water_m = 0.0;
+            cell.ocean = true;
+            cell.lake = false;
+            cell.lake_id = None;
+            cell.receiver = None;
+            cell.discharge = 0.0;
+        }
+        world.invalidate_geometry();
+        world
+    }
+
+    fn feature_signature(islands: &[FieldIsland]) -> Vec<(u64, [u64; 3], u64, u64, u64)> {
+        islands
+            .iter()
+            .map(|island| {
+                (
+                    island.shape.seed,
+                    island.frame.center.map(f64::to_bits),
+                    island.shape.long.to_bits(),
+                    island.shape.short.to_bits(),
+                    island.shape.peak.to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn island_bucket_eviction_and_parallel_queries_preserve_canonical_geometry() {
+        let world = marine_fixture(-2.0);
+        let field = IslandField::new(&world);
+        let q = normalize([0.71, -0.33, 0.67]);
+        let key = field.levels[0].key(&world, q);
+        let expected = field.bucket(&world, 0, key);
+        let signature = feature_signature(&expected);
+        for i in 0..=ISLAND_CACHE_BUCKETS {
+            field.bucket(&world, 0, [100_000 + i as i64, 0, 0]);
+        }
+        assert!(field.buckets.lock().unwrap()[0].entries.len() <= ISLAND_CACHE_BUCKETS);
+        assert_eq!(signature, feature_signature(&field.bucket(&world, 0, key)));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| feature_signature(&field.bucket(&world, 0, key))))
+                .collect();
+            for worker in workers {
+                assert_eq!(signature, worker.join().unwrap());
+            }
+        });
+    }
+
+    #[test]
+    fn island_height_bounds_skip_only_bands_that_cannot_change_the_field() {
+        let world = marine_fixture(-2.0);
+        let field = IslandField::new(&world);
+        let q = normalize([0.71, -0.33, 0.67]);
+        assert_eq!(
+            field.height_until(&world, q, 6_000.0, field.levels.len()),
+            6_000.0
+        );
+        assert!(field
+            .buckets
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|band| band.entries.is_empty()));
+        for natural in [-100.0, 0.0, 3.0, 40.0, 180.0, 800.0, 2_000.0, 6_000.0] {
+            let optimized = field.height_until(&world, q, natural, field.levels.len());
+            let mut complete = natural;
+            for (level, band) in field.levels.iter().enumerate() {
+                for island in field.bucket(&world, level, band.key(&world, q)).iter() {
+                    if dot(q, island.frame.center) > 0.0 {
+                        let [x, y] = island.frame.local(q);
+                        complete =
+                            complete.max(island_height(&world, q, x, y, natural, &island.shape));
+                    }
+                }
+            }
+            assert_eq!(optimized.to_bits(), complete.to_bits());
+        }
+    }
+
+    #[test]
+    fn island_thread_front_cache_cannot_mix_worlds_with_the_same_seed() {
+        let shallow = marine_fixture(-2.0);
+        let deep = marine_fixture(-200.0);
+        let first = &catalogue(&shallow).islands;
+        let second = &catalogue(&deep).islands;
+        let level = 6;
+        let key = (0..512_u64)
+            .map(|i| {
+                normalize(std::array::from_fn(|axis| {
+                    2.0 * random(i * 3 + axis as u64 + 9871) - 1.0
+                }))
+            })
+            .map(|q| first.levels[level].key(&shallow, q))
+            .find(|&key| !first.bucket(&shallow, level, key).is_empty())
+            .unwrap();
+        let expected_first = feature_signature(&first.bucket(&shallow, level, key));
+        let expected_second = feature_signature(&second.bucket(&deep, level, key));
+        assert_ne!(expected_first, expected_second);
+        for _ in 0..4 {
+            assert_eq!(
+                expected_first,
+                feature_signature(&first.bucket(&shallow, level, key))
+            );
+            assert_eq!(
+                expected_second,
+                feature_signature(&second.bucket(&deep, level, key))
+            );
+        }
+        ISLAND_FRONT.with(|front| {
+            assert!(front
+                .borrow()
+                .bands
+                .iter()
+                .all(|band| band.len() <= ISLAND_FRONT_BUCKETS));
+        });
+    }
+
+    #[test]
+    fn small_island_foundations_include_the_frozen_coastal_archipelagos() {
+        let world = destination_fixture(
+            Kind::Archipelago(vec![Island {
+                at: [0.0, 0.0],
+                long: 10_000.0,
+                short: 4_000.0,
+                angle: 0.0,
+                peak: 500.0,
+                seed: 31,
+            }]),
+            0.0,
+        );
+        let plan = catalogue(&world);
+        let at = [0.0, 0.0, 1.0];
+        assert_eq!(plan.islands.height_until(&world, at, -100.0, 0), -100.0);
+        assert!(plan.islands.foundation_height(&world, at, -100.0, 0) > 0.0);
+        let offshore = plan.districts[0].frame.point(30_000.0, 0.0);
+        assert_eq!(
+            plan.islands.foundation_height(&world, offshore, -100.0, 0),
+            -100.0
+        );
+    }
+
+    #[test]
+    fn hierarchical_islands_cover_every_size_band_and_cross_bucket_boundaries() {
+        let world = marine_fixture(-2.0);
+        let field = IslandField::new(&world);
+        for (level, band) in field.levels.iter().enumerate() {
+            let mut tested = 0;
+            for i in 0..768_u64 {
+                let q = normalize(std::array::from_fn(|axis| {
+                    2.0 * random(i * 3 + axis as u64 + 9871) - 1.0
+                }));
+                let islands = field.bucket(&world, level, band.key(&world, q));
+                for island in islands.iter().take(3) {
+                    for angle in 0..8 {
+                        let angle = angle as f64 * std::f64::consts::TAU / 8.0;
+                        let (s, c) = island.shape.angle.sin_cos();
+                        let x = island.shape.long * 0.8 * angle.cos();
+                        let y = island.shape.short * 0.8 * angle.sin();
+                        let at = island.frame.point(x * c - y * s, x * s + y * c);
+                        let found = field.bucket(&world, level, band.key(&world, at));
+                        assert!(
+                            found
+                                .iter()
+                                .any(|other| other.shape.seed == island.shape.seed),
+                            "band {level} omitted an island across a bucket boundary"
+                        );
+                    }
+                    tested += 1;
+                }
+                if tested >= 12 {
+                    break;
+                }
+            }
+            assert!(tested >= 12, "no size spectrum in band {level}: {tested}");
+        }
+    }
+
+    #[test]
+    fn large_island_guard_checks_the_whole_footprint_beyond_clearance_saturation() {
+        let mut world = marine_fixture(-200.0);
+        let lake_cell = 0;
+        world.cells[lake_cell].lake = true;
+        world.cells[lake_cell].ocean = false;
+        world.cells[lake_cell].lake_id = Some(992);
+        world.cells[lake_cell].water_m = 200.0;
+        let c = &world.cells[lake_cell];
+        let guarded_radius = 1.3 * 0.85 * c.area_m2.sqrt();
+        let frame = Frame::new(c.position, world.config.radius_m);
+        let at_distance = |clearance: f64| {
+            let angle = 2.0 * ((guarded_radius + clearance) / (2.0 * world.config.radius_m)).asin();
+            std::array::from_fn(|i| frame.center[i] * angle.cos() + frame.east[i] * angle.sin())
+        };
+        let island = Island {
+            at: [0.0, 0.0],
+            long: 60_000.0,
+            short: 40_000.0,
+            angle: 0.0,
+            peak: 1000.0,
+            seed: 7,
+        };
+        let dangerous = at_distance(80_000.0);
+        assert_eq!(
+            crate::lake_geometry::geographic_clearance(&world, dangerous),
+            20_000.0
+        );
+        assert!(!safe_island(
+            &world,
+            &Frame::new(dangerous, world.config.radius_m),
+            &island
+        ));
+        assert!(safe_island(
+            &world,
+            &Frame::new(at_distance(220_000.0), world.config.radius_m),
+            &island
+        ));
+    }
+
+    #[test]
+    fn island_support_and_curved_glacial_banks_blend_continuously() {
+        let world = marine_fixture(-20.0);
+        let frame = Frame::new([1.0, 0.0, 0.0], world.config.radius_m);
+        let island = Island {
+            at: [0.0, 0.0],
+            long: 1000.0,
+            short: 600.0,
+            angle: 0.0,
+            peak: 150.0,
+            seed: 44,
+        };
+        let phase = random(island.seed) * std::f64::consts::TAU;
+        let outline = 1.0
+            + 0.16 * phase.sin()
+            + 0.11 * (random(island.seed ^ 0x937) * std::f64::consts::TAU).sin()
+            + 0.065 * (-phase * 2.0).sin()
+            + 0.04 * (phase * 3.0).sin();
+        let edge = island.long * outline * 1.55;
+        let height = |x| island_height(&world, frame.point(x, 0.0), x, 0.0, -20.0, &island);
+        assert_eq!(height(edge + 0.001), -20.0);
+        assert!((height(edge - 0.001) - height(edge + 0.001)).abs() < 1e-6);
+        let curve = Trough {
+            a: [-4000.0, 0.0],
+            b: [4000.0, 0.0],
+            control_a: [-1500.0, 2500.0],
+            control_b: [1500.0, 2500.0],
+            width: 2000.0,
+            floor: -100.0,
+        };
+        for i in 0..=64 {
+            let point = curve.point(i as f64 / 64.0);
+            assert!(curve.distance(point) < 1e-6);
+        }
+        let center = curve.point(0.5);
+        let profile = |distance: f64| {
+            curve.floor + (500.0 - curve.floor) * smooth((distance / curve.width).powi(2))
+        };
+        assert!(profile(0.0) < profile(400.0) && profile(400.0) < profile(800.0));
+        let inside = curve.distance([center[0], center[1] + curve.width - 0.001]);
+        let outside = curve.distance([center[0], center[1] + curve.width + 0.001]);
+        assert!((profile(inside) - profile(outside)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generated_fjords_keep_their_curved_root_network_marine() {
+        let world = World::generate(crate::WorldConfig {
+            resolution: 64,
+            seed: 2386084681,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let plan = catalogue(&world);
+        let mut tested = 0;
+        for district in &plan.districts {
+            let Kind::Fjord(troughs) = &district.kind else {
+                continue;
+            };
+            for trough in troughs {
+                for step in 0..=8 {
+                    let at = trough.point(step as f64 / 8.0);
+                    let q = district.frame.point(at[0], at[1]);
+                    let base = crate::sampler::atlas_height(&world, q);
+                    assert!(terrain(&world, q, base) < 0.0);
+                }
+                tested += 1;
+            }
+        }
+        assert!(tested > 20);
+    }
+
+    /// Native diagnostic over a supplied frozen atlas. Counts are unique
+    /// canonical objects reached by the stated probe set, not raster components.
+    #[test]
+    #[ignore]
+    fn landform_size_spectrum_diagnostic() {
+        use std::collections::HashSet;
+        let world: World = if let Ok(path) = std::env::var("WB_LANDFORM_ATLAS") {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        } else {
+            World::generate(crate::WorldConfig {
+                resolution: 128,
+                seed: 2386084681,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let start = std::time::Instant::now();
+        let plan = catalogue(&world);
+        let catalogue_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let coastal: Vec<_> = plan
+            .districts
+            .iter()
+            .filter_map(|d| {
+                if let Kind::Archipelago(islands) = &d.kind {
+                    Some(islands)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let coastal_sizes = [250.0, 1_000.0, 4_000.0, 16_000.0].map(|limit| {
+            coastal
+                .iter()
+                .map(|islands| islands.iter().filter(|island| island.long <= limit).count())
+                .sum::<usize>()
+        });
+        let mut hierarchy = Vec::new();
+        let hierarchy_start = std::time::Instant::now();
+        for (level, band) in plan.islands.levels.iter().take(3).enumerate() {
+            let mut seen = HashSet::new();
+            let mut offshore = 0;
+            let mut min_radius = f64::INFINITY;
+            let mut max_radius = 0.0_f64;
+            for i in 0..2_048_u64 {
+                let z = 1.0 - 2.0 * (i as f64 + 0.5) / 2_048.0;
+                let angle = i as f64 * 2.399963229728653;
+                let radius = (1.0 - z * z).sqrt();
+                let q = [radius * angle.cos(), z, radius * angle.sin()];
+                for island in plan
+                    .islands
+                    .bucket(&world, level, band.key(&world, q))
+                    .iter()
+                {
+                    if !seen.insert(island.shape.seed) {
+                        continue;
+                    }
+                    min_radius = min_radius.min(island.shape.long);
+                    max_radius = max_radius.max(island.shape.long);
+                    if crate::sampler::atlas_height(&world, island.frame.center) < -1_500.0 {
+                        offshore += 1;
+                    }
+                }
+            }
+            hierarchy.push(serde_json::json!({ "band": level,
+                "nominal_radius_max_m": band.max_radius, "unique_objects": seen.len(),
+                "offshore_below_1500m": offshore,
+                "radius_min_m": min_radius, "radius_max_m": max_radius }));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "resolution": world.config.resolution, "seed": world.config.seed,
+                "density": world.config.archipelago_density,
+                "catalogue_ms": catalogue_ms,
+                "coastal_districts": coastal.len(),
+                "coastal_objects": coastal.iter().map(|islands| islands.len()).sum::<usize>(),
+                "coastal_cumulative_radii_250_1000_4000_16000": coastal_sizes,
+                "shield_provinces": plan.districts.iter().filter(|d| matches!(d.kind, Kind::Shield)).count(),
+                "hierarchy_probes_per_band": 2048, "hierarchy": hierarchy,
+                "hierarchy_probe_ms": hierarchy_start.elapsed().as_secs_f64() * 1000.0,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn island_cache_performance_diagnostic() {
+        use rayon::prelude::*;
+        let world = marine_fixture(-2.0);
+        let field = &catalogue(&world).islands;
+        let q = (0..128_u64)
+            .map(|i| {
+                normalize(std::array::from_fn(|axis| {
+                    2.0 * random(i * 3 + axis as u64 + 671) - 1.0
+                }))
+            })
+            .find(|&q| field.height_until(&world, q, -2.0, field.levels.len()) < 0.0)
+            .unwrap();
+        let evaluate =
+            || std::hint::black_box(field.height_until(&world, q, -2.0, field.levels.len()));
+        let count = 16_384;
+        let start = std::time::Instant::now();
+        let sequential: f64 = (0..count).map(|_| evaluate()).sum();
+        let sequential_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut parallel = Vec::new();
+        for threads in [4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let start = std::time::Instant::now();
+            let sum: f64 = pool.install(|| (0..count).into_par_iter().map(|_| evaluate()).sum());
+            parallel.push(serde_json::json!({"threads": threads,
+                "ms": start.elapsed().as_secs_f64() * 1000.0, "sum": sum}));
+        }
+        println!(
+            "{}",
+            serde_json::json!({ "samples": count, "sequential_ms": sequential_ms,
+            "sum": sequential, "parallel": parallel })
+        );
     }
 }

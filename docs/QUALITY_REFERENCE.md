@@ -259,3 +259,90 @@ Le bassin le plus profond a l'identifiant `1350471602600`. Au point local `x = 4
 Les huit régressions du module passent. Sur une province synthétique plate et humide à densité 1, 1 135 points sur 6 561 sont mouillés, avec 75 identifiants résolus à 125 m. Après vidage des deux caches et parcours inverse, identifiants, plans et altitudes restent identiques. Sur un sol doux avec pente et bruit continus, 104 changements de propriétaire entre plans différents sont bisectés à moins de 4 µm : aucune paire ne reste mouillée des deux côtés et le saut de terrain maximal vaut `0,000000446 m`. Aux 203 entrées ou sorties d'un support voisin, la même bissection mesure un saut maximal de `0,000000226 m`. Des paires à 2 mm sur une véritable frontière de cache restent sous 1 cm de différence. Les provinces sèches, chaudes, raides ou protégées n'ajoutent aucun objet. Sur 512 points d'intégration répartis entre une mer et un grand lac synthétiques, activer le module conserve exactement lit, plan, identifiant et statut. Deux régressions concurrentes vérifient qu'un quartier froid et deux quartiers différents qui se chevauchent exécutent le même nombre de callbacks qu'un parcours série ; les propositions retenues et rejetées sont réemployées après vidage du seul cache de quartiers.
 
 Ces contrôles portent sur le champ déterministe et des cas précis. Les microbassins restent une reconstruction sans bilan local vérifié de précipitation, d'évaporation, de stockage ou de sédiment. Le rendu WebGPU, les interactions de chaque domaine lacustre sinueux et l'érosion glaciaire réelle doivent être évalués séparément.
+
+## Complément : champs lacustres multi-échelles (prototype 0.10)
+
+Les mesures 0.9 ci-dessus restent historiques. La reconstruction 0.10 possède quatre populations à longueurs physiques fixes, sans paramètre de caméra ni seuil de LOD. Une maille fine résout des mares existantes. La présence et le plan horizontal d'un objet restent déterminés par son propre centre et ses sondes de rive, jamais par la pente, la densité ou le niveau d'un objet voisin au point affiché.
+
+| Population | Espacement des propositions | Bucket de recherche | Diamètre nominal | Support maximal strict |
+| --- | ---: | ---: | ---: | ---: |
+| Bassins et lacs | 1 050 m | 4 096 m | 180–3 000 m | < 2 300 m |
+| Petits bassins | 400 m | 1 024 m | 120–620 m | < 480 m |
+| Étangs | 160 m | 512 m | 35–170 m | < 130 m |
+| Mares et fissures humides | 60 m | 192 m | 10–55 m | < 43 m |
+
+Les diamètres suivent des distributions logarithmiques, avec une queue étendue pour les grands bassins. La forme varie aussi : plusieurs lobes courbes, un bras latéral possible, et des rapports longueur/largeur allant jusqu'à 6,2 pour les fissures. Le champ de propositions possède des régions riches et pauvres à 4 800 m et 1 150 m ; les petites populations se concentrent également dans des corridors humides continus à 430 m. Ce masque influence une décision canonique au centre de la proposition, sans atténuer son eau à la limite du champ géographique. Les positions sont irrégulières dans une coquille sphérique, sans grille hexagonale. La contribution d'un bassin creuse le terrain et ne relève pas sa rive naturelle ; les seuls reliefs secs entre plans différents restent les raccords continus nécessaires aux partages de propriétaires.
+
+La densité `regional_lake_density` intervient une seule fois dans la probabilité. Le même tirage est d'abord comparé à des majorants peu coûteux, avant de construire la forme et avant tout callback de terrain. Les bassins hérités d'une période glaciaire restent possibles dans les provinces tempérées humides ; le facteur climatique s'annule à 24 °C et sous −25 °C de température annuelle. L'humidité, la province, la pente et les contraintes physiques de l'eau restent nécessaires. Les grands réservoirs, la mer et les chenaux existants conservent leur priorité. Le support global de 2 300 m est partagé avec la garde physique du sampler.
+
+Le namespace `[1 << 40, 1 << 41)` demeure réservé aux petits lacs. Les bits 38 et 39 distinguent désormais les quatre populations ; les 38 bits inférieurs proviennent du hash canonique de l'adresse. Les identifiants 0.10 sont stables au changement de maille et d'ordre de parcours ; ils ne sont pas une promesse de conservation des identifiants entre deux versions différentes de l'algorithme.
+
+### Recherche et coût du catalogue
+
+Un bucket contient des descripteurs canoniques peu coûteux. La validation de terrain ne commence que lorsqu'un point appartient au support continu réel d'un descripteur ; son propre `OnceLock` mémorise ensuite l'acceptation ou le rejet. Une requête isolée du catalogue hydraulique ne valide donc pas tous les lacs possibles dans plusieurs kilomètres autour d'elle. Un test vérifie ce comportement et l'absence de nouveaux callbacks au second passage. Le halo maximal reste nécessaire pour retrouver chaque objet ; la sphère de support réelle sert ensuite de garde supplémentaire, sans créer de rejet global dépendant du bucket.
+
+Les cellules cubiques qui ne peuvent pas atteindre la coquille sphérique sont écartées avant le hash du centre irrégulier. Huit partitions géographiques possèdent des mutex indépendants ; les slots de toutes les propositions d'un bucket froid sont acquis par lot dans chaque partition. Un appel ne détient jamais deux mutex à la fois. La construction des formes, les callbacks et l'attente des `OnceLock` restent hors des mutex. Cette organisation conserve la coalescence des appels concurrents et les rejets mémorisés. Chaque thread retient aussi huit jeux de voisinages chauds ; leur propriétaire `Arc` sépare les mondes et les invalidations géométriques.
+
+Les caches demeurent bornés à 1 024 buckets et 65 536 propositions au total. Leurs quotas par population valent respectivement `384/256/256/128` et `32768/16384/8192/8192`. Ils évitent qu'une série de petites mares de 192 m n'évince tous les descripteurs des bassins de 4 km. Une éviction ne change pas l'objet reconstruit. Les statistiques du probe séparent les créations de buckets, les propositions, les validations et les callbacks par échelle.
+
+Une garde exacte accélère les requêtes à l'intérieur des domaines d'eau déjà protégés. Le sampler fournit une marge intérieure conservative : l'exclusion des plans physiques utilise sa distance globale ; un canal utilise le minimum entre sa marge de berge et le domaine sphérique où sa cellule demeure présente dans le stencil. Pour une population de support maximal `S`, une marge supérieure à `2 × R × asin(S/R) + 1 m` implique que le premier lobe sondé de toute proposition touchant le point est protégé. La population peut alors être ignorée avant de construire ses buckets. Le facteur deux couvre le trajet du point au centre sphérique et celui du centre au lobe réellement sondé ; cette optimisation ne dépend pas d'une protection constatée au seul point affiché. Un test compare bit pour bit le champ accéléré et le champ sans garde, y compris autour des quatre seuils. Les seuils conservatifs sont environ 4 601 m, 961 m, 261 m et 87 m pour un rayon de 1 737 km.
+
+### Contrôles numériques du 4 octobre 2026
+
+Les treize régressions de `local_water` passent. Le terrain synthétique plat à densité 1 conserve 327 identifiants résolus dans 10 km à 125 m de maille, contre 75 pour la version 0.9. Dans une région dense fixe de la graine 42, centrée à `x = 4 000 m`, `y = −2 000 m`, la fenêtre de 1 km donne :
+
+| Espacement | Identifiants mouillés | Dont mares de la quatrième population |
+| --- | ---: | ---: |
+| 31,25 m | 33 | 12 |
+| 15,625 m | 53 | 31 |
+| 7,8125 m | 67 | 44 |
+| 3,90625 m | 81 | 58 |
+
+Les points communs conservent bit pour bit le sol, le niveau, le propriétaire, la frange humide et le statut lacustre. Le vidage des caches puis le parcours inverse conserve aussi ce champ. Sur le terrain incliné du test, 352 partages de propriétaire n'ont aucun saut entre deux plans mouillés ; le saut maximal de sol bisecté vaut `0,000000717 m`. Les 483 entrées ou sorties de supports donnent au maximum `0,000000659 m`. Ces chiffres décrivent des cas synthétiques précis, pas une validation visuelle du renderer.
+
+Le probe peut charger directement l'atlas sauvegardé, éviter le survey et séparer une préparation froide courte d'une mesure détaillée :
+
+```sh
+cargo test -p world-core local_water --lib -- --nocapture
+cargo run --release -p world-core --example local_water_probe -- data/worlds/d8d1261ca22a1815f74f/atlas.json /tmp/wb-local-water-010-short --center=-0.5590794587440743,-0.774891421916368,-0.29491260239410366 --provinces=0 --extents=1000 --segments=32
+cargo run --release -p world-core --example local_water_probe -- data/worlds/d8d1261ca22a1815f74f/atlas.json /tmp/wb-local-water-010-final --center=-0.5590794587440743,-0.774891421916368,-0.29491260239410366 --provinces=0
+```
+
+Par défaut, il examine 10 km et 1 km avec 128, 256 et 512 intervalles. `--extents=` et `--segments=` permettent d'autres longueurs physiques et grilles imbriquées. Il compare tous les champs du `Sample` aux sommets communs et lors d'un parcours inverse échantillonné. Les histogrammes de diamètre équivalent proviennent de l'aire mouillée échantillonnée, excluent les objets coupés par le bord et sous-résolvent les formes plus petites que quelques cellules. Les options `--lake-density=`, `--island-density=` et `--fjord-strength=` servent aux diagnostics de coût, sans régénérer l'atlas physique ; leurs valeurs effectives figurent dans le rapport.
+
+### Mesure finale sur l'atlas physique 512 conservé
+
+La référence numérique finale recharge `data/worlds/d8d1261ca22a1815f74f/atlas.json` avec ses paramètres conservés : graine `2386084681`, rayon de 1 737 km, huit étapes d'érosion, détail de 140 m, densité lacustre de 0,55 et densité d'archipel de 0,6. Aucun atlas physique n'est régénéré par ces commandes. La reconstruction 0.10 possède toutefois des provinces, des côtes et un mélange climatique différents de 0.9 ; les nombres historiques ci-dessus ne constituent donc pas une comparaison où seul le cache aurait changé.
+
+La première fenêtre reprend exactement le centre provincial 0.9 `[-0.5590794587440743, -0.774891421916368, -0.29491260239410366]`. La petite fenêtre concentrique est une poche pauvre du même champ. Une seconde fenêtre de 1 km est centrée dans la case de 1 km qui contient le plus de centres lacustres résolus du tableau 10 km à 19,53 m : direction `[-0.5560914108239919, -0.7765237603893291, -0.29626540864332745]`, décalage local d'environ `[-4 500 m, -4 500 m]`. Choisir cette fenêtre après la mesure ne modifie pas ses propositions. Elle illustre une région dense, pas une moyenne de toutes les provinces.
+
+```sh
+target/release/examples/local_water_probe data/worlds/d8d1261ca22a1815f74f/atlas.json /tmp/wb-local-water-010-final --center=-0.5590794587440743,-0.774891421916368,-0.29491260239410366 --provinces=0 > /tmp/wb-local-water-010-final.json
+target/release/examples/local_water_probe data/worlds/d8d1261ca22a1815f74f/atlas.json /tmp/wb-local-water-010-dense --center=-0.5560914108239919,-0.7765237603893291,-0.29626540864332745 --provinces=0 --extents=1000 > /tmp/wb-local-water-010-dense.json
+```
+
+| Fenêtre | Espacement | Identifiants mouillés | Dont mares | Part des points occupée par l'eau | Profondeur maximale | Temps de sampling |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 km | 78,125 m | 176 | 17 | 4,7653 % | 4,184 m | 279,454 ms |
+| 10 km | 39,0625 m | 375 | 109 | 4,9054 % | 4,222 m | 587,688 ms |
+| 10 km | 19,53125 m | 653 | 320 | 4,8847 % | 4,231 m | 1 789,040 ms |
+| 1 km, poche pauvre | 7,8125 m | 2 | 2 | 0,0180 % | 1,067 m | 85,929 ms |
+| 1 km, poche pauvre | 3,90625 m | 3 | 3 | 0,0288 % | 1,262 m | 335,003 ms |
+| 1 km, poche pauvre | 1,953125 m | 3 | 3 | 0,0281 % | 1,297 m | 1 368,864 ms |
+| 1 km, poche dense | 7,8125 m | 45 | 28 | 6,0994 % | 2,052 m | 109,122 ms |
+| 1 km, poche dense | 3,90625 m | 47 | 30 | 6,0622 % | 2,081 m | 365,356 ms |
+| 1 km, poche dense | 1,953125 m | 48 | 31 | 6,0664 % | 2,081 m | 1 395,253 ms |
+
+À 19,53 m, les quatre populations du domaine de 10 km donnent respectivement `11/111/211/320` identifiants mouillés. Les diamètres équivalents des 627 objets complets sont répartis en `274/183/90/57/21/2/0` dans les classes `<25/25–50/50–100/100–250/250–500/500–1000/≥1000 m` ; les quantiles 10/50/90 % valent `22,04/31,17/126,60 m`. Ce diamètre d'aire n'est pas la longueur nominale d'une fissure. La fenêtre fine de 1 km dense possède 41 objets complets, avec des quantiles `6,61/18,44/47,63 m` ; les autres objets touchent le bord. Des formes nominales de 10 m peuvent avoir une aire mouillée de diamètre équivalent inférieur à 10 m.
+
+Les 100 cases de 1 km du domaine large ont un coefficient de variation du nombre de centres de `0,956` ; la case la plus riche en contient 32, contre une moyenne de 6,53. La fenêtre large possède 4 273 points classés marécage et 5 467 points secs avec un mélange marécageux supérieur à 0,20 ; la poche dense fine en possède respectivement 6 512 et 8 159. Ces comptages établissent une hétérogénéité numérique et des marges humides, sans garantir leur lecture dans les triangles ou les couleurs du renderer.
+
+Sur les neuf grilles, les **248 070** sommets partagés et **10 701** points rejoués en ordre inverse ne modifient aucun champ du `Sample`, bit pour bit. Tous les points mouillés d'un même identifiant conservent également le même plan horizontal entre les grilles et les fenêtres. Les rapports JSON et les CSV restent dans `/tmp/wb-local-water-010-final*` et `/tmp/wb-local-water-010-dense*`.
+
+### Préparation froide et limites de la mesure
+
+La compilation complète du catalogue de rivières déclenchée par `world.river_reach(0)` prend **3 957,532 ms** dans la matrice finale, après **2 240,551 ms** de lecture du JSON. La mesure indépendante de la poche dense prend **4 034,512 ms** pour ce même catalogue froid, après **2 293,633 ms** de lecture. La sonde courte isolée avec 32 intervalles mesure **4 160,090 ms**, contre **3 650,228 ms** pour la référence historique 0.9. Les timings de grille excluent l'écriture des CSV et la préparation hydraulique. Aucun survey provincial ne s'exécute dans ces mesures.
+
+Une première version des quatre populations construisait le catalogue en 32 278 ms. La validation différée seule supprimait des millions de callbacks sans corriger la contention des caches. Avant les partitions et la marge de canal, la sonde courte mesurait encore 15 324 ms. La préparation froide finale construit 93 595 buckets, 2 442 234 slots de proposition et exécute 37 156 callbacks de terrain ; les caches finaux restent aux bornes `384/256/256/128` buckets et `32768/16384/8192/8192` propositions. Les skips portent uniquement sur des rejets canoniques démontrés : aucune population n'est retirée selon la résolution. Les mesures intermédiaires ont servi au diagnostic pendant l'intégration et ne remplacent pas la matrice finale.
+
+`WB_PROFILE_LOCAL_WATER_COST=1` ajoute des temps agrégés par opération et par échelle dans les statistiques du probe. Ces compteurs additionnent les threads et leurs attentes ; ils ne représentent pas un temps mural et ajoutent un coût de diagnostic. Ils sont désactivés dans les mesures finales. Les microbassins restent une reconstruction géographique sans solveur local de stockage, d'évaporation ou de glacier. Les régressions et les CSV valident des propriétés numériques ; la validation WebGPU appartient à une étape distincte.

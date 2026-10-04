@@ -26,7 +26,7 @@ mod preview;
 mod regions;
 
 // Render-field revision changes tile caches without rewriting physical atlases.
-const SURFACE_REVISION: &str = "spherical-coast-9";
+const SURFACE_REVISION: &str = "spherical-coast-10";
 
 #[derive(Parser)]
 #[command(
@@ -508,7 +508,7 @@ async fn manifest(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let w = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":64,"max_tile_level":24,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
+        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":32,"coarse_tile_segments":64,"coarse_tile_max_level":2,"api_default_tile_segments":64,"max_tile_level":24,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
     ))
 }
 #[derive(Deserialize)]

@@ -56,13 +56,15 @@ impl CoastWarp {
             .filter_map(|index| {
                 let seed = config.seed ^ (0xc0a57 + u64::from(index) * 193);
                 let frequency = f64::from(config.resolution) * 0.75 * 2.0_f64.powi(index as i32);
-                // H=0.68 before the shear bound: short wavelengths retain more
-                // displacement than the previous H=0.85 / strength=0.24 field.
+                // H=0.62 before the coefficient bound. Fine coastal folds carry
+                // more lateral displacement, while the macro shore keeps its
+                // original first-band strength and the same exact inverse.
                 // This bounds the angle coefficient, not the full composition's
                 // Jacobian. Its cap still responds to the user's detail slider.
+                let cap = if index == 0 { 0.45 } else { 0.60 };
                 let strength =
-                    (0.55 * config.coast_detail_ratio * 2.0_f64.powf(0.32 * f64::from(index)))
-                        .min(0.45 * config.coast_detail_ratio.sqrt());
+                    (0.55 * config.coast_detail_ratio * 2.0_f64.powf(0.38 * f64::from(index)))
+                        .min(cap * config.coast_detail_ratio.sqrt());
                 let first_axis = axis(seed ^ 0x3524ab);
                 let mut second_axis = axis(seed ^ 0x917bed);
                 if dot(first_axis, second_axis).abs() > 0.7 {

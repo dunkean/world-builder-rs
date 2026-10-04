@@ -1,0 +1,542 @@
+{
+  "world": "8f797784bac1c2eb8363",
+  "generator": "prototype-0.10.0",
+  "surface_revision": "spherical-coast-10",
+  "canvas": {
+    "width": 918,
+    "height": 773
+  },
+  "measurement": "rAF cadence and main-thread longtasks; CPU submission is not GPU timing",
+  "cache_state": "page reloaded before setup: client RAM cold; server and persistent tile caches may already be warm",
+  "revision_note": "final WASM: gradient biome shader, local transition neighbors, instant coarsening, camera and active epoch guards, pole and root reset fixes",
+  "cases": [
+    {
+      "name": "orbit-cold",
+      "center_ready_ms": 5153,
+      "queues_idle_ms": 2569,
+      "transition": {
+        "frames": 307,
+        "raf_p50_ms": 16.69999999999891,
+        "raf_p95_ms": 16.799999999999272,
+        "raf_max_ms": 33.400000000000546
+      },
+      "settled": {
+        "frames": 185,
+        "raf_p50_ms": 16.69999999999891,
+        "raf_p95_ms": 16.80000000000109,
+        "raf_max_ms": 17.5
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 44,
+        "network": 107,
+        "installed": 150,
+        "stale": 1
+      },
+      "longtasks": [],
+      "cpu_bytes": 409674348,
+      "gpu_bytes": 296816224,
+      "active_tiles": 153,
+      "draw_tiles": 153,
+      "cut_commits": 55,
+      "instant_coarsen_commits": 0,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "wheel-pan-coast",
+      "center_ready_ms": 9577,
+      "queues_idle_ms": 8930,
+      "transition": {
+        "frames": 512,
+        "raf_p50_ms": 16.700000000000728,
+        "raf_p95_ms": 16.799999999999272,
+        "raf_max_ms": 33.5
+      },
+      "settled": {
+        "frames": 183,
+        "raf_p50_ms": 16.700000000000728,
+        "raf_p95_ms": 16.799999999999272,
+        "raf_max_ms": 16.900000000001455
+      },
+      "counters": {
+        "memory_hits": 7,
+        "disk_hits": 134,
+        "network": 178,
+        "installed": 309,
+        "stale": 3
+      },
+      "longtasks": [],
+      "cpu_bytes": 581259687,
+      "gpu_bytes": 360923544,
+      "active_tiles": 153,
+      "draw_tiles": 153,
+      "cut_commits": 109,
+      "instant_coarsen_commits": 6,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "early-coast",
+      "center_ready_ms": 5641,
+      "queues_idle_ms": 6107,
+      "transition": {
+        "frames": 336,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 33.30000000000291
+      },
+      "settled": {
+        "frames": 185,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 33.5
+      },
+      "counters": {
+        "memory_hits": 96,
+        "disk_hits": 0,
+        "network": 284,
+        "installed": 286,
+        "stale": 18
+      },
+      "longtasks": [],
+      "cpu_bytes": 691599124,
+      "gpu_bytes": 533272384,
+      "active_tiles": 525,
+      "draw_tiles": 271,
+      "cut_commits": 189,
+      "instant_coarsen_commits": 6,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "fjord-wide",
+      "center_ready_ms": 12745,
+      "queues_idle_ms": 12072,
+      "transition": {
+        "frames": 746,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 50
+      },
+      "settled": {
+        "frames": 183,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 17.10000000000582
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 147,
+        "network": 281,
+        "installed": 429,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804423342,
+      "gpu_bytes": 682431580,
+      "active_tiles": 498,
+      "draw_tiles": 169,
+      "cut_commits": 349,
+      "instant_coarsen_commits": 34,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "fjord-shore-500m",
+      "center_ready_ms": 9690,
+      "queues_idle_ms": 9256,
+      "transition": {
+        "frames": 578,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 33.5
+      },
+      "settled": {
+        "frames": 182,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 16.90000000000873
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 416,
+        "installed": 416,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804469289,
+      "gpu_bytes": 684799412,
+      "active_tiles": 627,
+      "draw_tiles": 134,
+      "cut_commits": 491,
+      "instant_coarsen_commits": 52,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "fjord-shore-50m",
+      "center_ready_ms": 13676,
+      "queues_idle_ms": 12149,
+      "transition": {
+        "frames": 820,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 16.89999999999418
+      },
+      "settled": {
+        "frames": 182,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 16.90000000000873
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 503,
+        "installed": 500,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804586836,
+      "gpu_bytes": 684563536,
+      "active_tiles": 798,
+      "draw_tiles": 218,
+      "cut_commits": 650,
+      "instant_coarsen_commits": 78,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "archipelago-wide",
+      "center_ready_ms": 8553,
+      "queues_idle_ms": 7903,
+      "transition": {
+        "frames": 511,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 50
+      },
+      "settled": {
+        "frames": 183,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 17.10000000000582
+      },
+      "counters": {
+        "memory_hits": 3,
+        "disk_hits": 18,
+        "network": 323,
+        "installed": 339,
+        "stale": 3
+      },
+      "longtasks": [],
+      "cpu_bytes": 804896967,
+      "gpu_bytes": 682973008,
+      "active_tiles": 465,
+      "draw_tiles": 171,
+      "cut_commits": 832,
+      "instant_coarsen_commits": 157,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "island-shore-500m",
+      "center_ready_ms": 10106,
+      "queues_idle_ms": 9461,
+      "transition": {
+        "frames": 606,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 17
+      },
+      "settled": {
+        "frames": 183,
+        "raf_p50_ms": 16.69999999999709,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 16.90000000000873
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 435,
+        "installed": 430,
+        "stale": 3
+      },
+      "longtasks": [],
+      "cpu_bytes": 805092428,
+      "gpu_bytes": 683768272,
+      "active_tiles": 582,
+      "draw_tiles": 143,
+      "cut_commits": 975,
+      "instant_coarsen_commits": 175,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "lake-province-8km",
+      "center_ready_ms": 19772,
+      "queues_idle_ms": 19554,
+      "transition": {
+        "frames": 1184,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.80000000000291,
+        "raf_max_ms": 33.30000000000291
+      },
+      "settled": {
+        "frames": 185,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 16.900000000023283
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 689,
+        "installed": 688,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 805207279,
+      "gpu_bytes": 691686944,
+      "active_tiles": 543,
+      "draw_tiles": 163,
+      "cut_commits": 1250,
+      "instant_coarsen_commits": 264,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "lake-province-1km",
+      "center_ready_ms": 8194,
+      "queues_idle_ms": 7760,
+      "transition": {
+        "frames": 491,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 17
+      },
+      "settled": {
+        "frames": 181,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 16.89999999999418
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 351,
+        "installed": 348,
+        "stale": 3
+      },
+      "longtasks": [],
+      "cpu_bytes": 804527659,
+      "gpu_bytes": 713472064,
+      "active_tiles": 621,
+      "draw_tiles": 189,
+      "cut_commits": 1388,
+      "instant_coarsen_commits": 295,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "river-wide",
+      "center_ready_ms": 18585,
+      "queues_idle_ms": 18375,
+      "transition": {
+        "frames": 1114,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.900000000023283
+      },
+      "settled": {
+        "frames": 187,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 16.89999999999418
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 1,
+        "network": 609,
+        "installed": 605,
+        "stale": 3
+      },
+      "longtasks": [],
+      "cpu_bytes": 805076880,
+      "gpu_bytes": 715804632,
+      "active_tiles": 513,
+      "draw_tiles": 187,
+      "cut_commits": 1648,
+      "instant_coarsen_commits": 378,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "river-300m",
+      "center_ready_ms": 7093,
+      "queues_idle_ms": 5370,
+      "transition": {
+        "frames": 425,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.89999999999418
+      },
+      "settled": {
+        "frames": 181,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.89999999999418
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 320,
+        "installed": 320,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804354892,
+      "gpu_bytes": 713269224,
+      "active_tiles": 591,
+      "draw_tiles": 230,
+      "cut_commits": 1769,
+      "instant_coarsen_commits": 399,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "fjord-shore-500m-revisit",
+      "center_ready_ms": 21116,
+      "queues_idle_ms": 20464,
+      "transition": {
+        "frames": 1266,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 17.199999999982538
+      },
+      "settled": {
+        "frames": 183,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 16.89999999999418
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 1,
+        "network": 753,
+        "installed": 750,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804469324,
+      "gpu_bytes": 702467616,
+      "active_tiles": 627,
+      "draw_tiles": 134,
+      "cut_commits": 2053,
+      "instant_coarsen_commits": 487,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "fjord-shore-5m-tilted",
+      "center_ready_ms": 11112,
+      "queues_idle_ms": 10895,
+      "transition": {
+        "frames": 666,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.800000000017462,
+        "raf_max_ms": 16.800000000017462
+      },
+      "settled": {
+        "frames": 182,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.800000000017462
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 452,
+        "installed": 450,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 805140392,
+      "gpu_bytes": 689973248,
+      "active_tiles": 759,
+      "draw_tiles": 181,
+      "cut_commits": 2201,
+      "instant_coarsen_commits": 515,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "island-shore-5m-tilted",
+      "center_ready_ms": 22820,
+      "queues_idle_ms": 22170,
+      "transition": {
+        "frames": 1368,
+        "raf_p50_ms": 16.699999999982538,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.900000000023283
+      },
+      "settled": {
+        "frames": 184,
+        "raf_p50_ms": 16.70000000001164,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.800000000046566
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 0,
+        "network": 724,
+        "installed": 724,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 804537266,
+      "gpu_bytes": 684287768,
+      "active_tiles": 720,
+      "draw_tiles": 243,
+      "cut_commits": 2483,
+      "instant_coarsen_commits": 610,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    },
+    {
+      "name": "return-orbit",
+      "center_ready_ms": 15948,
+      "queues_idle_ms": 15302,
+      "transition": {
+        "frames": 943,
+        "raf_p50_ms": 16.70000000001164,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 50.100000000034925
+      },
+      "settled": {
+        "frames": 182,
+        "raf_p50_ms": 16.699999999953434,
+        "raf_p95_ms": 16.79999999998836,
+        "raf_max_ms": 16.800000000046566
+      },
+      "counters": {
+        "memory_hits": 0,
+        "disk_hits": 3,
+        "network": 108,
+        "installed": 111,
+        "stale": 0
+      },
+      "longtasks": [],
+      "cpu_bytes": 805093892,
+      "gpu_bytes": 685489252,
+      "active_tiles": 153,
+      "draw_tiles": 153,
+      "cut_commits": 2637,
+      "instant_coarsen_commits": 675,
+      "max_neighbor_lod_gap": 1,
+      "errors": []
+    }
+  ]
+}

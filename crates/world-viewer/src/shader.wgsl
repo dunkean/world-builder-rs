@@ -1,4 +1,10 @@
 struct TileClip { bounds: vec4<f32>, face_level: vec4<f32> };
+struct NoiseBand { cell: vec4<i32>, phase_scale: vec4<f32> };
+struct NoiseFrame {
+    anchor_high: vec4<f32>,
+    anchor_low: vec4<f32>,
+    bands: array<NoiseBand, 6>,
+};
 struct Uniforms {
     view_projection: mat4x4<f32>,
     eye: vec4<f32>,
@@ -6,6 +12,8 @@ struct Uniforms {
     light: vec4<f32>,
     options: vec4<f32>,
     cartography: vec4<u32>,
+    surface: vec4<f32>,
+    noise: NoiseFrame,
     clips: array<TileClip, 32>,
 };
 @group(0) @binding(0) var<uniform> scene: Uniforms;
@@ -20,6 +28,9 @@ struct VertexIn {
     @location(6) shading_normal: vec3<f32>,
     @location(7) parent_normal: vec3<f32>,
     @location(8) water_depth: f32,
+    @location(9) biome_a: vec4<f32>,
+    @location(10) biome_b: vec4<f32>,
+    @location(11) direction_low: vec3<f32>,
 };
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -29,6 +40,9 @@ struct VertexOut {
     @location(3) fields: vec4<f32>,
     @location(4) @interpolate(flat) flags: u32,
     @location(5) shading_normal: vec3<f32>,
+    @location(6) surface_delta: vec3<f32>,
+    @location(7) biome_a: vec4<f32>,
+    @location(8) biome_b: vec4<f32>,
 };
 @vertex fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
@@ -45,6 +59,12 @@ struct VertexOut {
     out.fields.w=mix(v.morph.z,v.water_depth,progress);
     out.flags = u32(v.color.a + 0.5);
     out.shading_normal = normalize(mix(v.parent_normal, v.shading_normal, progress));
+    // Surface ink is independent of rendered height, relief exaggeration and
+    // morph. Subtract the split unit-sphere anchor before converting to metres.
+    out.surface_delta = ((v.normal_height.xyz - scene.noise.anchor_high.xyz)
+        + (v.direction_low - scene.noise.anchor_low.xyz)) * scene.options.y;
+    out.biome_a = v.biome_a;
+    out.biome_b = v.biome_b;
     return out;
 }
 
@@ -52,53 +72,203 @@ fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     return mix(low, high, clamp(x, 0.0, 1.0));
 }
 
-fn cell_ink(cell: vec3<i32>, seed: u32) -> f32 {
-    let lattice = bitcast<vec3<u32>>(cell);
-    var h = (lattice.x * 0x8da6b343u) ^ (lattice.y * 0xd8163841u) ^ (lattice.z * 0xcb1ab31fu) ^ seed;
-    h = (h ^ (h >> 16u)) * 0x7feb352du;
+fn ink_hash(value: u32) -> u32 {
+    var h = (value ^ (value >> 16u)) * 0x7feb352du;
     h = (h ^ (h >> 15u)) * 0x846ca68bu;
-    h = h ^ (h >> 16u);
-    return f32(h & 0x00ffffffu) / 8388607.5 - 1.0;
+    return h ^ (h >> 16u);
+}
+
+fn ink_gradient(hash: u32, displacement: vec3<f32>) -> f32 {
+    // The twelve equally long cube-edge gradients avoid constant-value
+    // plateaus around lattice corners, which looked like square clearings.
+    let index = hash % 12u;
+    let u = select(displacement.x, displacement.y, index >= 8u);
+    let v = select(displacement.z, displacement.y, index < 4u);
+    return (select(u, -u, (index & 1u) != 0u)
+        + select(v, -v, (index & 2u) != 0u)) * 0.707106781;
+}
+
+fn cell_ink(cell: vec3<i32>, displacement: vec3<f32>, seed: u32) -> vec3<f32> {
+    let lattice = bitcast<vec3<u32>>(cell);
+    let h = ink_hash((lattice.x * 0x8da6b343u) ^ (lattice.y * 0xd8163841u)
+        ^ (lattice.z * 0xcb1ab31fu) ^ seed);
+    return vec3<f32>(ink_gradient(h, displacement),
+        ink_gradient(ink_hash(h ^ 0x68bc21ebu), displacement),
+        ink_gradient(ink_hash(h ^ 0x02e5be93u), displacement));
 }
 
 // A three-dimensional field on the sphere, not UVs on individual cube faces.
-// Quintic interpolation keeps cell boundaries smooth without a texture lookup.
-fn map_noise(q: vec3<f32>, seed: u32) -> f32 {
-    let base = vec3<i32>(floor(q));
+// Gradient noise and quintic interpolation keep cell boundaries C2 without
+// a texture lookup. The split anchor still addresses the same world corners.
+fn map_noise(q: vec3<f32>, origin: vec3<i32>, seed: u32) -> vec3<f32> {
+    let base = origin + vec3<i32>(floor(q));
     let f = fract(q);
     let t = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
     let low = mix(
-        mix(cell_ink(base, seed), cell_ink(base + vec3<i32>(1, 0, 0), seed), t.x),
-        mix(cell_ink(base + vec3<i32>(0, 1, 0), seed), cell_ink(base + vec3<i32>(1, 1, 0), seed), t.x), t.y);
+        mix(cell_ink(base, f, seed), cell_ink(base + vec3<i32>(1, 0, 0), f - vec3(1.0, 0.0, 0.0), seed), t.x),
+        mix(cell_ink(base + vec3<i32>(0, 1, 0), f - vec3(0.0, 1.0, 0.0), seed), cell_ink(base + vec3<i32>(1, 1, 0), f - vec3(1.0, 1.0, 0.0), seed), t.x), t.y);
     let high = mix(
-        mix(cell_ink(base + vec3<i32>(0, 0, 1), seed), cell_ink(base + vec3<i32>(1, 0, 1), seed), t.x),
-        mix(cell_ink(base + vec3<i32>(0, 1, 1), seed), cell_ink(base + vec3<i32>(1, 1, 1), seed), t.x), t.y);
-    return mix(low, high, t.z);
+        mix(cell_ink(base + vec3<i32>(0, 0, 1), f - vec3(0.0, 0.0, 1.0), seed), cell_ink(base + vec3<i32>(1, 0, 1), f - vec3(1.0, 0.0, 1.0), seed), t.x),
+        mix(cell_ink(base + vec3<i32>(0, 1, 1), f - vec3(0.0, 1.0, 1.0), seed), cell_ink(base + vec3<i32>(1, 1, 1), f - vec3(1.0, 1.0, 1.0), seed), t.x), t.y);
+    return mix(low, high, t.z) * 1.8;
 }
 
-fn map_grain(p: vec3<f32>, footprint_m: f32) -> f32 {
-    // Rotate the lattice away from the cube axes. Neither the camera nor the
-    // relief exaggeration chooses coordinates, a seed, or an octave phase.
-    let q = vec3<f32>(dot(p, vec3(0.36, 0.48, 0.8)),
-                      dot(p, vec3(-0.8, 0.6, 0.0)),
-                      dot(p, vec3(-0.48, -0.64, 0.6))) * scene.options.y;
+fn noise_axes(p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(p, vec3(0.36, 0.48, 0.8)),
+                     dot(p, vec3(-0.8, 0.6, 0.0)),
+                     dot(p, vec3(-0.48, -0.64, 0.6)));
+}
+
+fn surface_delta(delta: vec3<f32>) -> vec3<f32> {
+    // Interpolated directions lie on a triangle chord. Project back onto the
+    // sphere with a cancellation-safe local expression, avoiding f32 planetary
+    // coordinates and preventing a noise phase change when a tile subdivides.
+    let radius = scene.options.y;
+    let anchor = scene.noise.anchor_high.xyz + scene.noise.anchor_low.xyz;
+    let t = (2.0 * dot(anchor, delta) + dot(delta, delta) / radius) / radius;
+    let norm = sqrt(max(1e-12, 1.0 + t));
+    return (delta - anchor * (radius * t / (norm + 1.0))) / norm;
+}
+
+struct Facies { regional: vec3<f32>, local: vec3<f32>, fine: vec3<f32> };
+
+fn map_facies(delta: vec3<f32>, footprint_m: f32, band_count: u32) -> Facies {
+    let q = noise_axes(delta);
     let seed = scene.cartography.x ^ (scene.cartography.y * 0x9e3779b9u);
-    var grain = 0.0;
-    // Only the rendering is filtered. The underlying fields are fixed; skip
-    // frequencies below two pixels to avoid moiré and unnecessary hash work.
-    if footprint_m < 4000.0 {
-        grain += map_noise(q / 8000.0, seed ^ 0x713ab51du)
-            * 0.55 * (1.0 - smoothstep(1000.0, 4000.0, footprint_m));
+    let regional_weight = array<f32, 6>(0.55, 0.45, 0.28, 0.15, 0.09, 0.05);
+    let local_weight = array<f32, 6>(0.0, 0.0, 0.35, 0.40, 0.32, 0.24);
+    let fine_weight = array<f32, 6>(0.0, 0.0, 0.0, 0.28, 0.38, 0.48);
+    var field = Facies(vec3(0.0), vec3(0.0), vec3(0.0));
+    var warp = vec3(0.0);
+    for (var band = 0u; band < band_count; band += 1u) {
+        let record = scene.noise.bands[band];
+        let metres = record.phase_scale.w;
+        // A frequency appears continuously once it covers several pixels.
+        // The domain warp uses the unfiltered parent field: zoom never shifts
+        // an already visible patch by changing the next octave's coordinates.
+        if footprint_m < metres * 0.5 {
+            let raw = map_noise(q / metres + record.phase_scale.xyz + warp,
+                record.cell.xyz, seed ^ (0x713ab51du + (band * 0x318f402bu)));
+            let visible = 1.0 - smoothstep(metres * 0.125, metres * 0.5, footprint_m);
+            field.regional += raw * (regional_weight[band] * visible);
+            field.local += raw * (local_weight[band] * visible);
+            field.fine += raw * (fine_weight[band] * visible);
+            warp = raw.yzx * 0.72;
+        }
     }
-    if footprint_m < 200.0 {
-        grain += map_noise(q / 400.0, seed ^ 0x318f402bu)
-            * 0.30 * (1.0 - smoothstep(50.0, 200.0, footprint_m));
+    return field;
+}
+
+fn biome_bias(index: u32, patches: vec3<f32>) -> f32 {
+    switch index {
+        case 0u: { return dot(patches, vec3(0.95, 0.0, 0.40)); }
+        case 1u: { return dot(patches, vec3(-1.0, 0.55, 0.0)); }
+        case 2u: { return dot(patches, vec3(0.0, 0.95, 0.45)); }
+        case 3u: { return dot(patches, vec3(0.65, -1.0, 0.0)); }
+        case 4u: { return dot(patches, vec3(-0.55, 0.0, 0.95)); }
+        case 5u: { return dot(patches, vec3(0.0, 0.45, -1.0)); }
+        case 6u: { return dot(patches, vec3(0.0, -0.50, -0.40)); }
+        default: { return dot(patches, vec3(0.70, -0.55, 0.0)); }
     }
-    if footprint_m < 10.0 {
-        grain += map_noise(q / 20.0, seed ^ 0x91d203f7u)
-            * 0.15 * (1.0 - smoothstep(2.5, 10.0, footprint_m));
+}
+
+fn biome_facies(index: u32, temperature: f32, moisture: f32, slope: f32, field: Facies) -> vec3<f32> {
+    let region = smoothstep(-0.36, 0.36, field.regional.x + field.local.y * 0.55);
+    let mosaic = smoothstep(-0.30, 0.30, field.regional.y + field.local.x * 0.75);
+    let fine = smoothstep(-0.20, 0.20, field.fine.z + field.local.z * 0.25);
+    let wet = clamp(moisture + field.regional.z * 0.18 + field.local.y * 0.14, 0.0, 1.0);
+    let exposed = smoothstep(25.0, 55.0, slope);
+    let tree_cover = pow(1.0 - smoothstep(20.0, 55.0, slope), 2.0);
+    let snow_cover = pow(1.0 - smoothstep(25.0, 60.0, slope), 2.0);
+    let bare_rock = smoothstep(40.0, 65.0, slope);
+    let stone = mix(vec3(0.24, 0.26, 0.25), vec3(0.51, 0.44, 0.33), region);
+    var ink = stone;
+    switch index {
+        case 0u: {
+            // Ice remains ice in its cold interior. Warm margins and real
+            // steep faces expose debris; no green vegetation is painted here.
+            let snow = mix(vec3(0.65, 0.75, 0.76), vec3(0.86, 0.88, 0.83), fine);
+            let thaw = smoothstep(-15.0, 0.0, temperature);
+            let debris = clamp(exposed * 0.55 + thaw * mosaic * 0.42, 0.0, 0.72);
+            ink = mix(mix(vec3(0.30, 0.32, 0.29), stone, fine), snow, (1.0-debris)*snow_cover);
+        }
+        case 1u: {
+            let moss = mix(vec3(0.22, 0.29, 0.18), vec3(0.43, 0.43, 0.25), fine);
+            let soil = mix(vec3(0.27, 0.26, 0.21), vec3(0.42, 0.37, 0.28), region);
+            ink = mix(soil, moss, clamp(wet * 0.65 + mosaic * 0.50, 0.08, 0.93));
+            ink = mix(ink, stone, exposed * 0.62 + (1.0 - mosaic) * 0.15);
+        }
+        case 2u: {
+            let sand = mix(vec3(0.55, 0.37, 0.20), vec3(0.75, 0.61, 0.39), fine);
+            let ochre = mix(vec3(0.43, 0.34, 0.25), vec3(0.67, 0.49, 0.29), region);
+            ink = mix(ochre, sand, mosaic * 0.76 + 0.12);
+            ink = mix(ink, stone, exposed * 0.64 + (1.0 - mosaic) * 0.17);
+        }
+        case 3u: {
+            let grass = mix(vec3(0.20, 0.33, 0.12), vec3(0.41, 0.47, 0.21), fine);
+            let dry = mix(vec3(0.41, 0.35, 0.19), vec3(0.56, 0.46, 0.27), region);
+            ink = mix(dry, grass, clamp(wet * 0.82 + mosaic * 0.53, 0.05, 0.97));
+            ink = mix(ink, stone, exposed * 0.55 + (1.0 - mosaic) * 0.08);
+        }
+        case 4u: {
+            let canopy = mix(vec3(0.045, 0.13, 0.065), vec3(0.19, 0.30, 0.13), fine);
+            let glade = mix(vec3(0.25, 0.36, 0.145), vec3(0.43, 0.50, 0.23), region);
+            let cover = clamp(0.60 + wet * 0.32 + field.regional.y * 0.34 + field.local.x * 0.28, 0.34, 0.98);
+            ink = mix(glade, canopy, cover * tree_cover);
+            ink = mix(ink, stone, exposed * 0.70);
+        }
+        case 5u: {
+            let canopy = mix(vec3(0.028, 0.105, 0.06), vec3(0.13, 0.25, 0.11), fine);
+            let clearing = mix(vec3(0.18, 0.25, 0.12), vec3(0.32, 0.32, 0.17), region);
+            let cover = clamp(0.84 + field.regional.y * 0.24 + field.local.x * 0.20, 0.60, 0.99);
+            ink = mix(clearing, canopy, cover * tree_cover);
+            ink = mix(ink, stone, exposed * 0.70);
+        }
+        case 6u: {
+            let reeds = mix(vec3(0.17, 0.28, 0.15), vec3(0.36, 0.37, 0.22), fine);
+            let peat = mix(vec3(0.075, 0.14, 0.11), vec3(0.24, 0.26, 0.16), region);
+            ink = mix(peat, reeds, mosaic * 0.75 + 0.16);
+            ink = mix(ink, stone, exposed * 0.65);
+        }
+        default: {
+            let mineral = mix(vec3(0.25, 0.27, 0.26), vec3(0.52, 0.43, 0.31), fine);
+            let lichen = mix(vec3(0.23, 0.28, 0.18), vec3(0.39, 0.38, 0.24), region);
+            let growth = wet * smoothstep(-10.0, 5.0, temperature) * (1.0 - exposed) * mosaic * 0.32;
+            ink = mix(mix(stone, mineral, 0.62), lichen, growth);
+        }
     }
-    return grain;
+    // Every vertical face is exposed mineral. Neither a biome's broad
+    // fraction nor its fine pattern can leave trees or snow on that face.
+    return mix(ink, stone, bare_rock);
+}
+
+fn physical_slope_degrees(v: VertexOut, radial: vec3<f32>) -> f32 {
+    let cosine = clamp(dot(normalize(v.shading_normal), radial), 0.0001, 1.0);
+    let rendered_tangent = sqrt(max(0.0, 1.0-cosine*cosine)) / cosine;
+    let exaggeration = max(1.0, scene.surface.x);
+    let height = v.normal_height.w * 1000.0;
+    let radial_correction = max(1e-6, scene.options.y + exaggeration*height)
+        / max(1e-6, scene.options.y+height);
+    return atan(rendered_tangent * radial_correction / exaggeration) * 57.295779513;
+}
+
+fn land_ink(v: VertexOut, radial: vec3<f32>, field: Facies) -> vec3<f32> {
+    let fractions = array<f32, 8>(v.biome_a.x, v.biome_a.y, v.biome_a.z, v.biome_a.w,
+        v.biome_b.x, v.biome_b.y, v.biome_b.z, v.biome_b.w);
+    let slope = physical_slope_degrees(v, radial);
+    let patches = field.regional * 2.4 + field.local * 1.2;
+    var ink = vec3(0.0);
+    var total = 0.0;
+    for (var biome = 0u; biome < 8u; biome += 1u) {
+        if fractions[biome] > 0.0 {
+            // Fixed, softly competing patches break an ecotone into fingers
+            // and islands. Only terrestrial fractions enter this competition.
+            let weight = pow(fractions[biome], 1.35) * exp(clamp(biome_bias(biome, patches), -6.0, 6.0));
+            ink += biome_facies(biome, v.fields.x, v.fields.y, slope, field) * weight;
+            total += weight;
+        }
+    }
+    return ink / max(total, 1e-12);
 }
 
 fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
@@ -123,7 +293,8 @@ fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
 @fragment fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
     let radial = normalize(v.normal_height.xyz);
     // Derivatives precede every divergent branch/discard, also on WebGL2.
-    let footprint_m = scene.options.y * max(length(dpdx(radial)), length(dpdy(radial)));
+    let ink_delta = surface_delta(v.surface_delta);
+    let footprint_m = max(length(dpdx(ink_delta)), length(dpdy(ink_delta)));
     if v.flags >= 99u {
         if v.flags < 101u && scene.options.z < 0.5 { discard; }
         if v.flags < 101u && scene.eye.w < 10000.0 { discard; }
@@ -153,20 +324,15 @@ fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
     var color = v.color.rgb;
     let mode = u32(scene.options.x);
     if mode == 0u {
-        let grain = map_grain(radial, footprint_m);
+        let facies = map_facies(ink_delta, footprint_m, select(6u, 3u, water));
         if water {
             // Existing hydraulic/LOD markers stay unchanged. Marine ink is
             // unambiguously bluer than freshwater ink, including legacy tiles.
             let marine = (v.fields.z > -1.5 && v.fields.z < -0.5)
                 || (v.fields.z >= -1.5 && v.color.b > v.color.g * 1.3);
-            color = water_ink(v.fields.w, v.fields.z, marine, grain);
+            color = water_ink(v.fields.w, v.fields.z, marine, facies.regional.x * 0.5);
         } else {
-            // The CPU supplies the actual biome fractions. Grain modulates
-            // their ink rather than reclassifying land or painting fake water.
-            color *= 1.0 + grain * 0.11;
-            let slope = 1.0 - max(0.0, dot(normalize(v.shading_normal), radial));
-            let rock = smoothstep(0.10, 0.42, slope);
-            color = mix(color, vec3(0.40, 0.35, 0.28) * (1.0 + grain * 0.045), rock * 0.38);
+            color = land_ink(v, radial, facies);
         }
     } else if mode == 1u {
         color = ramp((v.normal_height.w + 2.0) / 8.0, vec3(0.08, 0.20, 0.34), vec3(0.96, 0.91, 0.75));

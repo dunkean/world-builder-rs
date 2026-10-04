@@ -1,7 +1,7 @@
 async (page) => {
   // Playwright CLI expression, executed once for setup and once per case.
   // It uses the existing page: no second canvas, context or GPU device.
-  const worldId = 'd8d1261ca22a1815f74f';
+  const worldId = '8f797784bac1c2eb8363';
   const errors = [];
   const onError = (error) => errors.push({ kind: 'pageerror', message: error.message });
   const onConsole = (entry) => {
@@ -10,7 +10,7 @@ async (page) => {
   page.on('pageerror', onError);
   page.on('console', onConsole);
   try {
-    const initialized = await page.evaluate(() => Boolean(window.qaRendering09));
+    const initialized = await page.evaluate(() => Boolean(window.qaRendering10));
     if (!initialized) {
       await page.waitForFunction((id) => typeof window.worldBuilderPerf?.().view?.active_level === 'number'
         && document.getElementById('stats')?.textContent.includes(id.slice(0, 16)), worldId, { timeout: 60000 });
@@ -26,7 +26,7 @@ async (page) => {
           fetchJson(`/api/worlds/${worldId}/landforms`),
           fetchJson(`/api/worlds/${worldId}/rivers`),
         ]);
-        if (health.generator_version !== 'prototype-0.9.0') throw new Error(`Backend not 0.9: ${health.generator_version}`);
+        if (health.generator_version !== 'prototype-0.10.0') throw new Error(`Backend not 0.10: ${health.generator_version}`);
         if (!document.getElementById('stats').textContent.includes(worldId.slice(0, 16))) throw new Error('The visible world is not the requested atlas');
         const viewer = await import('/pkg/world_viewer.js');
         const radius = manifest.config.radius_m;
@@ -97,6 +97,8 @@ async (page) => {
           { name: 'river-wide', direction: river.direction, altitude_m: river.altitude_m, tilt: 25 },
           { name: 'river-300m', direction: river.direction, altitude_m: 300, tilt: 25 },
           { name: 'fjord-shore-500m-revisit', direction: fjordShore.direction, altitude_m: 500, tilt: 0 },
+          { name: 'fjord-shore-5m-tilted', direction: fjordShore.direction, altitude_m: 5, tilt: 30 },
+          { name: 'island-shore-5m-tilted', direction: islandShore.direction, altitude_m: 5, tilt: 30 },
           { name: 'return-orbit', direction: fjordShore.direction, altitude_m: radius * 7, tilt: 0 },
         ];
         document.getElementById('layer').value = '0';
@@ -115,7 +117,7 @@ async (page) => {
         });
         observation.observer.observe({ entryTypes: ['longtask'] });
         const destinations = { fjord, islands, lakes, river };
-        window.qaRendering09 = { viewer, plan, index: 0, results: [], observation, manifest, destinations, fjordShore, islandShore, riverSample };
+        window.qaRendering10 = { viewer, plan, index: 0, results: [], observation, manifest, destinations, fjordShore, islandShore, riverSample };
         return { setup: true, world_id: worldId, generator: manifest.generator_version, surface_revision: manifest.surface_revision,
           backend: document.getElementById('backend').textContent, canvas: { width: document.getElementById('planet').width, height: document.getElementById('planet').height },
           destinations, fjordShore, islandShore, riverSample, scenarios: plan.map(({ name }) => name) };
@@ -130,7 +132,7 @@ async (page) => {
     }
 
     const scenario = await page.evaluate(() => {
-      const q = window.qaRendering09;
+      const q = window.qaRendering10;
       const scenario = q.plan[q.index];
       if (!scenario) return null;
       q.observation.frames = [];
@@ -148,7 +150,7 @@ async (page) => {
     });
     if (!scenario) {
       return await page.evaluate(() => {
-        const q = window.qaRendering09;
+        const q = window.qaRendering10;
         q.observation.running = false;
         q.observation.observer.disconnect();
         return { finished: true, results: q.results };
@@ -173,13 +175,13 @@ async (page) => {
         interactionSamples.push({ label, elapsed_ms: Date.now() - started, ...data });
       };
       const capture = async (name) => {
-        await page.evaluate(() => { window.qaRendering09.observation.phase = 'idle'; });
-        const path = `output/playwright/renderer-09-${name}.png`;
+        await page.evaluate(() => { window.qaRendering10.observation.phase = 'idle'; });
+        const path = `output/playwright/renderer-10-${name}.png`;
         await page.screenshot({ path });
         intermediateScreenshots.push(path);
         await page.evaluate(() => {
-          window.qaRendering09.observation.phase = 'transition';
-          window.qaRendering09.observation.last = undefined;
+          window.qaRendering10.observation.phase = 'transition';
+          window.qaRendering10.observation.last = undefined;
         });
       };
       for (let step = 1; step <= 10; step += 1) {
@@ -222,8 +224,8 @@ async (page) => {
       } else centerSince = null;
     }
     await page.evaluate(() => {
-      window.qaRendering09.observation.phase = 'settled';
-      window.qaRendering09.observation.last = undefined;
+      window.qaRendering10.observation.phase = 'settled';
+      window.qaRendering10.observation.last = undefined;
     });
     const settledStarted = Date.now();
     while (Date.now() - settledStarted < 3000) {
@@ -234,7 +236,7 @@ async (page) => {
       })) queuesIdleMs = Date.now() - started;
     }
     const result = await page.evaluate(({ scenario, centerReadyMs, queuesIdleMs }) => {
-      const q = window.qaRendering09;
+      const q = window.qaRendering10;
       q.observation.phase = 'idle';
       const current = window.worldBuilderPerf();
       const { resident_keys, requests, ...view } = current.view;
@@ -247,7 +249,11 @@ async (page) => {
         center_ready: view.active_level === view.level && view.pending_tiles === 0, view, transition: quantiles('transition'), settled: quantiles('settled'),
         longtasks: q.observation.longtasks, counters, in_flight: current.in_flight, queued: current.queued,
         cpu_render_submit_ms: current.render_ms, cpu_render_submit_max_ms_since_page_load: current.max_render_ms,
-        screenshot: `output/playwright/renderer-09-${scenario.name}.png` };
+        screenshot: `output/playwright/renderer-10-${scenario.name}.png`,
+        surface_edge_audit: typeof q.viewer.surface_edge_audit === 'function'
+          ? JSON.parse(q.viewer.surface_edge_audit()) : undefined,
+        surface_probe: scenario.altitude_m <= 5 && typeof q.viewer.surface_probe === 'function'
+          ? JSON.parse(q.viewer.surface_probe(JSON.stringify(view.direction))) : undefined };
       q.results.push(result);
       q.index += 1;
       return result;

@@ -11,6 +11,7 @@ pub mod local_water;
 mod regions;
 pub mod river_geometry;
 mod sampler;
+mod surface_detail;
 pub mod tile_wire;
 pub use regions::RegionPatch;
 
@@ -25,7 +26,7 @@ use std::{
     sync::OnceLock,
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.9.0";
+pub const GENERATOR_VERSION: &str = "prototype-0.10.0";
 
 /// Optional native diagnostic; it never changes the generated data.
 #[derive(Default)]

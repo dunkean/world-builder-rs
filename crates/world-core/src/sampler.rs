@@ -2,7 +2,7 @@
 //! provide their own hydraulic datum; interpolated wet fractions never flood
 //! dry terrain. Detail is addressed by global position and protected by channels.
 
-use crate::{geometry, noise, Biome, Sample, Tile, TileKey, World};
+use crate::{geometry, Biome, Sample, Tile, TileKey, World};
 use anyhow::{bail, Result};
 use geometry::{direction, dot, normalize, FACE_BASES};
 use rayon::prelude::*;
@@ -44,7 +44,6 @@ impl World {
         let mut moisture = 0.0;
         let mut discharge = 0.0;
         let mut erodability = 0.0;
-        let mut biome_mix = [0.0_f32; 10];
         let mut selected = patch.attributes[0].0;
         let mut dominant = -1.0;
         for &(index, weight) in &patch.attributes[..patch.attribute_count] {
@@ -53,7 +52,6 @@ impl World {
             moisture += weight * f64::from(cell.moisture);
             discharge += weight * f64::from(cell.discharge);
             erodability += weight * f64::from(cell.erodability);
-            biome_mix[cell.biome as usize] += weight as f32;
             if weight > dominant {
                 dominant = weight;
                 selected = index;
@@ -207,19 +205,26 @@ impl World {
             .filter(|&level| level > height && (ocean || lake || river > 0.0))
             .unwrap_or(height);
         let mut biome = self.cells[selected].biome;
+        let mut biome_mix;
         if ocean || lake {
             biome = if ocean { Biome::Ocean } else { Biome::Lake };
             biome_mix = [0.0; 10];
             biome_mix[biome as usize] = 1.0;
         } else {
-            // Water color is not allowed to bleed onto emerging land merely
-            // because a neighboring atlas cell belongs to a lake or the sea.
-            biome_mix[Biome::Ocean as usize] = 0.0;
-            biome_mix[Biome::Lake as usize] = 0.0;
             if matches!(biome, Biome::Ocean | Biome::Lake) {
                 biome = land_biome(temperature, moisture);
             }
-            refine_biome_boundaries(self.config.seed, self.config.radius_m, p, &mut biome_mix);
+            // Reconstruct populations from continuous climate rather than
+            // interpolating one categorical label per atlas cell. Local lapse
+            // correction also places snow/vegetation on the reconstructed land.
+            biome_mix = crate::surface_detail::biome_mix(
+                &self.config,
+                p,
+                temperature - 0.0065 * (height - patch.height),
+                moisture,
+                height,
+                discharge,
+            );
             if river > 0.15 && matches!(biome, Biome::Desert | Biome::Grassland) {
                 biome = Biome::Wetland;
                 biome_mix[Biome::Wetland as usize] += 0.25;
@@ -578,7 +583,12 @@ fn geographic_height(world: &World, p: [f64; 3], patch: &Patch) -> f64 {
         * (1.0
             - feature_weight
                 * (1.0 - crate::landforms::detail_multiplier(world, patch.atlas_direction)));
-    let natural = patch.height + fractal_detail(world, p, erodability) * amplitude;
+    let natural = patch.height
+        + if amplitude > 0.0 {
+            fractal_detail(world, p, erodability) * amplitude
+        } else {
+            0.0
+        };
     let natural = lake_divide_height(world, patch, natural, amplitude);
     natural
         + feature_weight
@@ -590,6 +600,31 @@ fn geographic_feature_weight(world: &World, patch: &Patch) -> f64 {
         (crate::lake_geometry::geographic_clearance(world, patch.atlas_direction) / 3_000.0)
             .clamp(0.0, 1.0),
     )
+}
+
+/// Radius of a spherical cap where the canonical cell is guaranteed to stay
+/// in reconstruction's own-face 4x4 stencil. Ghost-cell mappings can add other
+/// occurrences, but are never needed for this conservative lower bound.
+fn stencil_inclusion_margin(index: usize, n: u32, p: [f64; 3], radius_m: f64) -> f64 {
+    let area = n as usize * n as usize;
+    let [normal, bu, bv] = FACE_BASES[index / area];
+    let local = index % area;
+    let coordinates = [(local % n as usize) as f64, (local / n as usize) as f64];
+    let plane = dot(p, normal);
+    let face_limit = 1.0 + 1.0 / f64::from(n);
+    let mut signed_distance = 1.0_f64;
+    for (coordinate, basis) in coordinates.into_iter().zip([bu, bv]) {
+        // ix=floor(fx); a cell x appears for ix in [x-2,x+1].
+        let low = (2.0 * (coordinate - 1.5) / f64::from(n) - 1.0).max(-face_limit);
+        let high = (2.0 * (coordinate + 2.5) / f64::from(n) - 1.0).min(face_limit);
+        let projected = dot(p, basis);
+        signed_distance = signed_distance
+            .min((projected - low * plane) / (1.0 + low * low).sqrt())
+            .min((high * plane - projected) / (1.0 + high * high).sqrt());
+    }
+    // The four positive half-spaces also imply plane>0. Their nearest great
+    // circle bounds the cap independently of which face dominates p.
+    radius_m * signed_distance.clamp(0.0, 1.0).asin()
 }
 
 fn local_environment(
@@ -607,13 +642,17 @@ fn local_environment(
     }
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
-    let mut protected = if natural < 35.0
-        || crate::lake_geometry::geographic_clearance(world, patch.atlas_direction) <= 2_301.0
-    {
-        1.0
-    } else {
-        0.0
-    };
+    let clearance = crate::lake_geometry::geographic_clearance(world, patch.atlas_direction);
+    // This distance is global and 1-Lipschitz in the atlas domain. Height and
+    // the bounded channel stencil alone cannot provide the same guarantee.
+    let mut protected_inner_m =
+        (crate::local_water::LOCAL_WATER_SUPPORT_M + 1.0 - clearance).max(0.0);
+    let mut protected =
+        if natural < 35.0 || clearance <= crate::local_water::LOCAL_WATER_SUPPORT_M + 1.0 {
+            1.0
+        } else {
+            0.0
+        };
     for &index in &patch.nearby[..patch.nearby_count] {
         let cell = &world.cells[index];
         let h = f64::from(cell.height_m);
@@ -631,10 +670,21 @@ fn local_environment(
         let delta = std::array::from_fn::<_, 3, _>(|i| patch.atlas_direction[i] - a[i]);
         let t = (dot(delta, v) / dot(v, v).max(1e-30)).clamp(0.0, 1.0);
         let offset = std::array::from_fn::<_, 3, _>(|i| delta[i] - t * v[i]);
-        if dot(offset, offset).sqrt() * world.config.radius_m
-            < 450.0 + 18.0 * f64::from(cell.discharge).sqrt()
-        {
+        let channel_margin = 450.0 + 18.0 * f64::from(cell.discharge).sqrt()
+            - dot(offset, offset).sqrt() * world.config.radius_m;
+        if channel_margin > 0.0 {
             protected = 1.0;
+            // Distance to the segment is 1-Lipschitz, but that segment must
+            // also remain in the bounded stencil at every basin anchor.
+            if channel_margin > protected_inner_m {
+                protected_inner_m =
+                    protected_inner_m.max(channel_margin.min(stencil_inclusion_margin(
+                        index,
+                        world.config.resolution,
+                        patch.atlas_direction,
+                        world.config.radius_m,
+                    )));
+            }
         }
     }
     crate::local_water::LocalWaterEnvironment {
@@ -644,6 +694,7 @@ fn local_environment(
         moisture,
         roughness: (high - low) / (6.0 * patch.spacing_m).max(1.0),
         protected_water_weight: protected,
+        protected_inner_m,
     }
 }
 
@@ -672,37 +723,7 @@ fn local_water_at(
 }
 
 fn fractal_detail(world: &World, p: [f64; 3], erodability: f64) -> f64 {
-    let frequency = f64::from(world.config.resolution) * 0.75;
-    let warp = std::array::from_fn(|i| {
-        p[i] + 0.32 / frequency
-            * noise(
-                world.config.seed ^ (0x99121 + i as u64 * 107),
-                p,
-                frequency * 0.37,
-            )
-    });
-    let warp = normalize(warp);
-    let mut value = 0.0;
-    let mut normalization = 0.0;
-    let mut amplitude = 1.0;
-    let mut frequency = frequency;
-    let ridge_fraction = (0.58 - 0.24 * erodability).clamp(0.1, 0.5);
-    for band in 0..17 {
-        if world.config.radius_m / frequency < 0.5 {
-            break;
-        }
-        let n = noise(
-            world.config.seed.wrapping_add(0x44281 + band * 97),
-            warp,
-            frequency,
-        );
-        let ridge = (0.6 - 2.0 * n.abs()).clamp(-1.0, 1.0);
-        value += amplitude * (n * (1.0 - ridge_fraction) + ridge * ridge_fraction);
-        normalization += amplitude;
-        amplitude *= 2.0_f64.powf(-0.85);
-        frequency *= 2.0;
-    }
-    value / normalization
+    crate::surface_detail::relief(&world.config, p, erodability)
 }
 
 fn channel_at(world: &World, index: usize, p: [f64; 3], spacing: f64) -> Option<Channel> {
@@ -867,35 +888,6 @@ fn land_biome(temperature: f64, moisture: f64) -> Biome {
     }
 }
 
-/// Reweight existing terrestrial transitions, rather than inventing climate or
-/// changing a water owner. Fixed metric bands keep their locations at every LOD;
-/// zero fractions remain zero and pure biome interiors remain pure.
-fn refine_biome_boundaries(seed: u64, radius: f64, p: [f64; 3], mix: &mut [f32; 10]) {
-    if mix[2..].iter().filter(|&&w| w > 0.0).count() < 2 {
-        return;
-    }
-    for (i, weight) in mix.iter_mut().enumerate().skip(2) {
-        if *weight <= 0.0 {
-            continue;
-        }
-        let key = seed ^ 0xb10_7e5 ^ (i as u64).wrapping_mul(104_729);
-        let perturbation = [(30_000.0, 0.85), (3_000.0, 0.50), (300.0, 0.25)]
-            .into_iter()
-            .enumerate()
-            .map(|(band, (metres, amplitude))| {
-                amplitude * noise(key ^ (band as u64 * 193), p, radius / metres)
-            })
-            .sum::<f64>();
-        *weight *= perturbation.exp() as f32;
-    }
-    let total: f32 = mix[2..].iter().sum();
-    if total > 0.0 {
-        for fraction in &mut mix[2..] {
-            *fraction /= total;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,34 +895,32 @@ mod tests {
 
     #[test]
     fn biome_boundary_detail_is_continuous_seeded_and_preserves_water_exclusion() {
+        let config = WorldConfig {
+            seed: 2386084681,
+            ..Default::default()
+        };
         let p = normalize([0.43, 0.61, -0.37]);
-        let mut mix = [0.0; 10];
-        mix[Biome::Grassland as usize] = 0.5;
-        mix[Biome::Forest as usize] = 0.5;
-        let mut a = mix;
-        refine_biome_boundaries(2386084681, 1_737_000.0, p, &mut a);
-        let mut repeat = mix;
-        refine_biome_boundaries(2386084681, 1_737_000.0, p, &mut repeat);
-        assert_eq!(a, repeat);
+        let sample = |config: &WorldConfig, p| {
+            crate::surface_detail::biome_mix(config, p, 10.0, 0.46, 200.0, 40.0)
+        };
+        let a = sample(&config, p);
+        assert_eq!(a, sample(&config, p));
         assert_eq!(a[Biome::Ocean as usize], 0.0);
         assert_eq!(a[Biome::Lake as usize], 0.0);
         assert!(a.iter().all(|w| w.is_finite() && *w >= 0.0));
         assert!((a.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        let mut another_seed = mix;
-        refine_biome_boundaries(1, 1_737_000.0, p, &mut another_seed);
-        assert_ne!(a, another_seed);
-        let mut adjacent = mix;
-        refine_biome_boundaries(
-            2386084681,
-            1_737_000.0,
-            normalize([p[0] + 0.001 / 1_737_000.0, p[1], p[2]]),
-            &mut adjacent,
+        assert_ne!(
+            a,
+            sample(
+                &WorldConfig {
+                    seed: 1,
+                    ..config.clone()
+                },
+                p
+            )
         );
+        let adjacent = sample(&config, normalize([p[0] + 0.001 / 1_737_000.0, p[1], p[2]]));
         assert!((a[5] - adjacent[5]).abs() < 1e-5);
-        let mut pure = [0.0; 10];
-        pure[Biome::Forest as usize] = 1.0;
-        refine_biome_boundaries(1, 1_737_000.0, p, &mut pure);
-        assert_eq!(pure[Biome::Forest as usize], 1.0);
     }
 
     fn synthetic() -> World {
@@ -957,6 +947,83 @@ mod tests {
         }
         world.invalidate_geometry();
         world
+    }
+
+    #[test]
+    fn stencil_margin_preserves_cell_presence_across_faces_and_corners() {
+        let world = synthetic();
+        let n = world.config.resolution;
+        let radius = world.config.radius_m;
+        let mut checked = 0;
+        for face in 0..6 {
+            for x in [0, n / 2, n - 1] {
+                for y in [0, n / 2, n - 1] {
+                    let index = geometry::cell_index(face, x, y, n);
+                    for dx in [-1.99, -0.5, 0.0, 0.5, 1.99] {
+                        for dy in [-1.99, -0.5, 0.0, 0.5, 1.99] {
+                            let p = direction(
+                                face,
+                                2.0 * (f64::from(x) + 0.5 + dx) / f64::from(n) - 1.0,
+                                2.0 * (f64::from(y) + 0.5 + dy) / f64::from(n) - 1.0,
+                            );
+                            let margin = stencil_inclusion_margin(index, n, p, radius);
+                            if margin <= 0.0 {
+                                continue;
+                            }
+                            let east = normalize(geometry::cross(
+                                if p[1].abs() < 0.9 {
+                                    [0.0, 1.0, 0.0]
+                                } else {
+                                    [1.0, 0.0, 0.0]
+                                },
+                                p,
+                            ));
+                            let north = geometry::cross(p, east);
+                            for ray in 0..16 {
+                                let angle = ray as f64 * std::f64::consts::TAU / 16.0;
+                                let distance = margin / radius * 0.999;
+                                let q = std::array::from_fn(|i| {
+                                    p[i] * distance.cos()
+                                        + (east[i] * angle.cos() + north[i] * angle.sin())
+                                            * distance.sin()
+                                });
+                                let patch = reconstruction(&world, q);
+                                assert!(patch.nearby[..patch.nearby_count].contains(&index));
+                                checked += 1;
+                            }
+                            assert_eq!(
+                                stencil_inclusion_margin(index, n, p.map(|v| -v), radius),
+                                0.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn channel_interior_margin_keeps_the_same_protection_at_basin_anchors() {
+        let mut world = synthetic();
+        let index = geometry::cell_index(4, 3, 3, 8);
+        world.cells[index].receiver = Some(geometry::cell_index(4, 4, 3, 8));
+        world.cells[index].discharge = 144.0;
+        let p = world.cells[index].position;
+        let current = local_environment(&world, &reconstruction(&world, p), 160.0);
+        assert!(current.protected_inner_m > 600.0);
+        let east = normalize(geometry::cross([0.0, 1.0, 0.0], p));
+        let north = geometry::cross(p, east);
+        for ray in 0..32 {
+            let angle = ray as f64 * std::f64::consts::TAU / 32.0;
+            let distance = 0.99 * current.protected_inner_m / world.config.radius_m;
+            let q = std::array::from_fn(|i| {
+                p[i] * distance.cos()
+                    + (east[i] * angle.cos() + north[i] * angle.sin()) * distance.sin()
+            });
+            let e = local_environment(&world, &reconstruction(&world, q), 160.0);
+            assert_eq!(e.protected_water_weight, 1.0);
+        }
     }
 
     #[test]
@@ -1613,6 +1680,11 @@ mod tests {
     #[test]
     fn fine_vertical_detail_cannot_flip_the_canonical_coastline() {
         let mut world = synthetic();
+        // This assertion isolates bounded vertical noise. Geographic islands
+        // and fjord cuts intentionally move the atlas's original zero set.
+        world.config.archipelago_density = 0.0;
+        world.config.fjord_strength = 0.0;
+        world.config.regional_lake_density = 0.0;
         world.config.detail_m = 140.0;
         for cell in &mut world.cells {
             cell.height_m = (800.0 * cell.position[0]) as f32;
@@ -1655,6 +1727,9 @@ mod tests {
     #[test]
     fn fractal_coast_is_stable_across_lod_and_preserves_continental_envelope() {
         let mut world = synthetic();
+        world.config.archipelago_density = 0.0;
+        world.config.fjord_strength = 0.0;
+        world.config.regional_lake_density = 0.0;
         world.config.detail_m = 40.0;
         for c in &mut world.cells {
             c.height_m = 1200.0 * c.position[0] as f32;
