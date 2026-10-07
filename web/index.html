@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b121a">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Ccircle cx=%2716%27 cy=%2716%27 r=%2714%27 fill=%27%23285b67%27/%3E%3Cpath d=%27M7 11L15 5 25 12 18 16 20 24 12 26 8 18Z%27 fill=%27%2381a47c%27/%3E%3C/svg%3E">
   <title>World Builder</title>
   <link rel="stylesheet" href="/style.css">
 </head>
@@ -19,6 +20,9 @@
       <section id="pane-generation" class="tab-pane" role="tabpanel" aria-labelledby="tab-generation">
         <form id="generator">
           <div class="form-fields">
+            <label for="generation-mode">Mode de la prochaine planète</label>
+            <select id="generation-mode"><option value="hybrid" selected>Hybride · relief complet InfiniteDiffusion</option><option value="procedural">Procédural original</option></select>
+            <p class="hint">Les continents et l’hydrologie viennent du générateur original. En hybride, le NN produit les hauteurs complètes du terrain exploré, avec ses aperçus puis sa source à30m. Le monde orbital et les eaux restent issus du générateur original.</p>
             <label for="preset">Point de départ</label>
             <select id="preset"><option value="custom">Personnalisé</option><option value="balanced">Équilibré</option><option value="preview">Essai rapide</option><option value="mountains">Relief marqué</option><option value="oceanic">Monde océanique</option><option value="fjords">Fjords</option><option value="archipelagos">Archipels</option><option value="wetlands">Lacs et marais</option></select>
             <p id="preset-description" class="hint">Les réglages prennent effet à la prochaine génération.</p>
@@ -27,12 +31,16 @@
             <details class="settings-section" open><summary>Planète</summary>
               <div class="field-pair"><div><label for="resolution">Atlas / face</label><select id="resolution"><option value="32">32 × 32</option><option value="64">64 × 64</option><option value="96">96 × 96</option><option value="128" selected>128 × 128</option><option value="256">256 × 256</option><option value="512">512 × 512</option><option value="1024">1024 × 1024</option></select></div><div><label for="radius">Rayon <span>km</span></label><input id="radius" type="number" value="1737" min="10" max="100000" step="any" required></div></div>
               <p id="config-cost" class="hint">98 304 cellules d’atlas</p>
+              <div class="field-pair"><div><label for="plate-count">Plaques tectoniques</label><input id="plate-count" type="number" value="14" min="3" max="64" step="1" required></div><div><label for="continent-scale">Échelle des continents</label><input id="continent-scale" type="number" value="1" min="0.25" max="4" step="any" required></div></div>
+              <label for="continent-fragmentation">Fragmentation des continents</label><input id="continent-fragmentation" type="number" value="0.8" min="0" max="2" step="any" required>
               <label for="gravity">Gravité <span>m/s²</span></label><input id="gravity" type="number" value="3" min="0.05" max="100" step="any" required>
             </details>
             <details class="settings-section" open><summary>Relief et côtes</summary>
               <div class="field-pair"><div><label for="relief">Amplitude du relief <span>m</span></label><input id="relief" type="number" value="6000" min="10" step="any" required></div><div><label for="detail">Détail du terrain <span>m</span></label><input id="detail" type="number" value="140" min="0" step="any" required></div></div>
+              <label for="surface-spacing">Échelle minimale du terrain <span>m</span></label><input id="surface-spacing" type="number" value="0.2" min="0.2" max="30" step="any" required>
+              <p class="hint">En procédural, le bruit fournit les petites échelles. En hybride, les hauteurs NN natives à30m sont interpolées en douceur ; un maillage plus fin ne crée pas de nouvelles données apprises.</p>
               <label class="slider-label" for="coast-detail">Détail côtier <output id="coast-detail-value">30 %</output></label><input id="coast-detail" type="range" min="0" max="100" step="0.1" value="30">
-              <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="0.25" min="0.25" max="10000" step="any" required>
+              <label for="coast-spacing">Échelle de référence des côtes <span>m</span></label><input id="coast-spacing" type="number" value="0.25" min="0.2" max="10000" step="any" required>
               <p class="hint">Le détail côtier règle la déformation des côtes. L’échelle minimale reste fixe, quel que soit le zoom.</p>
               <label class="slider-label" for="fjord-strength">Fjords polaires <output id="fjord-strength-value">65 %</output></label><input id="fjord-strength" type="range" min="0" max="100" step="0.1" value="65">
               <label class="slider-label" for="archipelago-density">Densité des archipels <output id="archipelago-density-value">60 %</output></label><input id="archipelago-density" type="range" min="0" max="100" step="0.1" value="60">
@@ -67,7 +75,13 @@
       </section>
       <section id="pane-view" class="tab-pane" role="tabpanel" aria-labelledby="tab-view" hidden>
         <div class="pane-content">
-          <label for="layer">Champ visible</label><select id="layer"><option value="0">Biomes et eaux</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage</option></select>
+          <label for="terrain-mode">Génération du relief</label><select id="terrain-mode"><option value="procedural">Procédural original</option><option value="hybrid" selected>Hybride · terrain InfiniteDiffusion</option></select>
+          <button id="show-nn-relief" class="secondary" type="button">Voir montagnes NN · vue à18km</button>
+          <p class="hint">Sur la planète de démo, ouvre une zone montagneuse froide. Le NN fournit le terrain complet à30m, puis une interpolation continue au zoom rapproché.</p>
+          <div class="config-actions"><button id="zoom-native" type="button">Détail NN 30 m</button><button id="zoom-fine" type="button">Zoom rapproché · interpolation</button></div>
+          <p id="terrain-resolution" class="hint" aria-live="off">Le terrain original reste disponible pendant le calcul des patches NN.</p>
+          <label for="layer">Champ visible</label><select id="layer"><option value="0">Biomes et eaux</option><option value="5">Relief coloré · altitude et pentes</option><option value="1">Altitude</option><option value="2">Température</option><option value="3">Humidité</option><option value="4">Drainage</option></select>
+          <div id="relief-measure" hidden><p id="relief-summary" class="hint">Mesure au centre en attente du maillage.</p><p class="hint">Δ NN compare les sommets du relief hybride à leurs altitudes procédurales originales. Mer, lacs et rivières peuvent conserver un résidu nul.</p></div>
           <label class="slider-label" for="season">Saison <output id="season-value">Moyenne annuelle</output></label><input id="season" type="range" min="0" max="12" value="0" step="1">
           <label class="checkbox-label"><input id="show-rivers" type="checkbox" checked> Afficher les rivières</label>
           <label class="slider-label" for="exaggeration">Amplification visuelle du relief <output id="exaggeration-value">×1</output></label><input id="exaggeration" type="range" min="1" max="30" value="1">
@@ -86,7 +100,16 @@
       <div class="panel-footer"><div id="message" role="status" aria-live="polite" hidden></div><div class="runtime"><span id="runtime-dot" class="dot"></span><span id="backend">Chargement du moteur…</span></div></div>
     </div>
   </aside>
-  <main class="viewport"><canvas id="planet" aria-label="Explorateur de planète en trois dimensions"></canvas><footer class="statusbar"><span id="status">Initialisation…</span><span id="camera">Orbite</span><span id="fps">— fps</span></footer></main>
+  <main class="viewport"><canvas id="planet" role="img" aria-label="Explorateur de planète en trois dimensions" aria-describedby="relief-summary"></canvas>
+    <aside id="relief-legend" class="relief-legend" aria-label="Légende du relief coloré" hidden>
+      <strong>Relief coloré · altitude générée (m)</strong>
+      <div class="relief-scale" aria-hidden="true"></div><div class="relief-stops"><span>0</span><span>500</span><span>2 000</span><span>6 000</span></div>
+      <p>Valeurs hors échelle : teinte basse sous 0 m ; teinte haute au-delà de 6 000 m.</p>
+      <p>Rouge accentué : pentes de 20 à 55°. Clair et sombre : éclairage des normales réelles. Eau : bleu.</p>
+      <p>Source : terrain NN complet en hybride, procédural hors couverture et eaux protégées. Aucune texture de biome.</p>
+      <p id="relief-overlay-summary">Mesure au centre en attente du maillage.</p>
+    </aside>
+    <footer class="statusbar"><span id="status">Initialisation…</span><span id="camera">Orbite</span><span id="fps">— fps</span></footer></main>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -36,6 +36,11 @@ struct Channel {
     id: u64,
 }
 
+fn hybrid_fade(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
 impl World {
     pub fn sample(&self, position: [f64; 3]) -> Sample {
         let p = normalize(position);
@@ -95,11 +100,22 @@ impl World {
         let mut channel_weight = 0.0;
         let mut channel_beds = 0.0;
         let mut channel_depths = 0.0;
+        let mut hybrid_weight = hybrid_fade(
+            (crate::lake_geometry::geographic_clearance(self, patch.atlas_direction) / 160.0)
+                .clamp(0.0, 1.0),
+        );
         for &index in &patch.nearby[..patch.nearby_count] {
             let Some(candidate) = channel_at(self, index, p, patch.spacing_m) else {
                 continue;
             };
             let carved = carve(candidate, natural);
+            // Reach full permission before the bounded channel projection expires.
+            // Dry metadata extends to 1.1 half-widths; the NN weight is zero there.
+            let protected_radius = candidate.half_width_m * 1.1;
+            let feather = ((candidate.valley_width_m - protected_radius) * 0.8).clamp(1.0, 160.0);
+            hybrid_weight = hybrid_weight.min(hybrid_fade(
+                ((candidate.distance_m - protected_radius) / feather).clamp(0.0, 1.0),
+            ));
             height = height.min(carved);
             let radial = candidate.distance_m / candidate.half_width_m;
             let wet_shape = (1.0 - radial * radial).max(0.0).powi(2);
@@ -264,6 +280,16 @@ impl World {
             ocean,
             lake,
             river: river as f32,
+            hybrid_weight: if ocean || lake || depth > 0.0 {
+                0.0
+            } else {
+                let local_weight = local_water.map_or(1.0, |water| {
+                    let bank =
+                        hybrid_fade(((height - water.level_m).max(0.0) / 8.0).clamp(0.0, 1.0));
+                    bank * (1.0 - water.wetland_weight.clamp(0.0, 1.0)).powi(2)
+                });
+                (hybrid_weight * local_weight) as f32
+            },
         }
     }
 
@@ -947,6 +973,107 @@ mod tests {
         }
         world.invalidate_geometry();
         world
+    }
+
+    #[test]
+    fn hybrid_constant_minus_eighty_river_transect_has_no_dry_metadata_step() {
+        use crate::hybrid::{chart_plane, HybridField, HybridPatch, NATIVE_MPP, PATCH_SIDE};
+        let mut world = synthetic();
+        for cell in &mut world.cells {
+            cell.height_m = 1000.0;
+            cell.water_m = 1000.0;
+        }
+        let a = geometry::cell_index(4, 3, 3, 8);
+        let b = geometry::cell_index(4, 4, 3, 8);
+        world.cells[a].receiver = Some(b);
+        world.cells[a].discharge = 1000.0;
+        world.cells[b].discharge = 1000.0;
+        world.invalidate_geometry();
+        let reach = world.river_reach(a).unwrap();
+        let center = reach.position(0.5);
+        let along = normalize(std::array::from_fn(|i| reach.end[i] - reach.start[i]));
+        let across = normalize(geometry::cross(center, along));
+        let channel = channel_at(&world, a, center, world.cells[a].area_m2.sqrt()).unwrap();
+        let protected = channel.half_width_m * 1.1;
+        let feather = ((channel.valley_width_m - protected) * 0.8).clamp(1.0, 160.0);
+        let plane = chart_plane(4, center, world.config.radius_m);
+        let cx = (plane[0] / (NATIVE_MPP * 256.0)).floor() as i32;
+        let cy = (plane[1] / (NATIVE_MPP * 256.0)).floor() as i32;
+        let mut patches = Vec::new();
+        for y in cy - 1..=cy + 1 {
+            for x in cx - 1..=cx + 1 {
+                patches.push(HybridPatch {
+                    face: 4,
+                    level: 0,
+                    x,
+                    y,
+                    values: vec![-80.0; PATCH_SIDE * PATCH_SIDE],
+                });
+            }
+        }
+        let field = HybridField::new(world.id.clone(), 1, world.config.radius_m, patches).unwrap();
+        let sample = |distance: f64| {
+            let angle = distance / world.config.radius_m;
+            world.sample(normalize(std::array::from_fn(|i| {
+                center[i] * angle.cos() + across[i] * angle.sin()
+            })))
+        };
+        let delta = |distance: f64| {
+            let s = sample(distance);
+            field.protected_delta(
+                s.direction,
+                f64::from(s.height_m),
+                s.water_level_m.map(f64::from),
+                s.water_body_id,
+                f64::from(s.river),
+                s.ocean,
+                s.lake,
+            ) * f64::from(s.hybrid_weight)
+        };
+        assert!((field.raw_delta(center) + 80.0).abs() < 1e-8);
+        let mut wet = 0;
+        for sign in [-1.0, 1.0] {
+            let extent = protected + feather + 20.0;
+            let step = 0.2;
+            let steps = (extent / step).ceil() as usize;
+            let mut previous = delta(0.0);
+            for i in 0..=steps {
+                let distance = sign * i as f64 * step;
+                let s = sample(distance);
+                let current = delta(distance);
+                assert!(s.hybrid_weight.is_finite() && (0.0..=1.0).contains(&s.hybrid_weight));
+                assert!(
+                    (current - previous).abs() < 80.0 * 2.0 * step / feather + 0.02,
+                    "NN river step at {distance}m: {previous} -> {current}; feather={feather}m"
+                );
+                if s.water_m > s.height_m && s.river > 0.0 {
+                    assert_eq!(current, 0.0);
+                    wet += 1;
+                }
+                previous = current;
+            }
+            assert!(
+                delta(sign * extent) < -79.0,
+                "Transect must reach the actual -80m residual outside protection"
+            );
+            for offset in [-0.02, 0.0, 0.02] {
+                assert!(
+                    delta(sign * (protected + offset)).abs() < 0.001,
+                    "Dry river metadata expiration must not introduce a learned cliff"
+                );
+            }
+            // A cubic smoothstep has a finite second-derivative jump here.
+            // Quintic coverage instead converges to zero with the probe span.
+            let h = 0.1_f64.min(feather * 0.001);
+            let f0 = delta(sign * protected);
+            let second = (delta(sign * (protected + h)) - 2.0 * f0 + delta(sign * (protected - h)))
+                / (h * h);
+            assert!(
+                second.abs() < 80.0 * 12.0 * h / feather.powi(3) + 0.001,
+                "River protection is not C2: second difference={second}, feather={feather}"
+            );
+        }
+        assert!(wet > 10);
     }
 
     #[test]

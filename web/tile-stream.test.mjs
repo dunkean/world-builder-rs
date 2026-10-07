@@ -170,3 +170,21 @@ test('all three slots remain usable for visible demand and a partial quartet can
   assert.equal(stream.jobs.size, 3);
   assert.equal(messages.filter((m) => m.type === 'load' && m.key === '5').length, 0);
 });
+
+
+test('ordinary root requests use the world atlas instead of a mismatched network grid', () => {
+  const { stream, messages, context } = setup();
+  stream.update([{ key: 'root', face: 4, level: 0 }], context);
+  assert.equal(messages.find((message) => message.type === 'load').rootFace, 4);
+});
+
+test('pending surface batches pause ordinary loads and propagate patch failures', () => {
+  const { stream, worker, messages, context, requests } = setup();
+  const errors = []; stream.onSurfaceError = (error) => errors.push(error);
+  stream.setSurface(2, 'pending', undefined, { paused: true });
+  worker.onmessage({ data: { type: 'surface-ready', version: 2 } });
+  stream.update(requests, context);
+  assert.equal(messages.filter((message) => message.type === 'load').length, 0);
+  worker.onmessage({ data: { type: 'patch-error', error: 'registry full' } });
+  assert.deepEqual(errors, ['registry full']);
+});

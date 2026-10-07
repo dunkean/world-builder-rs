@@ -56,8 +56,8 @@ pub(crate) fn relief(config: &WorldConfig, p: [f64; 3], erodability: f64) -> f64
     let mut normalization = 0.0;
     let mut amplitude = 1.0;
     let mut frequency = frequency;
-    for band in 0..17 {
-        if config.radius_m / frequency < 0.5 {
+    for band in 0..32 {
+        if config.radius_m / frequency < config.surface_detail_min_spacing_m {
             break;
         }
         let n = lattice(

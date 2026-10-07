@@ -3,6 +3,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   seed: 42,
   radius_m: 1737000,
   resolution: 128,
+  plate_count: 14,
+  continent_scale: 1,
+  continent_fragmentation: 0.8,
+  surface_detail_min_spacing_m: 0.2,
   ocean_fraction: 0.58,
   relief_m: 6000,
   detail_m: 140,
@@ -34,6 +38,9 @@ export const PRESETS = Object.freeze({
 });
 
 const fields = [
+  ['plate_count', 'plate-count', 1], ['continent_scale', 'continent-scale', 1],
+  ['continent_fragmentation', 'continent-fragmentation', 1],
+  ['surface_detail_min_spacing_m', 'surface-spacing', 1],
   ['seed', 'seed', 1], ['resolution', 'resolution', 1], ['radius_m', 'radius', 1000],
   ['ocean_fraction', 'ocean-fraction', 0.01], ['relief_m', 'relief', 1], ['detail_m', 'detail', 1],
   ['coast_detail_ratio', 'coast-detail', 0.01], ['coast_reference_spacing_m', 'coast-spacing', 1],
@@ -47,10 +54,13 @@ const fields = [
 ];
 
 const constraints = [
+  ['continent_scale', 'L’échelle des continents', 0.25, 4],
+  ['continent_fragmentation', 'La fragmentation des continents', 0, 2],
+  ['surface_detail_min_spacing_m', 'L’échelle minimale du terrain (m)', 0.2, 30],
   ['radius_m', 'Le rayon (m)', 10000, 100000000],
   ['ocean_fraction', 'La fraction océanique', 0.05, 0.95],
   ['coast_detail_ratio', 'Le détail côtier', 0, 1],
-  ['coast_reference_spacing_m', 'L’échelle des côtes (m)', 0.25, 10000],
+  ['coast_reference_spacing_m', 'L’échelle des côtes (m)', 0.2, 10000],
   ['fjord_strength', 'La force des fjords', 0, 1],
   ['archipelago_density', 'La densité des archipels', 0, 1],
   ['regional_lake_density', 'La densité des petits lacs', 0, 1],
@@ -70,6 +80,7 @@ export function normalizeConfig(value) {
   if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('Le champ config doit être un objet JSON.');
   const config = { ...DEFAULT_CONFIG, ...source };
   if (!Number.isSafeInteger(config.seed) || config.seed < 0) throw new Error('La graine doit être un entier entre 0 et 9 007 199 254 740 991 pour cette interface web.');
+  if (!Number.isInteger(config.plate_count) || config.plate_count < 3 || config.plate_count > 64) throw new Error('Le nombre de plaques doit être un entier entre 3 et 64.');
   if (!Number.isInteger(config.resolution) || config.resolution < 8 || config.resolution > 1024) throw new Error('La résolution de l’atlas doit être un entier entre 8 et 1024.');
   if (!Number.isInteger(config.erosion_steps) || config.erosion_steps < 0 || config.erosion_steps > 256) throw new Error('Le nombre d’étapes doit être un entier entre 0 et 256.');
   for (const [key, label, min, max] of constraints) {

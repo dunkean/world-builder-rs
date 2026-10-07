@@ -12,7 +12,16 @@ Installer [Rust avec rustup](https://rustup.rs), puis :
 
 Ouvrir **http://localhost:8001** dans Chrome ou Edge récent. Le premier lancement compile le serveur et le WASM, installe `wasm-bindgen-cli` et prépare la graine 42. Les suivants réutilisent les binaires et le monde enregistré. Après une mise à jour du générateur, régénérer le monde depuis l'interface pour bénéficier du nouvel algorithme.
 
-Sous Windows : `powershell -ExecutionPolicy Bypass -File scripts/run.ps1`. Sous WSL : lancer le script Linux et ouvrir l'URL dans le navigateur Windows. Le calcul régional peut utiliser CUDA dans WSL, tandis que le rendu utilise le GPU du navigateur Windows. WebGPU est prioritaire ; **http://localhost:8001/?backend=webgl** force WebGL2.
+Sous Windows : `powershell -ExecutionPolicy Bypass -File scripts/run.ps1`. Sous WSL : lancer le script Linux et ouvrir l'URL dans le navigateur Windows. Le calcul régional peut utiliser CUDA dans WSL, tandis que le rendu utilise le GPU du navigateur Windows. Firefox préfère WebGL2 ; les autres navigateurs essaient WebGPU en premier lorsqu’un adaptateur est disponible. **http://localhost:8001/?backend=webgl** préfère explicitement WebGL2 puis tente WebGPU en cas d’échec.
+
+Dans ce workspace, [le lanceur parent](../docs/world_builder_hybrid.md) démarre
+également la passerelle InfiniteDiffusion sur8767. Le mode hybride est le
+choix par défaut dans Génération : base des continents procédurale et hauteurs
+NN locales complètes à 30 m, avec aperçus appris. Le bouton
+**Voir montagnes NN · vue à 18 km** ouvre la vue colorée
+avec hauteur, pente et apport NN mesurés. `./scripts/run.sh` seul ne lance
+pas cette passerelle. Sous Firefox Windows/RDP, utiliser le profil dédié
+du lanceur `C:\workspace\map-denoise-firefox.cmd`.
 
 CUDA requiert le pilote NVIDIA et NVRTC, fourni par le CUDA Toolkit. Le script Linux ajoute `/usr/lib/wsl/lib` et `/usr/local/cuda/lib64` au chemin des bibliothèques. Sous Windows, rendre le dossier `bin` du Toolkit accessible dans `PATH`, par exemple avec `$env:Path = "$env:CUDA_PATH\bin;$env:Path"`. Sans CUDA/NVRTC, le serveur revient automatiquement au CPU ; le rapport régional indique le backend et la raison du repli. Le benchmark CUDA explicite échoue si CUDA est absent.
 
@@ -80,4 +89,4 @@ La version **0.8** réduit l’érosion par défaut et accélère la préparatio
 
 La [comparaison avec Burgmap](docs/QUALITY_REFERENCE.md), la [validation de l’érosion 0.7](docs/EROSION_VALIDATION.md) et l’[audit Sonnet](docs/AUDIT_BUGS_PERFORMANCE.md) conservent les relevés antérieurs. La [revue des lacs](docs/LAKE_REVIEW.md) explique leurs contraintes de reconstruction. Le terrain local de `city_generator` évolue à environ 64 m ; notre atlas 512 a un espacement moyen de 4,91 km. Le maillage fin ne remplace pas encore cette simulation locale.
 
-L'[architecture de recherche](docs/DESIGN_MONDE_MULTIECHELLE.md) dépasse les capacités actuelles. Les bilans sont mesurables, mais lois et coefficients restent simplifiés. L'érosion régionale simule une pluie finie ; son horloge n'est pas calibrée sur l'histoire géologique. Climat paramétrique, réservoirs sans hiérarchie Fill–Spill–Merge complète et absence de restriction conservatrice exacte entre niveaux restent des limites explicites. Le mode natif et le modèle appris ne sont pas implémentés.
+L'[architecture de recherche](docs/DESIGN_MONDE_MULTIECHELLE.md) dépasse les capacités actuelles. Les bilans sont mesurables, mais lois et coefficients restent simplifiés. L'érosion régionale simule une pluie finie ; son horloge n'est pas calibrée sur l'histoire géologique. Climat paramétrique, réservoirs sans hiérarchie Fill–Spill–Merge complète et absence de restriction conservatrice exacte entre niveaux restent des limites explicites. L’intégration InfiniteDiffusion fournit les hauteurs complètes des zones explorées via la passerelle externe ; les continents et l’hydrologie initiaux restent procéduraux. Le détail sous 30 m est interpolé, avec matériaux procéduraux, sans nouvelles structures apprises. Le checkpoint n’a pas de canal d’historique glaciaire.

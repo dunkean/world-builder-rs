@@ -21,12 +21,95 @@ const DEEP_STREAM_SEGMENTS: usize = 32;
 // Halving a tile's grid requires twice the tile frequency for the same
 // physical vertex spacing, hence up to four times as many visible leaves.
 const MAX_VISIBLE_TILES: usize = 1024;
-// Reserve inverse parents, the central return path and a staged quartet within
-// the existing 768 MiB CPU cache after WVP2's increase in vertex size.
-const MAX_PLANNED_LEAVES: usize = 1024;
+// Keep room for an atomic learned-field replacement, its old visible cut,
+// and canonical root support inside the existing 768 MiB CPU/GPU budgets.
+const MAX_PLANNED_LEAVES: usize = 576;
 const MAX_PREFETCH_TILES: usize = 64;
-const MORPH_DURATION_SECONDS: f64 = 0.16;
-const BIOME_DETAIL_SCALES_M: [f64; 6] = [64_000.0, 8_000.0, 1_000.0, 125.0, 16.0, 2.0];
+// The same value is injected into WGSL. Short, smooth transitions keep a
+// twenty-level descent from spending seconds waiting on completed geometry.
+const MORPH_DURATION_SECONDS: f64 = 0.08;
+const BIOME_DETAIL_SCALES_M: [f64; 8] = [64_000.0, 8_000.0, 1_000.0, 125.0, 16.0, 2.0, 0.5, 0.2];
+
+const TERRAIN_MEMORY_LIMIT: usize = 768 * 1024 * 1024;
+
+// Field revisions stay immutable while the incoming registry changes.
+#[derive(Default)]
+struct HybridSnapshots {
+    selected: Option<String>,
+    fields: HashMap<String, std::rc::Rc<world_core::hybrid::HybridField>>,
+}
+impl HybridSnapshots {
+    fn key(field: &world_core::hybrid::HybridField) -> String {
+        format!(
+            "{}/{}/{}",
+            field.world_id,
+            field.revision,
+            field.radius_m().to_bits()
+        )
+    }
+    fn prepare(
+        &mut self,
+        field: world_core::hybrid::HybridField,
+    ) -> std::rc::Rc<world_core::hybrid::HybridField> {
+        let key = Self::key(&field);
+        if let Some(existing) = self.fields.get(&key) {
+            return existing.clone();
+        }
+        self.fields
+            .retain(|candidate, _| Some(candidate) == self.selected.as_ref());
+        let field = std::rc::Rc::new(field);
+        self.fields.insert(key.clone(), field.clone());
+        self.selected = Some(key);
+        field
+    }
+    fn select(&mut self, key: &str) -> Option<std::rc::Rc<world_core::hybrid::HybridField>> {
+        let field = self.fields.get(key)?.clone();
+        self.selected = Some(key.to_owned());
+        self.fields.retain(|candidate, _| candidate == key);
+        Some(field)
+    }
+    fn procedural(&mut self) {
+        self.selected = None;
+        self.fields.clear();
+    }
+}
+fn surface_refresh_keys(active: &HashSet<TileKey>, changed: &HashSet<TileKey>) -> HashSet<TileKey> {
+    let mut keys: HashSet<_> = changed.intersection(active).copied().collect();
+    for key in keys.iter().copied().collect::<Vec<_>>() {
+        keys.extend(tile_neighbors(key, active));
+    }
+    // Keep the complete canonical orbital return path, including shared normals.
+    if changed.iter().any(|key| key.level == 0) {
+        keys.extend(lod::initial_leaves());
+    }
+    keys
+}
+fn within_surface_budget(
+    current: (usize, usize),
+    reserved: (usize, usize),
+    limits: (usize, usize),
+) -> bool {
+    current
+        .0
+        .checked_add(reserved.0)
+        .is_some_and(|n| n <= limits.0)
+        && current
+            .1
+            .checked_add(reserved.1)
+            .is_some_and(|n| n <= limits.1)
+}
+
+fn transition_needs_child_uploads(coarsening: bool, instant: bool) -> bool {
+    // Instant refinement still introduces four new resident GPU meshes.
+    // Only an invisible coarsening can omit the departing children's jobs.
+    !coarsening || !instant
+}
+
+fn surface_cpu_reservation(base: usize, mesh: usize, gpu_cpu: usize) -> usize {
+    // The decoded mesh is released immediately after upload. Only one upload
+    // can temporarily overlap both representations; that scratch is global.
+    base + mesh.max(gpu_cpu)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -40,7 +123,7 @@ struct NoiseBand {
 struct NoiseFrame {
     anchor_high: [f32; 4],
     anchor_low: [f32; 4],
-    bands: [NoiseBand; 6],
+    bands: [NoiseBand; 8],
 }
 
 fn noise_axes(point: DVec3) -> DVec3 {
@@ -52,12 +135,13 @@ fn noise_axes(point: DVec3) -> DVec3 {
 }
 
 fn noise_frame(anchor: DVec3, radius_m: f64) -> NoiseFrame {
-    let anchor = anchor.normalize();
+    let inverse_length = 1.0 / anchor.length();
+    let direction = anchor * inverse_length;
     let high = anchor.as_vec3();
     let low = (anchor - high.as_dvec3()).as_vec3();
-    let world_point = noise_axes(anchor) * radius_m;
+    let world_point = noise_axes(direction) * radius_m;
     NoiseFrame {
-        anchor_high: high.extend(0.0).to_array(),
+        anchor_high: high.extend(inverse_length as f32).to_array(),
         anchor_low: low.extend(0.0).to_array(),
         bands: BIOME_DETAIL_SCALES_M.map(|scale| {
             // Integer cell IDs retain the world phase. The floating-point
@@ -116,7 +200,7 @@ struct Config {
     resolution: usize,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 struct Sample {
     #[serde(alias = "position")]
@@ -142,6 +226,29 @@ struct Sample {
     biome_mix: [f64; 10],
     ocean: bool,
     lake: bool,
+    #[serde(deserialize_with = "native_f32")]
+    hybrid_weight: f64,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self {
+            direction: [0.0; 3],
+            height_m: 0.0,
+            water_m: 0.0,
+            water_level_m: None,
+            water_body_id: None,
+            temperature_c: 0.0,
+            moisture: 0.0,
+            discharge: 0.0,
+            river: 0.0,
+            biome: String::new(),
+            biome_mix: [0.0; 10],
+            ocean: false,
+            lake: false,
+            hybrid_weight: 1.0,
+        }
+    }
 }
 
 fn native_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -217,6 +324,7 @@ fn from_core_tile(tile: world_core::Tile) -> Tile {
                 biome_mix: s.biome_mix.map(f64::from),
                 ocean: s.ocean,
                 lake: s.lake,
+                hybrid_weight: f64::from(s.hybrid_weight),
             })
             .collect(),
         indices: tile.indices,
@@ -318,7 +426,7 @@ struct PreparedHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct PackedSample {
+struct LegacyPackedSample {
     direction: [f64; 3],
     height: f64,
     water: f64,
@@ -332,6 +440,39 @@ struct PackedSample {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PackedSample {
+    direction: [f64; 3],
+    height: f64,
+    water: f64,
+    level: f64,
+    body: u64,
+    fields: [f32; 4],
+    mix: [f32; 10],
+    biome: u32,
+    flags: u32,
+    hybrid_weight: f32,
+    reserved: u32,
+}
+impl From<LegacyPackedSample> for PackedSample {
+    fn from(sample: LegacyPackedSample) -> Self {
+        Self {
+            direction: sample.direction,
+            height: sample.height,
+            water: sample.water,
+            level: sample.level,
+            body: sample.body,
+            fields: sample.fields,
+            mix: sample.mix,
+            biome: sample.biome,
+            flags: sample.flags,
+            hybrid_weight: 1.0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct BorderNormal {
     index: u32,
     reserved: u32,
@@ -339,6 +480,8 @@ struct BorderNormal {
 }
 
 struct PreparedTile {
+    // Immutable procedural heights: every field revision starts from these.
+    base_heights: Vec<f64>,
     tile: Tile,
     mesh: Mesh,
     borders: Vec<BorderNormal>,
@@ -476,10 +619,12 @@ fn prepare_tile(tile: Tile, radius: f64, exaggeration: f64) -> Result<Vec<u8>, S
             mix: v.biome_mix.map(|x| x as f32),
             biome: BIOMES.iter().position(|name| *name == v.biome).unwrap_or(9) as u32,
             flags: u32::from(v.ocean) | u32::from(v.lake) << 1,
+            hybrid_weight: v.hybrid_weight as f32,
+            reserved: 0,
         })
         .collect();
     let header = PreparedHeader {
-        magic: *b"WVP2",
+        magic: *b"WVP4",
         face: tile.key.face,
         level: tile.key.level,
         reserved: [0; 2],
@@ -508,13 +653,61 @@ fn prepare_tile(tile: Tile, radius: f64, exaggeration: f64) -> Result<Vec<u8>, S
     Ok(bytes)
 }
 
+/// Apply the continuous field once, before geometry preparation. The raw tile
+/// and its procedural detail remain the immutable source for later revisions.
+fn hybrid_delta(field: &world_core::hybrid::HybridField, sample: &Sample, base_height: f64) -> f64 {
+    field.protected_delta(
+        sample.direction,
+        base_height,
+        sample.water_level_m,
+        sample.water_body_id,
+        sample.river,
+        sample.ocean,
+        sample.lake,
+    ) * if sample.hybrid_weight.is_finite() {
+        sample.hybrid_weight.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn prepare_hybrid_tile(
+    mut tile: Tile,
+    radius: f64,
+    exaggeration: f64,
+    field: Option<&world_core::hybrid::HybridField>,
+) -> Result<Vec<u8>, String> {
+    let base_heights: Vec<_> = tile.vertices.iter().map(|sample| sample.height_m).collect();
+    if let Some(field) = field {
+        for sample in &mut tile.vertices {
+            sample.height_m += hybrid_delta(field, sample, sample.height_m);
+            if let Some(level) = sample.water_level_m {
+                sample.water_m = (level - sample.height_m).max(0.0);
+            }
+        }
+    }
+    let mut packet = prepare_tile(tile, radius, exaggeration)?;
+    let size = std::mem::size_of::<PreparedHeader>();
+    let mut header: PreparedHeader = bytemuck::pod_read_unaligned(&packet[..size]);
+    header.magic = *b"WVP4";
+    header.counts[5] = base_heights.len() as u32;
+    packet[..size].copy_from_slice(bytemuck::bytes_of(&header));
+    packet.extend_from_slice(bytemuck::cast_slice(&base_heights));
+    Ok(packet)
+}
+
 fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
     let hsize = std::mem::size_of::<PreparedHeader>();
     if bytes.len() < hsize {
         return Err("Préparation tronquée".into());
     }
     let header: PreparedHeader = bytemuck::pod_read_unaligned(&bytes[..hsize]);
-    if header.magic != *b"WVP2"
+    if !matches!(&header.magic, b"WVP2" | b"WVP3" | b"WVP4")
+        || (header.magic == *b"WVP3" && header.counts[5] != header.counts[0])
+        || (header.magic == *b"WVP2" && header.counts[5] != 0)
+        || (header.magic == *b"WVP4"
+            && header.counts[5] != 0
+            && header.counts[5] != header.counts[0])
         || header.face >= 6
         || header.level > MAX_TILE_LEVEL
         || header.counts[0] > 263169
@@ -541,11 +734,32 @@ fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
         *offset = end;
         Ok(out)
     }
-    let samples: Vec<PackedSample> = read(bytes, &mut offset, header.counts[0] as usize)?;
+    let samples: Vec<PackedSample> = if header.magic == *b"WVP4" {
+        read(bytes, &mut offset, header.counts[0] as usize)?
+    } else {
+        read::<LegacyPackedSample>(bytes, &mut offset, header.counts[0] as usize)?
+            .into_iter()
+            .map(PackedSample::from)
+            .collect()
+    };
+    if samples.iter().any(|sample| {
+        !sample.hybrid_weight.is_finite() || !(0.0..=1.0).contains(&sample.hybrid_weight)
+    }) {
+        return Err("Poids de protection hybride invalide".into());
+    }
     let vertices: Vec<Vertex> = read(bytes, &mut offset, header.counts[1] as usize)?;
     let indices: Vec<u32> = read(bytes, &mut offset, header.counts[2] as usize)?;
     offset = (offset + 7) & !7;
     let borders = read(bytes, &mut offset, header.counts[3] as usize)?;
+    let base_heights = if header.counts[5] > 0 {
+        let heights: Vec<f64> = read(bytes, &mut offset, header.counts[5] as usize)?;
+        if heights.iter().any(|height| !height.is_finite()) {
+            return Err("Altitudes de référence invalides".into());
+        }
+        heights
+    } else {
+        samples.iter().map(|sample| sample.height).collect()
+    };
     if offset != bytes.len() || indices.iter().any(|i| *i as usize >= vertices.len()) {
         return Err("Indices de préparation invalides".into());
     }
@@ -574,11 +788,13 @@ fn decode_prepared_tile(bytes: &[u8]) -> Result<PreparedTile, String> {
                 biome_mix: v.mix.map(f64::from),
                 ocean: v.flags & 1 != 0,
                 lake: v.flags & 2 != 0,
+                hybrid_weight: f64::from(v.hybrid_weight),
             })
             .collect(),
         ..Default::default()
     };
     Ok(PreparedTile {
+        base_heights,
         tile,
         mesh: Mesh { vertices, indices },
         borders,
@@ -796,6 +1012,7 @@ fn atlas_sample(world: &World, direction: DVec3) -> Sample {
     let n = world.mesh_resolution();
     let mut sample = Sample {
         direction: direction.to_array(),
+        hybrid_weight: 0.0,
         ..Default::default()
     };
     let mut candidates = Vec::with_capacity(12);
@@ -851,6 +1068,7 @@ fn atlas_sample(world: &World, direction: DVec3) -> Sample {
         sample.moisture += w * cell.moisture;
         sample.discharge += w * cell.discharge;
         sample.river += w * cell.river;
+        sample.hybrid_weight += w * cell.hybrid_weight;
         if cell.biome_mix.iter().sum::<f64>() > 0.0 {
             for j in 0..10 {
                 sample.biome_mix[j] += w * cell.biome_mix[j];
@@ -1071,10 +1289,18 @@ fn tile_neighbors(key: TileKey, cut: &HashSet<TileKey>) -> HashSet<TileKey> {
     let count = (1u32 << key.level) as f64;
     let mut out = HashSet::new();
     for (x, y) in [
+        (-1e-6, 0.25),
         (-1e-6, 0.5),
+        (-1e-6, 0.75),
+        (1.000001, 0.25),
         (1.000001, 0.5),
+        (1.000001, 0.75),
+        (0.25, -1e-6),
         (0.5, -1e-6),
+        (0.75, -1e-6),
+        (0.25, 1.000001),
         (0.5, 1.000001),
+        (0.75, 1.000001),
         (-1e-6, -1e-6),
         (-1e-6, 1.000001),
         (1.000001, -1e-6),
@@ -1188,6 +1414,51 @@ fn bounded_footprint_level(
         level -= 1;
     }
     level
+}
+
+/// Keep the original bounded overview, spending remaining leaves on source
+/// resolution near the inspection centre. Periphery stays coarser and2:1.
+fn inspection_targets(
+    direction: DVec3,
+    wanted: u8,
+    mut base: u8,
+    aspect: f64,
+    altitude: f64,
+    tilt: f64,
+) -> Vec<TileKey> {
+    loop {
+        let raw = footprint_keys(direction, base, aspect, altitude, tilt);
+        let mut parents: Vec<_> = raw.into_iter().filter_map(lod::parent).collect();
+        let (face, u, v) = face_uv(direction);
+        let count = 1u32 << wanted.saturating_sub(1);
+        let centre = TileKey {
+            face: face as u8,
+            level: wanted.saturating_sub(1),
+            x: (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+            y: (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+        };
+        parents.push(centre);
+        let mut targets = graduate_targets(&parents, wanted, direction);
+        if graduated_leaf_count(&targets, wanted) <= MAX_PLANNED_LEAVES || base == 0 {
+            let mut neighbors: Vec<_> = same_level_neighbors(centre).into_iter().collect();
+            neighbors.sort_by(|a, b| {
+                tile_center(*b)
+                    .dot(direction)
+                    .total_cmp(&tile_center(*a).dot(direction))
+            });
+            for neighbor in neighbors {
+                parents.push(neighbor);
+                let candidate = graduate_targets(&parents, wanted, direction);
+                if graduated_leaf_count(&candidate, wanted) <= MAX_PLANNED_LEAVES {
+                    targets = candidate;
+                } else {
+                    parents.pop();
+                }
+            }
+            return targets;
+        }
+        base -= 1;
+    }
 }
 
 fn split_preserves_grading(key: TileKey, cut: &HashSet<TileKey>) -> bool {
@@ -2339,7 +2610,16 @@ mod browser {
     use wasm_bindgen::JsCast;
     use wgpu::util::DeviceExt;
 
-    thread_local! { static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) }; }
+    thread_local! {
+        static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
+        // A worker has its own WASM instance. Parsing a field once avoids
+        // repeatedly decoding megabytes of residuals for each procedural tile.
+        static WORKER_FIELD: RefCell<Option<std::rc::Rc<world_core::hybrid::HybridField>>> = const { RefCell::new(None) };
+        static WORKER_SNAPSHOTS: RefCell<HybridSnapshots> = RefCell::new(HybridSnapshots::default());
+        static VIEW_SNAPSHOT: RefCell<String> = RefCell::new("{}".into());
+        static WORKER_WORLD: RefCell<Option<World>> = const { RefCell::new(None) };
+        static FIELD_PATCHES: RefCell<HashMap<String, world_core::hybrid::HybridPatch>> = RefCell::new(HashMap::new());
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
@@ -2520,6 +2800,8 @@ mod browser {
     }
     struct CachedTile {
         key: TileKey,
+        base_heights: Vec<f64>,
+        surface_version: u32,
         tile: Tile,
         prepared: Option<Mesh>,
         borders: Vec<BorderNormal>,
@@ -2534,6 +2816,7 @@ mod browser {
         fn cpu_bytes(&self) -> usize {
             std::mem::size_of::<Self>()
                 + self.cpu_base
+                + self.base_heights.capacity() * 8
                 + self.tile.morph_offsets.capacity() * 24
                 + self.prepared.as_ref().map_or(0, |m| {
                     m.vertices.capacity() * std::mem::size_of::<Vertex>() + m.indices.capacity() * 4
@@ -2579,6 +2862,7 @@ mod browser {
         mesh_builds: u64,
         cut_commits: u64,
         instant_coarsen_commits: u64,
+        instant_refine_commits: u64,
         reused_tiles: u64,
         max_prepare_ms: f64,
         last_prepare_ms: f64,
@@ -2619,6 +2903,18 @@ mod browser {
             + borders.capacity() * std::mem::size_of::<BorderNormal>()
     }
 
+    struct SurfaceUpdate {
+        version: u32,
+        field: Option<world_core::hybrid::HybridField>,
+        keys: Vec<TileKey>,
+        packets: HashMap<TileKey, PreparedTile>,
+        staged: HashMap<TileKey, (PreparedTile, GpuMesh)>,
+        shared: HashMap<(u8, [i64; 3]), [f32; 3]>,
+        epoch: u32,
+        invalidated: HashSet<TileKey>,
+        reservations: HashMap<TileKey, (usize, usize)>,
+    }
+
     struct Renderer {
         surface: wgpu::Surface<'static>,
         device: wgpu::Device,
@@ -2633,7 +2929,11 @@ mod browser {
         base_surfaces: [Vec<DVec3>; 2],
         tiles: Vec<CachedTile>,
         pending: Option<PendingCut>,
+        surface_update: Option<SurfaceUpdate>,
+        surface_field: Option<world_core::hybrid::HybridField>,
+        surface_version: u32,
         cut_dirty: bool,
+        surface_priority_until: f64,
         cut_visible: bool,
         signature: Option<[u64; 5]>,
         last_camera_change: f64,
@@ -2712,19 +3012,54 @@ mod browser {
             camera_level(altitude).max(step)
         }
         fn level_for(&self, direction: DVec3, altitude: f64) -> u8 {
-            bounded_footprint_level(
+            let requested = self.requested_level_for(altitude);
+            let base = bounded_footprint_level(
                 direction,
-                self.requested_level_for(altitude),
+                requested,
                 self.aspect(),
                 altitude,
                 self.view_tilt,
-            )
+            );
+            if let Some(field) = &self.surface_field {
+                if field.kind == world_core::hybrid::SurfaceKind::Height {
+                    if let Some(spacing) = field.source_spacing(direction.to_array()) {
+                        let radius = self
+                            .world
+                            .as_ref()
+                            .map_or(1_737_000.0, |w| w.config.radius_m);
+                        let native = (2.0 * radius / (DEEP_STREAM_SEGMENTS as f64 * spacing))
+                            .log2()
+                            .ceil()
+                            .clamp(0.0, f64::from(MAX_TILE_LEVEL))
+                            as u8;
+                        return base.max(native.min(requested.saturating_add(1)));
+                    }
+                }
+            }
+            base
         }
         fn detail_level(&self) -> u8 {
             self.level_for(self.direction(), self.altitude)
         }
         fn footprint(&self, level: u8) -> Vec<TileKey> {
             let direction = self.direction();
+            let base = bounded_footprint_level(
+                direction,
+                self.requested_level_for(self.altitude),
+                self.aspect(),
+                self.altitude,
+                self.view_tilt,
+            );
+            if level > base {
+                return inspection_targets(
+                    direction,
+                    level,
+                    base,
+                    self.aspect(),
+                    self.altitude,
+                    self.view_tilt,
+                );
+            }
             graduate_targets(
                 &footprint_keys(
                     direction,
@@ -2975,33 +3310,70 @@ mod browser {
             }
         }
         fn cache_bytes(&self) -> (usize, usize) {
-            (
-                self.tiles.iter().map(CachedTile::cpu_bytes).sum(),
-                self.tiles
+            let patch_bytes = |field: &world_core::hybrid::HybridField| {
+                field
+                    .patches()
                     .iter()
-                    .filter_map(|t| t.gpu.as_ref())
-                    .map(|g| g.bytes)
-                    .sum(),
-            )
+                    .map(|patch| patch.values.capacity() * 4)
+                    .sum::<usize>()
+            };
+            let packet_bytes = |packet: &PreparedTile| {
+                tile_cpu_base(&packet.tile, &packet.borders)
+                    + packet.base_heights.capacity() * 8
+                    + packet.mesh.vertices.capacity() * std::mem::size_of::<Vertex>()
+                    + packet.mesh.indices.capacity() * 4
+            };
+            let mut cpu = self.tiles.iter().map(CachedTile::cpu_bytes).sum::<usize>()
+                + self.surface_field.as_ref().map_or(0, patch_bytes);
+            let mut gpu = self
+                .tiles
+                .iter()
+                .filter_map(|tile| tile.gpu.as_ref())
+                .map(|mesh| mesh.bytes)
+                .sum::<usize>();
+            if let Some(update) = &self.surface_update {
+                cpu += update.field.as_ref().map_or(0, patch_bytes);
+                cpu += update.packets.values().map(packet_bytes).sum::<usize>();
+                cpu += update
+                    .staged
+                    .values()
+                    .map(|(packet, mesh)| packet_bytes(packet) + mesh.cpu_bytes())
+                    .sum::<usize>();
+                gpu += update
+                    .staged
+                    .values()
+                    .map(|(_, mesh)| mesh.bytes)
+                    .sum::<usize>();
+            }
+            (cpu, gpu)
         }
         fn evict_cache(&mut self) {
-            const CPU_LIMIT: usize = 768 * 1024 * 1024;
-            const GPU_LIMIT: usize = 768 * 1024 * 1024;
-            let (cpu, gpu) = self.cache_bytes();
-            if cpu <= CPU_LIMIT && gpu <= GPU_LIMIT {
+            self.evict_for_capacity((0, 0), &HashSet::new());
+        }
+        fn evict_for_capacity(&mut self, reserve: (usize, usize), additional: &HashSet<TileKey>) {
+            let limits = (TERRAIN_MEMORY_LIMIT, TERRAIN_MEMORY_LIMIT);
+            if within_surface_budget(self.cache_bytes(), reserve, limits) {
                 return;
             }
             let mut pinned = self.active_set.clone();
-            pinned.extend(self.active_set.iter().filter_map(|leaf| lod::parent(*leaf)));
+            pinned.extend(additional.iter().copied());
+            if let Some(update) = &self.surface_update {
+                pinned.extend(update.keys.iter().copied());
+            }
+            if reserve == (0, 0) {
+                pinned.extend(self.active_set.iter().filter_map(|leaf| lod::parent(*leaf)));
+            }
             let (face, u, v) = face_uv(self.direction());
-            if let Some(center) = lod::covering_key(&self.active_set, face as u8, u, v) {
+            if let Some(center) =
+                lod::covering_key(&self.active_set, face as u8, u, v).filter(|_| reserve == (0, 0))
+            {
                 // Keep the central return path resident without retaining every
                 // historical ancestor of the entire visible partition.
                 pinned.extend((0..center.level).filter_map(|level| lod::ancestor(center, level)));
             }
             // Reserve a complete sibling quartet before its fourth packet arrives.
             // Without this reservation, pressure can repeatedly evict the first three.
-            if let Some(parent) = self.staged_parent() {
+            if let Some(parent) = self.staged_parent().filter(|_| reserve == (0, 0)) {
                 pinned.extend(lod::children(parent));
             }
             if let Some(p) = &self.pending {
@@ -3011,8 +3383,7 @@ mod browser {
             }
             let wanted: HashSet<_> = self.requests().0.into_iter().collect();
             loop {
-                let (cpu, gpu) = self.cache_bytes();
-                if cpu <= CPU_LIMIT && gpu <= GPU_LIMIT {
+                if within_surface_budget(self.cache_bytes(), reserve, limits) {
                     break;
                 }
                 let victim = self
@@ -3030,7 +3401,250 @@ mod browser {
             }
         }
 
+        fn cancel_surface_update(&mut self) {
+            if let Some(update) = self.surface_update.take() {
+                self.epochs[update.epoch as usize % 32].start = -1e9;
+                // Ordinary requests prepared with the uncommitted worker field
+                // must never enter a later procedural cut after cancellation.
+                self.tiles.retain(|tile| {
+                    self.active_set.contains(&tile.key)
+                        || tile.surface_version == self.surface_version
+                });
+                self.rebuild_lookup();
+                self.cut_dirty = true;
+            }
+        }
+
+        fn surface_target(
+            &self,
+            update: &SurfaceUpdate,
+            key: TileKey,
+            direction: DVec3,
+        ) -> Option<(f64, [f32; 3], f64, f64)> {
+            let Some((packet, gpu)) = update.staged.get(&key) else {
+                return self.cached_surface(key, direction, js_now(), true);
+            };
+            let side = (packet.tile.vertices.len() as f64).sqrt() as usize;
+            let (height, normal) = surface_query(direction, key, side, |i| {
+                let g = gpu.geometry[i];
+                let dynamic = gpu.dynamic[i];
+                (
+                    g.direction * (g.radius + dynamic.morph[3] as f64),
+                    dynamic.shading_normal,
+                )
+            })?;
+            let (water, depth) = gpu
+                .ocean_start
+                .and_then(|start| {
+                    surface_scalar(direction, key, side, |i| {
+                        let g = gpu.geometry[start + i];
+                        let dynamic = gpu.dynamic[start + i];
+                        (
+                            g.direction * (g.radius + dynamic.morph[3] as f64),
+                            dynamic.water_depth as f64,
+                        )
+                    })
+                })
+                .unwrap_or((height, -1e9));
+            Some((height, normal, water, depth))
+        }
+
+        fn process_surface_update(&mut self) {
+            let Some(mut update) = self.surface_update.take() else {
+                return;
+            };
+            if update.packets.len() + update.staged.len() != update.keys.len() {
+                self.surface_update = Some(update);
+                return;
+            }
+            if update.shared.is_empty() {
+                // Include untouched neighbors, as in normal LOD transitions.
+                let mut sums: HashMap<(u8, [i64; 3]), DVec3> = HashMap::new();
+                let normal_keys: HashSet<_> = self
+                    .active_keys
+                    .iter()
+                    .chain(update.keys.iter())
+                    .copied()
+                    .collect();
+                for key in &normal_keys {
+                    let (tile, borders) = if let Some(packet) = update.packets.get(key) {
+                        (&packet.tile, &packet.borders)
+                    } else {
+                        let tile = &self.tiles[self.tile_lookup[key]];
+                        (&tile.tile, &tile.borders)
+                    };
+                    for border in borders {
+                        *sums
+                            .entry((
+                                key.level,
+                                normal_key(DVec3::from_array(
+                                    tile.vertices[border.index as usize].direction,
+                                )),
+                            ))
+                            .or_default() += DVec3::from_array(border.sum);
+                    }
+                }
+                update.shared = sums
+                    .into_iter()
+                    .map(|(key, value)| (key, value.normalize_or_zero().as_vec3().to_array()))
+                    .collect();
+            }
+            // Batch small uploads within a short frame budget. The old cut
+            // remains visible until the complete replacement is ready.
+            let upload_deadline = js_now() + 0.005;
+            let mut uploaded = 0;
+            while let Some(key) = update
+                .keys
+                .iter()
+                .copied()
+                .find(|key| !update.staged.contains_key(key))
+            {
+                let mut packet = update.packets.remove(&key).unwrap();
+                let old = &self.tiles[self.tile_lookup[&key]];
+                let ground_count = packet.tile.vertices.len();
+                let side = (ground_count as f64).sqrt() as usize;
+                let ocean_start = packet
+                    .mesh
+                    .vertices
+                    .iter()
+                    .position(|vertex| surface_vertex(vertex).ocean);
+                let mut dynamic = Vec::with_capacity(packet.mesh.vertices.len());
+                let time = js_now();
+                for (i, vertex) in packet.mesh.vertices.iter().enumerate() {
+                    let g = surface_vertex(vertex);
+                    let original_index = if i < ground_count {
+                        Some(i)
+                    } else {
+                        ocean_start.filter(|_| g.ocean).map(|start| i - start)
+                    };
+                    let border = original_index.filter(|i| {
+                        i % side == 0
+                            || i % side == side - 1
+                            || *i < side
+                            || *i >= ground_count - side
+                    });
+                    let mut target = (g.radius, g.normal, g.radius, g.depth as f64);
+                    if let Some(index) = border {
+                        if let Some(coarse) = border_neighbors(key, index, side, &self.active_set)
+                            .into_iter()
+                            .filter(|neighbor| neighbor.level < key.level)
+                            .min_by_key(|neighbor| neighbor.level)
+                        {
+                            if let Some(surface) = self.surface_target(&update, coarse, g.direction)
+                            {
+                                target = surface;
+                            }
+                        } else if !g.water {
+                            if let Some(normal) = update.shared.get(&(
+                                key.level,
+                                normal_key(DVec3::from_array(
+                                    packet.tile.vertices[index].direction,
+                                )),
+                            )) {
+                                target.1 = *normal;
+                            }
+                        }
+                    }
+                    let source = if let Some(index) = original_index.filter(|_| !g.ocean) {
+                        let gpu = old.gpu.as_ref().unwrap();
+                        let point = gpu.geometry[index];
+                        let old_dynamic = gpu.dynamic[index];
+                        let progress = epoch_progress(old_dynamic.morph[1], time, &self.epochs);
+                        let normal = Vec3::from_array(old_dynamic.parent_normal)
+                            .lerp(
+                                Vec3::from_array(old_dynamic.shading_normal),
+                                progress as f32,
+                            )
+                            .normalize_or_zero()
+                            .to_array();
+                        (
+                            point.radius + self.dynamic_delta(&old_dynamic, time, false),
+                            normal,
+                            0.0,
+                        )
+                    } else if g.ocean {
+                        self.cached_surface(key, g.direction, time, false)
+                            .map(|surface| (surface.2, g.normal, surface.3))
+                            .unwrap_or((g.radius, g.normal, g.depth as f64))
+                    } else {
+                        (g.radius, g.normal, g.depth as f64)
+                    };
+                    let (initial, final_radius, final_normal, initial_depth, final_depth) =
+                        if g.ocean {
+                            (source.0, target.2, g.normal, source.2, target.3)
+                        } else if g.water {
+                            (g.radius, g.radius, g.normal, g.depth as f64, g.depth as f64)
+                        } else {
+                            (source.0, target.0, target.1, g.depth as f64, g.depth as f64)
+                        };
+                    dynamic.push(DynamicVertex {
+                        morph: [
+                            (initial - g.radius) as f32,
+                            -(update.epoch as f32),
+                            initial_depth as f32,
+                            (final_radius - g.radius) as f32,
+                        ],
+                        shading_normal: final_normal,
+                        parent_normal: source.1,
+                        water_depth: final_depth as f32,
+                    });
+                }
+                let gpu = GpuMesh::upload_dynamic(&self.device, &self.queue, &packet.mesh, dynamic);
+                self.metrics.uploads += 1;
+                self.metrics.upload_bytes += gpu.bytes as u64;
+                // Geometry now lives in GpuMesh; keep samples/borders for
+                // normals and collision, but free the full decoded Mesh.
+                packet.mesh = Mesh::default();
+                update.staged.insert(key, (packet, gpu));
+                uploaded += 1;
+                if uploaded >= 16 || js_now() >= upload_deadline {
+                    break;
+                }
+            }
+            if update.staged.len() != update.keys.len() {
+                self.surface_update = Some(update);
+                return;
+            }
+            let start = f64::from(js_now() as f32);
+            self.epochs[update.epoch as usize % 32].start = start as f32;
+            for (key, (packet, gpu)) in update.staged {
+                let index = self.tile_lookup[&key];
+                let bounds = (gpu.bound_center, gpu.bound_radius);
+                let cpu_base = tile_cpu_base(&packet.tile, &packet.borders);
+                self.tiles[index] = CachedTile {
+                    key,
+                    base_heights: packet.base_heights,
+                    surface_version: update.version,
+                    tile: packet.tile,
+                    prepared: None,
+                    borders: packet.borders,
+                    gpu: Some(gpu),
+                    last_used: self.tick,
+                    cpu_base,
+                    bounds,
+                    morph_source: self.cut_serial,
+                    transition_start: start,
+                };
+            }
+            self.tiles.retain(|tile| {
+                tile.key.level == 0
+                    || self.active_set.contains(&tile.key)
+                    || !update.invalidated.contains(&tile.key)
+            });
+            for tile in &mut self.tiles {
+                tile.surface_version = update.version;
+            }
+            self.rebuild_lookup();
+            self.surface_field = update.field;
+            self.surface_version = update.version;
+            self.signature = None;
+            self.morph_start = start;
+            self.cut_dirty = true;
+            self.evict_cache();
+        }
+
         fn install_roots(&mut self) -> Result<(), String> {
+            self.cancel_surface_update();
             self.cancel_pending();
             self.neighbor_cache.clear();
             self.tiles.clear();
@@ -3043,13 +3657,22 @@ mod browser {
             let roots = root_tiles(world)?;
             let mut compiled = Vec::new();
             for tile in roots {
-                let mut mesh = tile_mesh(&tile, radius, self.exaggeration)?;
-                compact_mesh(&mut mesh, tile.vertices.len());
-                let borders = tile_borders(&tile, &mesh);
-                compiled.push((tile, mesh, borders));
+                let packet = prepare_hybrid_tile(
+                    tile,
+                    radius,
+                    self.exaggeration,
+                    self.surface_field.as_ref(),
+                )?;
+                let prepared = decode_prepared_tile(&packet)?;
+                compiled.push((
+                    prepared.tile,
+                    prepared.mesh,
+                    prepared.borders,
+                    prepared.base_heights,
+                ));
             }
             let mut sums: HashMap<[i64; 3], DVec3> = HashMap::new();
-            for (tile, _, borders) in &compiled {
+            for (tile, _, borders, _) in &compiled {
                 for border in borders {
                     *sums
                         .entry(normal_key(DVec3::from_array(
@@ -3058,7 +3681,7 @@ mod browser {
                         .or_default() += DVec3::from_array(border.sum);
                 }
             }
-            for (tile, mut mesh, borders) in compiled {
+            for (tile, mut mesh, borders, base_heights) in compiled {
                 for border in &borders {
                     let i = border.index as usize;
                     if let Some(sum) =
@@ -3075,6 +3698,8 @@ mod browser {
                 let cpu_base = tile_cpu_base(&tile, &borders);
                 self.tiles.push(CachedTile {
                     key,
+                    base_heights,
+                    surface_version: self.surface_version,
                     tile,
                     prepared: None,
                     borders,
@@ -3170,13 +3795,12 @@ mod browser {
                     continue;
                 }
                 let quartet = lod::children(parent);
-                let candidate_instant = coarsening
-                    && self.can_coarsen_instantly(
-                        std::iter::once(parent)
-                            .chain(quartet)
-                            .chain(affected.iter().copied()),
-                        frame,
-                    );
+                let candidate_instant = self.can_coarsen_instantly(
+                    std::iter::once(parent)
+                        .chain(quartet)
+                        .chain(affected.iter().copied()),
+                    frame,
+                );
                 if !parents.is_empty() && candidate_instant != instant {
                     continue;
                 }
@@ -3249,7 +3873,7 @@ mod browser {
                         .map(|&parent| (parent, WorkKind::Parent, parent)),
                 );
             }
-            if !instant {
+            if transition_needs_child_uploads(coarsening, instant) {
                 jobs.extend(children.iter().copied().map(|k| {
                     (
                         k,
@@ -3349,9 +3973,20 @@ mod browser {
                 self.desired = self.footprint(self.wanted);
                 self.sync_cut();
             }
+            if self.surface_update.is_some() {
+                // Input and the rendered camera keep moving. Only partition
+                // changes wait for this short, atomic geometry transaction.
+                self.process_surface_update();
+                return;
+            }
             // In-flight local work is never cancelled merely because the camera moved.
             if self.pending.is_some() {
                 self.process_cut(deadline);
+                return;
+            }
+            // Let a ready neural field take the next idle slot instead of
+            // starting another LOD batch every frame and starving its commit.
+            if js_now() < self.surface_priority_until {
                 return;
             }
             if !self.cut_dirty {
@@ -3384,7 +4019,9 @@ mod browser {
                 .collect();
             coarsen.sort_by(|a, b| b.level.cmp(&a.level));
             let (cpu, gpu) = self.cache_bytes();
-            if cpu > 768 * 1024 * 1024 || gpu > 768 * 1024 * 1024 {
+            // Off-screen old cuts must coarsen before new visible refinement
+            // consumes their inverse parents and the last cache headroom.
+            if cpu >= TERRAIN_MEMORY_LIMIT * 4 / 5 || gpu >= TERRAIN_MEMORY_LIMIT * 4 / 5 {
                 let outside: Vec<_> = coarsen
                     .iter()
                     .copied()
@@ -3680,18 +4317,21 @@ mod browser {
                         self.view_frame(js_now()),
                     )
                 {
-                    // Camera movement can expose a group while it is being prepared.
-                    // Complete the visible inverse morph instead of committing a jump.
+                    // Camera movement can expose a prepared group. Refine
+                    // children already carry their complete source/target
+                    // geometry, so their normal visible morph can start now.
                     pending.instant = false;
-                    pending.jobs.extend(
-                        pending
-                            .children
-                            .iter()
-                            .copied()
-                            .map(|key| (key, WorkKind::Coarsen, lod::parent(key).unwrap())),
-                    );
-                    self.pending = Some(pending);
-                    return;
+                    if pending.coarsening {
+                        pending.jobs.extend(
+                            pending
+                                .children
+                                .iter()
+                                .copied()
+                                .map(|key| (key, WorkKind::Coarsen, lod::parent(key).unwrap())),
+                        );
+                        self.pending = Some(pending);
+                        return;
+                    }
                 }
                 let start = f64::from(js_now() as f32);
                 let epoch_start = if pending.instant {
@@ -3710,6 +4350,8 @@ mod browser {
                     self.metrics.cut_commits += 1;
                     if pending.coarsening {
                         self.metrics.instant_coarsen_commits += 1;
+                    } else if pending.instant {
+                        self.metrics.instant_refine_commits += 1;
                     }
                     self.cut_serial = self.cut_serial.wrapping_add(1);
                     self.cut_dirty = true;
@@ -3801,7 +4443,7 @@ mod browser {
                 ),
                 surface: [self.exaggeration as f32, 0.0, 0.0, 0.0],
                 noise: noise_frame(
-                    dir,
+                    eye,
                     self.world
                         .as_ref()
                         .map_or(1_737_000.0, |world| world.config.radius_m),
@@ -3918,6 +4560,12 @@ mod browser {
             })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        // The JS startup watchdog replaces a canvas before trying another
+        // backend. An abandoned async attempt must not allocate a device or
+        // overwrite the renderer that its replacement has already started.
+        if !canvas.is_connected() {
+            return Err(JsValue::from_str("Tentative de démarrage annulée"));
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("World Builder"),
@@ -3928,6 +4576,9 @@ mod browser {
             })
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        if !canvas.is_connected() {
+            return Err(JsValue::from_str("Tentative de démarrage annulée"));
+        }
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
             web_sys::console::error_1(&JsValue::from_str(&format!("GPU validation: {error}")));
         }));
@@ -4043,6 +4694,9 @@ mod browser {
                 &info.name
             }
         );
+        if !canvas.is_connected() {
+            return Err(JsValue::from_str("Tentative de démarrage annulée"));
+        }
         RENDERER.with(|state| {
             *state.borrow_mut() = Some(Renderer {
                 surface,
@@ -4058,6 +4712,10 @@ mod browser {
                 base_surfaces: [Vec::new(), Vec::new()],
                 tiles: Vec::new(),
                 pending: None,
+                surface_update: None,
+                surface_field: None,
+                surface_version: 0,
+                surface_priority_until: 0.0,
                 cut_dirty: true,
                 cut_visible: false,
                 signature: None,
@@ -4108,6 +4766,8 @@ mod browser {
         RENDERER.with(|state| {
             let mut state = state.borrow_mut();
             let renderer = state.as_mut().ok_or("Visualiseur absent")?;
+            renderer.surface_field = None;
+            renderer.surface_version = 0;
             renderer.world = Some(world);
             renderer.globe = None;
             renderer.base_surfaces = [Vec::new(), Vec::new()];
@@ -4141,9 +4801,407 @@ mod browser {
         prepare_tile(tile, radius_m, exaggeration).map_err(|e| JsValue::from_str(&e))
     }
     #[wasm_bindgen]
+    pub fn set_worker_world(json: &str) -> Result<(), JsValue> {
+        let world = serde_json::from_str::<World>(json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        WORKER_WORLD.with(|state| *state.borrow_mut() = Some(world));
+        Ok(())
+    }
+
+    #[derive(Deserialize)]
+    struct FieldContext {
+        world_id: String,
+        revision: u64,
+        radius_m: f64,
+        #[serde(default)]
+        kind: world_core::hybrid::SurfaceKind,
+    }
+    #[derive(Deserialize)]
+    struct PatchContext {
+        world_id: String,
+        face: u8,
+        #[serde(default)]
+        level: u8,
+        x: i32,
+        y: i32,
+    }
+    fn parsed_field(json: &str) -> Result<Option<world_core::hybrid::HybridField>, JsValue> {
+        if json.is_empty() {
+            return Ok(None);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        if value.get("patches").is_some() {
+            return world_core::hybrid::HybridField::from_json(json)
+                .map(Some)
+                .map_err(|error| JsValue::from_str(&error.to_string()));
+        }
+        let context: FieldContext =
+            serde_json::from_value(value).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        FIELD_PATCHES.with(|patches| {
+            let prefix = format!("{}/", context.world_id);
+            let patches = patches
+                .borrow()
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, patch)| patch.clone())
+                .collect();
+            world_core::hybrid::HybridField::with_kind(
+                context.world_id,
+                context.revision,
+                context.radius_m,
+                patches,
+                context.kind,
+            )
+            .map(Some)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn register_hybrid_patch(meta_json: &str, values: &[f32]) -> Result<(), JsValue> {
+        let meta: PatchContext = serde_json::from_str(meta_json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        if meta.face >= 6
+            || values.len() != 258 * 258
+            || values.iter().any(|value| !value.is_finite())
+        {
+            return Err(JsValue::from_str("Patch hybride invalide"));
+        }
+        let key = format!(
+            "{}/{}/{}/{}/{}",
+            meta.world_id, meta.face, meta.level, meta.x, meta.y
+        );
+        FIELD_PATCHES.with(|patches| {
+            let mut patches = patches.borrow_mut();
+            if patches.len() >= 96 && !patches.contains_key(&key) {
+                return Err(JsValue::from_str("Cache de patches plein"));
+            }
+            patches.insert(
+                key,
+                world_core::hybrid::HybridPatch {
+                    face: meta.face,
+                    level: meta.level,
+                    x: meta.x,
+                    y: meta.y,
+                    values: values.to_vec(),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn remove_hybrid_patch(meta_json: &str) -> Result<(), JsValue> {
+        let meta: PatchContext = serde_json::from_str(meta_json)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        FIELD_PATCHES.with(|patches| {
+            patches.borrow_mut().remove(&format!(
+                "{}/{}/{}/{}/{}",
+                meta.world_id, meta.face, meta.level, meta.x, meta.y
+            ));
+        });
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn clear_hybrid_patch_registry() {
+        FIELD_PATCHES.with(|patches| patches.borrow_mut().clear());
+    }
+
+    #[wasm_bindgen]
+    pub fn clear_hybrid_patches() {
+        clear_hybrid_patch_registry();
+        WORKER_FIELD.with(|state| *state.borrow_mut() = None);
+        WORKER_SNAPSHOTS.with(|state| state.borrow_mut().procedural());
+    }
+
+    #[wasm_bindgen]
+    pub fn set_worker_hybrid_field(json: &str) -> Result<(), JsValue> {
+        let field = parsed_field(json)?;
+        let field =
+            WORKER_SNAPSHOTS.with(|state| field.map(|field| state.borrow_mut().prepare(field)));
+        WORKER_FIELD.with(|state| *state.borrow_mut() = field);
+        Ok(())
+    }
+
+    /// Restore/commit selects a stored revision without consulting patch data.
+    #[wasm_bindgen]
+    pub fn select_worker_hybrid_field(json: &str) -> Result<(), JsValue> {
+        if json.is_empty() {
+            WORKER_FIELD.with(|state| *state.borrow_mut() = None);
+            WORKER_SNAPSHOTS.with(|state| state.borrow_mut().procedural());
+            return Ok(());
+        }
+        let context: FieldContext =
+            serde_json::from_str(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        let key = format!(
+            "{}/{}/{}",
+            context.world_id,
+            context.revision,
+            context.radius_m.to_bits()
+        );
+        let field = WORKER_SNAPSHOTS
+            .with(|state| state.borrow_mut().select(&key))
+            .ok_or("Snapshot hybride absent")?;
+        WORKER_FIELD.with(|state| *state.borrow_mut() = Some(field));
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub fn prepare_tile_binary_hybrid(
+        bytes: &[u8],
+        radius_m: f64,
+        exaggeration: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let tile = world_core::tile_wire::decode_tile(bytes)
+            .map_err(|error| JsValue::from_str(&error.to_string()))?;
+        WORKER_FIELD.with(|field| {
+            prepare_hybrid_tile(
+                from_core_tile(tile),
+                radius_m,
+                exaggeration,
+                field.borrow().as_deref(),
+            )
+            .map_err(|error| JsValue::from_str(&error))
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn prepare_tile_json_hybrid(
+        json: &str,
+        radius_m: f64,
+        exaggeration: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        let tile = decode_json_tile(json).map_err(|error| JsValue::from_str(&error.to_string()))?;
+        WORKER_FIELD.with(|field| {
+            prepare_hybrid_tile(tile, radius_m, exaggeration, field.borrow().as_deref())
+                .map_err(|error| JsValue::from_str(&error))
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn prepare_root_tile_hybrid(
+        face: u8,
+        radius_m: f64,
+        exaggeration: f64,
+    ) -> Result<Vec<u8>, JsValue> {
+        WORKER_WORLD.with(|world| {
+            let world = world.borrow();
+            let world = world.as_ref().ok_or("Atlas worker absent")?;
+            let mut roots = root_tiles(world).map_err(|error| JsValue::from_str(&error))?;
+            if face >= 6 {
+                return Err(JsValue::from_str("Face invalide"));
+            }
+            let tile = roots.swap_remove(face as usize);
+            WORKER_FIELD.with(|field| {
+                prepare_hybrid_tile(tile, radius_m, exaggeration, field.borrow().as_deref())
+                    .map_err(|error| JsValue::from_str(&error))
+            })
+        })
+    }
+
+    /// Returns the exact immutable partition to reprepare. A busy LOD morph is
+    /// allowed to finish; beginning a field transaction never cancels its epoch.
+    #[wasm_bindgen]
+    pub fn begin_surface_update(version: u32, field_json: &str) -> Result<String, JsValue> {
+        let field = parsed_field(field_json)?;
+        RENDERER.with(|state| {
+            let mut state = state.borrow_mut();
+            let r = state.as_mut().ok_or("Visualiseur absent")?;
+            if r.world.is_none() {
+                return Err(JsValue::from_str("Monde absent"));
+            }
+            if let Some(update) = &r.surface_update {
+                if update.version == version {
+                    return Ok(serde_json::json!({"state":"preparing", "version":version,
+                        "keys":update.keys})
+                    .to_string());
+                }
+                r.cancel_surface_update();
+            }
+            let time = js_now();
+            if r.pending.is_some()
+                || r.active_keys.iter().any(|key| {
+                    r.tiles[r.tile_lookup[key]].transition_start + MORPH_DURATION_SECONDS > time
+                })
+            {
+                r.surface_priority_until = time + 0.25;
+                return Ok(serde_json::json!({"state":"busy", "version":version}).to_string());
+            }
+            let Some(epoch) = next_morph_epoch(r.next_epoch, time, &r.epochs) else {
+                return Ok(serde_json::json!({"state":"busy", "version":version}).to_string());
+            };
+            let mut changed = HashSet::new();
+            for tile in &r.tiles {
+                if tile
+                    .tile
+                    .vertices
+                    .iter()
+                    .zip(&tile.base_heights)
+                    .any(|(sample, height)| {
+                        let target = *height
+                            + field
+                                .as_ref()
+                                .map_or(0.0, |field| hybrid_delta(field, sample, *height));
+                        (target - sample.height_m).abs() > 1e-7
+                    })
+                {
+                    changed.insert(tile.key);
+                }
+            }
+            let affected = surface_refresh_keys(&r.active_set, &changed);
+            // Reserve the complete batch before freezing LOD. Committed tags
+            // and inactive changed cache entries are untouched until commit.
+            let reservations: HashMap<_, _> = affected
+                .iter()
+                .map(|key| {
+                    let tile = &r.tiles[r.tile_lookup[key]];
+                    let geometry_bytes = tile.gpu.as_ref().map_or(0, |gpu| gpu.bytes);
+                    let mesh_cpu = tile.gpu.as_ref().map_or(0, |gpu| {
+                        gpu.geometry.len() * std::mem::size_of::<Vertex>() + gpu.count as usize * 4
+                    });
+                    let gpu_cpu = tile.gpu.as_ref().map_or(0, GpuMesh::cpu_bytes);
+                    let base = tile.cpu_base
+                        + tile.base_heights.capacity() * 8
+                        + tile.tile.morph_offsets.capacity() * 24
+                        + std::mem::size_of::<CachedTile>();
+                    (
+                        *key,
+                        (
+                            surface_cpu_reservation(base, mesh_cpu, gpu_cpu),
+                            geometry_bytes,
+                        ),
+                    )
+                })
+                .collect();
+            let field_bytes = field.as_ref().map_or(0, |field| {
+                field
+                    .patches()
+                    .iter()
+                    .map(|patch| patch.values.capacity() * 4)
+                    .sum()
+            });
+            // A single decoder/upload plus both shared-normal hash tables.
+            // Roots are at most129² samples, so32MiB also covers wire/PackedSample
+            // overlap and one temporary Vec<StaticVertex> at full root size.
+            let scratch = if reservations.is_empty() {
+                0
+            } else {
+                32 * 1024 * 1024
+            };
+            let reserve = reservations
+                .values()
+                .fold((field_bytes + scratch, 0usize), |sum, bytes| {
+                    (sum.0 + bytes.0, sum.1 + bytes.1)
+                });
+            r.evict_for_capacity(reserve, &affected);
+            if !within_surface_budget(
+                r.cache_bytes(),
+                reserve,
+                (TERRAIN_MEMORY_LIMIT, TERRAIN_MEMORY_LIMIT),
+            ) {
+                return Ok(serde_json::json!({"state":"memory", "version":version,
+                    "required_cpu_bytes":reserve.0,"required_gpu_bytes":reserve.1,
+                    "current_cpu_bytes":r.cache_bytes().0,"current_gpu_bytes":r.cache_bytes().1,
+                    "affected_tiles":affected.len(),"scratch_cpu_bytes":scratch})
+                .to_string());
+            }
+            let mut keys: Vec<_> = affected.into_iter().collect();
+            keys.sort_by_key(|key| (key.level, key.face, key.x, key.y)); // Coarse first, across faces.
+            r.next_epoch = epoch;
+            r.epochs[epoch as usize % 32] = MorphEpoch {
+                id: epoch,
+                start: 1e9,
+            };
+            r.surface_update = Some(SurfaceUpdate {
+                version,
+                field,
+                keys: keys.clone(),
+                packets: HashMap::new(),
+                staged: HashMap::new(),
+                shared: HashMap::new(),
+                epoch,
+                invalidated: changed,
+                reservations,
+            });
+            Ok(
+                serde_json::json!({"state":"preparing", "version":version, "keys":keys})
+                    .to_string(),
+            )
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn cancel_surface_update() {
+        RENDERER.with(|state| {
+            if let Some(r) = state.borrow_mut().as_mut() {
+                r.cancel_surface_update();
+            }
+        });
+    }
+
+    #[wasm_bindgen]
+    pub fn stage_surface_tile(bytes: &[u8], version: u32) -> Result<(), JsValue> {
+        let packet = decode_prepared_tile(bytes).map_err(|error| JsValue::from_str(&error))?;
+        RENDERER.with(|state| {
+            let mut state = state.borrow_mut();
+            let r = state.as_mut().ok_or("Visualiseur absent")?;
+            let update = r.surface_update.as_mut().ok_or("Mise à jour absente")?;
+            if update.version != version
+                || !update.keys.contains(&packet.tile.key)
+                || packet.radius != r.world.as_ref().ok_or("Monde absent")?.config.radius_m
+                || packet.exaggeration != r.exaggeration
+            {
+                return Err(JsValue::from_str("Préparation de surface périmée"));
+            }
+            let key = packet.tile.key;
+            let expected = update.reservations.get(&key).ok_or("Réservation absente")?;
+            let mesh_cpu = packet.mesh.vertices.capacity() * std::mem::size_of::<Vertex>()
+                + packet.mesh.indices.capacity() * 4;
+            let base = tile_cpu_base(&packet.tile, &packet.borders)
+                + packet.base_heights.capacity() * 8
+                + packet.tile.morph_offsets.capacity() * 24;
+            let gpu_cpu = packet.mesh.vertices.len()
+                * (std::mem::size_of::<SurfaceVertex>() + std::mem::size_of::<DynamicVertex>());
+            let cpu = surface_cpu_reservation(base, mesh_cpu, gpu_cpu);
+            let gpu = packet.mesh.vertices.len()
+                * (std::mem::size_of::<StaticVertex>() + std::mem::size_of::<DynamicVertex>())
+                + packet.mesh.indices.len() * 4;
+            if cpu > expected.0 || gpu > expected.1 {
+                return Err(JsValue::from_str(
+                    "La surface dépasse sa réservation mémoire",
+                ));
+            }
+            if !update.staged.contains_key(&key) {
+                update.packets.insert(key, packet);
+            }
+
+            Ok(())
+        })
+    }
+
+    #[wasm_bindgen]
+    pub fn install_prepared_tile_versioned(bytes: &[u8], version: u32) -> Result<String, JsValue> {
+        let packet = decode_prepared_tile(bytes).map_err(|error| JsValue::from_str(&error))?;
+        let valid = RENDERER.with(|state| {
+            state.borrow().as_ref().is_some_and(|r| {
+                r.surface_update
+                    .as_ref()
+                    .map_or(r.surface_version, |update| update.version)
+                    == version
+            })
+        });
+        if !valid {
+            return Err(JsValue::from_str("Champ de terrain périmé"));
+        }
+        install_prepared(packet, Some(version))
+    }
+
+    #[wasm_bindgen]
     pub fn install_prepared_tile(bytes: &[u8]) -> Result<String, JsValue> {
         let prepared = decode_prepared_tile(bytes).map_err(|e| JsValue::from_str(&e))?;
-        install_prepared(prepared)
+        install_prepared(prepared, None)
     }
     #[wasm_bindgen]
     pub fn set_tile(json: &str) -> Result<String, JsValue> {
@@ -4169,7 +5227,10 @@ mod browser {
         let bytes = prepare_tile(tile, radius, exaggeration).map_err(|e| JsValue::from_str(&e))?;
         install_prepared_tile(&bytes)
     }
-    fn install_prepared(prepared: PreparedTile) -> Result<String, JsValue> {
+    fn install_prepared(
+        prepared: PreparedTile,
+        surface_version: Option<u32>,
+    ) -> Result<String, JsValue> {
         RENDERER.with(|state| {
             let mut state = state.borrow_mut();
             let r = state.as_mut().ok_or("Visualiseur absent")?;
@@ -4202,6 +5263,8 @@ mod browser {
                     + prepared.borders.capacity() * std::mem::size_of::<BorderNormal>();
                 r.tiles.push(CachedTile {
                     key,
+                    base_heights: prepared.base_heights,
+                    surface_version: surface_version.unwrap_or(r.surface_version),
                     tile: prepared.tile,
                     prepared: Some(prepared.mesh),
                     borders: prepared.borders,
@@ -4222,35 +5285,15 @@ mod browser {
         })
     }
     #[wasm_bindgen]
-    pub fn clear_tiles() {
+    pub fn clear_tiles() -> Result<(), JsValue> {
         RENDERER.with(|state| {
             if let Some(r) = state.borrow_mut().as_mut() {
-                r.cancel_pending();
-                r.tiles.retain(|t| t.key.level == 0);
-                // Prepared Edge jobs may reference an abandoned partition.
-                // Only roots survive this explicit clear: restore their
-                // canonical geometry, normals and hydraulic depths together.
-                for tile in &mut r.tiles {
-                    if let Some(gpu) = &mut tile.gpu {
-                        let dynamic = gpu
-                            .geometry
-                            .iter()
-                            .map(|g| DynamicVertex::settled(g.normal, g.depth))
-                            .collect();
-                        gpu.update_dynamic(&r.queue, dynamic);
-                    }
-                    tile.transition_start = -1e9;
-                    tile.morph_source = 0;
-                }
-                r.rebuild_lookup();
-                r.active_set = lod::initial_leaves();
+                r.install_roots()
+                    .map_err(|error| JsValue::from_str(&error))?;
                 r.cut_serial = r.cut_serial.wrapping_add(1);
-                r.neighbor_cache.clear();
-                r.sync_cut();
-                r.cut_dirty = true;
-                r.signature = None;
             }
-        });
+            Ok(())
+        })
     }
 
     fn rebuild_objects(r: &mut Renderer) {
@@ -4304,13 +5347,17 @@ mod browser {
     #[wasm_bindgen]
     pub fn render(width: u32, height: u32) -> Result<(), JsValue> {
         RENDERER.with(|state| {
-            if let Some(renderer) = state.borrow_mut().as_mut() {
-                renderer
-                    .render(width, height)
-                    .map_err(|e| JsValue::from_str(&e))
-            } else {
-                Ok(())
-            }
+            // Browser drivers/instrumentation may read metrics synchronously.
+            // Never hold a RefCell borrow across their GPU calls.
+            let renderer = state.borrow_mut().take();
+            let Some(mut renderer) = renderer else {
+                return Ok(());
+            };
+            let result = renderer
+                .render(width, height)
+                .map_err(|e| JsValue::from_str(&e));
+            *state.borrow_mut() = Some(renderer);
+            result
         })
     }
 
@@ -4320,7 +5367,8 @@ mod browser {
             if let Some(r) = state.borrow_mut().as_mut() {
                 let speed = 0.002 * r.altitude.clamp(0.000001, 2.0);
                 r.yaw -= dx * speed;
-                r.pitch = (r.pitch + dy * speed).clamp(-1.55, 1.55);
+                r.pitch = (r.pitch + dy * speed)
+                    .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
             }
         });
     }
@@ -4367,7 +5415,10 @@ mod browser {
                 .config
                 .radius_m;
             renderer.yaw = direction.x.atan2(direction.z);
-            renderer.pitch = direction.y.asin().clamp(-1.55, 1.55);
+            renderer.pitch = direction
+                .y
+                .asin()
+                .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
             renderer.altitude = (altitude_m / radius).clamp(5.0 / radius, 7.0);
             Ok(())
         })
@@ -4386,7 +5437,7 @@ mod browser {
     pub fn set_mode(mode: u32) {
         RENDERER.with(|state| {
             if let Some(r) = state.borrow_mut().as_mut() {
-                r.mode = mode.min(4) as f32;
+                r.mode = mode.min(5) as f32;
             }
         });
     }
@@ -4476,6 +5527,8 @@ mod browser {
                     serde_json::json!({
                         "index": i, "direction": sample.direction,
                         "canonical_height_m": sample.height_m,
+                        "procedural_height_m": tile.base_heights[i],
+                        "learned_delta_m": sample.height_m - tile.base_heights[i],
                         "base_height_m": (g.radius - 1.0) * metres,
                         "displayed_height_m": (g.radius + delta - 1.0) * metres,
                         "current_delta_m": delta * metres,
@@ -4556,8 +5609,8 @@ mod browser {
     #[wasm_bindgen]
     pub fn view_info() -> String {
         RENDERER.with(|state| {
-            let state = state.borrow();
-            let Some(r) = state.as_ref() else { return "{}".into(); };
+            let Ok(state) = state.try_borrow() else { return VIEW_SNAPSHOT.with(|snapshot| snapshot.borrow().clone()); };
+            let Some(r) = state.as_ref() else { return VIEW_SNAPSHOT.with(|snapshot| snapshot.borrow().clone()); };
             let (face, u, v) = face_uv(r.direction());
             let radius = r.world.as_ref().map_or(1_737_000.0, |w| w.config.radius_m);
             let level = u32::from(r.detail_level());
@@ -4567,11 +5620,32 @@ mod browser {
             let (requests, essential_count) = r.requests();
             let delivered = lod::covering_key(&r.active_set,face as u8,u,v).map(|key|key.level);
             let requested = r.requested_level_for(r.altitude);
-            serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level":lod::covering_key(&r.active_set,face as u8,u,v).map(|key|key.level), "active_tiles": r.active_keys.len(), "draw_tiles":r.draw_keys.len(),
-                "requested_level":requested,"delivered_level":delivered,"detail_limit_reached":level < u32::from(requested),"planned_leaves":graduated_leaf_count(&r.desired,r.wanted),"max_planned_leaves":MAX_PLANNED_LEAVES,
+            let time = js_now();
+            let eye = r.view_frame(time).0;
+            let clearance = (eye.length() - r.displayed_radius(eye.normalize(), false, None, time)
+                .max(r.displayed_radius(eye.normalize(), true, None, time))) * radius;
+            let morph_remaining = r.active_keys.iter().map(|key|
+                (r.tiles[r.tile_lookup[key]].transition_start + MORPH_DURATION_SECONDS - time).max(0.0))
+                .fold(0.0f64, f64::max);
+            let spacing = delivered.map(|level| {
+                let segments = if level == 0 {
+                    r.world.as_ref().map_or(128, World::mesh_resolution)
+                } else if level <= 2 { STREAM_SEGMENTS } else { DEEP_STREAM_SEGMENTS };
+                let step = 2.0 * radius / (segments as f64 * (1u32 << level) as f64);
+                step * (1.0 + u * u).sqrt().max((1.0 + v * v).sqrt()) / (1.0 + u * u + v * v)
+            });
+            let mut snapshot = serde_json::json!({ "face": face, "level": level, "x": x, "y": y, "altitude_m": r.altitude * radius, "direction": r.direction().to_array(), "view_tilt_deg": r.view_tilt.to_degrees(), "active_level":lod::covering_key(&r.active_set,face as u8,u,v).map(|key|key.level), "active_tiles": r.active_keys.len(), "draw_tiles":r.draw_keys.len(),
+                "camera_clearance_m":clearance,"grid_spacing_m":spacing,"morph_remaining_s":morph_remaining,"requested_level":requested,"delivered_level":delivered,"detail_limit_reached":level < u32::from(requested),"planned_leaves":graduated_leaf_count(&r.desired,r.wanted),"max_planned_leaves":MAX_PLANNED_LEAVES,
                 "cpu_bytes":r.cache_bytes().0,"gpu_bytes":r.cache_bytes().1,"cpu_budget_bytes":768*1024*1024u64,"gpu_budget_bytes":768*1024*1024u64,"resident_keys":r.tiles.iter().map(|tile|tile.key).collect::<Vec<_>>(),
+                "surface_version":r.surface_version,"surface_update_version":r.surface_update.as_ref().map(|update|update.version),"surface_update_keys":r.surface_update.as_ref().map(|update|&update.keys),"surface_update_staged":r.surface_update.as_ref().map_or(0,|update|update.staged.len()),"active_keys":r.active_keys,
                 "pending_tiles":r.pending.as_ref().map_or(0,|p|p.jobs.len()-p.cursor),"mesh_builds":r.metrics.mesh_builds,"uploads":r.metrics.uploads,"upload_bytes":r.metrics.upload_bytes,
-                "cut_commits":r.metrics.cut_commits,"instant_coarsen_commits":r.metrics.instant_coarsen_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"surface_fallbacks":r.metrics.surface_fallbacks,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"essential_count": essential_count,"requests": requests }).to_string()
+                "cut_commits":r.metrics.cut_commits,"instant_coarsen_commits":r.metrics.instant_coarsen_commits,"reused_tiles":r.metrics.reused_tiles,"prepare_ms":r.metrics.last_prepare_ms,"surface_fallbacks":r.metrics.surface_fallbacks,"max_prepare_ms":r.metrics.max_prepare_ms,"max_render_ms":r.metrics.max_render_ms,"essential_count": essential_count,"requests": requests });
+            snapshot["exaggeration"] = serde_json::json!(r.exaggeration);
+            snapshot["instant_refine_commits"] = serde_json::json!(r.metrics.instant_refine_commits);
+            snapshot["morph_duration_s"] = serde_json::json!(MORPH_DURATION_SECONDS);
+            let snapshot = snapshot.to_string();
+            VIEW_SNAPSHOT.with(|cached| *cached.borrow_mut() = snapshot.clone());
+            snapshot
         })
     }
 }
@@ -4581,6 +5655,31 @@ pub use browser::*;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn learned_inspection_centre_reaches_native_resolution_without_refining_the_entire_view() {
+        let radius = 6_371_000.0;
+        let direction = DVec3::new(
+            -0.1392381651514895,
+            0.015470907239054392,
+            0.9901380632994811,
+        )
+        .normalize();
+        let altitude = 18000.0 / radius;
+        let base = bounded_footprint_level(direction, 14, 1.6, altitude, 25f64.to_radians());
+        let targets = inspection_targets(direction, 14, base, 1.6, altitude, 25f64.to_radians());
+        assert!(graduated_leaf_count(&targets, 14) <= MAX_PLANNED_LEAVES);
+        let (face, u, v) = face_uv(direction);
+        let count = 1u32 << 13;
+        let parent = TileKey {
+            face: face as u8,
+            level: 13,
+            x: (((u + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+            y: (((v + 1.0) * 0.5 * f64::from(count)) as u32).min(count - 1),
+        };
+        assert!(targets.contains(&parent));
+        assert!(2.0 * radius / (32.0 * (1u32 << 14) as f64) <= 30.0);
+        assert!(targets.iter().any(|key| key.level < base));
+    }
     use super::*;
 
     fn desired_partition(targets: &[TileKey], wanted: u8) -> HashSet<TileKey> {
@@ -5004,6 +6103,313 @@ mod tests {
     }
 
     #[test]
+    fn rollback_selects_the_committed_field_without_rebuilding_mutable_patches() {
+        use world_core::hybrid::{HybridField, HybridPatch};
+        let make = |revision, value| {
+            HybridField::new(
+                "world".into(),
+                revision,
+                6371000.0,
+                vec![HybridPatch {
+                    face: 4,
+                    level: 0,
+                    x: 0,
+                    y: 0,
+                    values: vec![value; 258 * 258],
+                }],
+            )
+            .unwrap()
+        };
+        let mut snapshots = HybridSnapshots::default();
+        let a = snapshots.prepare(make(1, 10.0));
+        let a_key = HybridSnapshots::key(&a);
+        let b = snapshots.prepare(make(2, 50.0));
+        assert_eq!(snapshots.fields.len(), 2);
+        assert_eq!(b.patches()[0].values[100], 50.0);
+        let restored = snapshots.select(&a_key).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&a, &restored));
+        assert_eq!(restored.patches()[0].values[100], 10.0);
+        assert_eq!(snapshots.fields.len(), 1);
+        snapshots.prepare(make(3, -25.0));
+        assert_eq!(snapshots.fields.len(), 2);
+        snapshots.procedural();
+        assert!(snapshots.fields.is_empty());
+    }
+
+    #[test]
+    fn coarse_edges_find_both_finer_neighbors_before_shared_surface_updates() {
+        let mut cut = lod::initial_leaves();
+        let root = TileKey {
+            face: 4,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        lod::split(&mut cut, root);
+        let coarse = TileKey {
+            face: 4,
+            level: 1,
+            x: 0,
+            y: 0,
+        };
+        let adjacent = TileKey {
+            face: 4,
+            level: 1,
+            x: 1,
+            y: 0,
+        };
+        lod::split(&mut cut, adjacent);
+        let neighbors = tile_neighbors(coarse, &cut);
+        assert!(neighbors.contains(&TileKey {
+            face: 4,
+            level: 2,
+            x: 2,
+            y: 0
+        }));
+        assert!(neighbors.contains(&TileKey {
+            face: 4,
+            level: 2,
+            x: 2,
+            y: 1
+        }));
+        let affected = surface_refresh_keys(&cut, &HashSet::from([coarse]));
+        assert!(neighbors.is_subset(&affected));
+    }
+
+    #[test]
+    fn inactive_roots_are_refreshed_as_a_complete_canonical_return_shell() {
+        let roots = lod::initial_leaves();
+        let root = TileKey {
+            face: 4,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let mut active = roots.clone();
+        assert!(lod::split(&mut active, root));
+        assert!(!active.contains(&root));
+        let refresh = surface_refresh_keys(&active, &HashSet::from([root]));
+        assert_eq!(refresh, roots);
+        let mut resident: HashSet<_> = active.union(&roots).copied().collect();
+        // Beginning/cancelling does not invalidate any committed cache entry.
+        assert!(roots.is_subset(&resident));
+        // A committed root update replaces all six resident atlas packets.
+        resident.extend(refresh);
+        assert!(lod::initial_leaves().is_subset(&resident));
+        assert!(valid_tile_vertex_count(root, 129 * 129, 128));
+        assert!(!valid_tile_vertex_count(root, 65 * 65, 128));
+    }
+
+    #[test]
+    fn packet_upload_ownership_never_adds_all_mesh_and_gpu_cpu_representations() {
+        let allocations = [(20, 50, 30, 15), (40, 25, 60, 12), (30, 55, 32, 18)];
+        let reserve: usize = allocations
+            .iter()
+            .map(|(b, m, c, _)| surface_cpu_reservation(*b, *m, *c))
+            .sum();
+        let scratch = allocations
+            .iter()
+            .map(|(_, m, c, s)| m.min(c) + s)
+            .max()
+            .unwrap();
+        for staged_mask in 0u32..8 {
+            let owned: usize = allocations
+                .iter()
+                .enumerate()
+                .map(|(i, (b, m, c, _))| b + if staged_mask & (1 << i) == 0 { *m } else { *c })
+                .sum();
+            assert!(owned <= reserve);
+            for (_, m, c, s) in allocations {
+                // During one upload both representations and the temporary
+                // static vertices coexist; never multiply scratch by all tiles.
+                assert!(owned + m.min(c) + s <= reserve + scratch);
+            }
+        }
+    }
+
+    #[test]
+    fn invisible_refinement_still_uploads_all_children_before_its_cut_commits() {
+        let parent = TileKey {
+            face: 4,
+            level: 0,
+            x: 0,
+            y: 0,
+        };
+        let mut active = lod::initial_leaves();
+        let mut resident_gpu = active.clone();
+        assert!(transition_needs_child_uploads(false, true));
+        if transition_needs_child_uploads(false, true) {
+            resident_gpu.extend(lod::children(parent));
+        }
+        assert!(lod::split(&mut active, parent));
+        assert!(active.is_subset(&resident_gpu));
+        assert!(!transition_needs_child_uploads(true, true));
+        assert!(transition_needs_child_uploads(true, false));
+    }
+
+    #[test]
+    fn refinement_visibility_guard_is_rechecked_for_a_camera_that_moves_during_preparation() {
+        let bounds = [(DVec3::new(2.0, 0.0, 1.0), 0.01)];
+        let away = camera_frame(DVec3::Z, 0.01, 1.0, 0.0);
+        assert!(instant_coarsen_bounds(&bounds, away, 1.73, 771));
+        let eye = DVec3::new(2.0, 0.0, 1.05);
+        let visible = (eye, -DVec3::Z, DVec3::X, DVec3::Y);
+        assert!(!instant_coarsen_bounds(&bounds, visible, 1.73, 771));
+    }
+
+    #[test]
+    fn bounded_atomic_cut_still_delivers_twenty_centimetre_spacing_at_five_metres() {
+        let radius = 6371000.0;
+        for direction in [
+            DVec3::Y,
+            -DVec3::Y,
+            DVec3::ONE.normalize(),
+            DVec3::new(0.1642453664314664, -0.1052273755405935, 0.9807908334821612),
+        ] {
+            let level = bounded_footprint_level(direction, 24, 1.73, 5.0 / radius, 0.0);
+            let targets = graduate_targets(
+                &footprint_keys(direction, level, 1.73, 5.0 / radius, 0.0),
+                level,
+                direction,
+            );
+            let (_, u, v) = face_uv(direction);
+            let spacing = 2.0 * radius / (32.0 * f64::from(1u32 << level))
+                * (1.0 + u * u).sqrt().max((1.0 + v * v).sqrt())
+                / (1.0 + u * u + v * v);
+            assert!(graduated_leaf_count(&targets, level) <= MAX_PLANNED_LEAVES);
+            assert!(
+                spacing <= 0.2,
+                "{direction:?}: level={level}, spacing={spacing}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_reservations_reject_excess_before_collecting_or_uploading() {
+        let budget = (1024, 768);
+        let old = (400, 300);
+        assert!(within_surface_budget(old, (624, 468), budget));
+        assert!(!within_surface_budget(old, (625, 468), budget));
+        assert!(!within_surface_budget(old, (624, 469), budget));
+        assert!(!within_surface_budget((usize::MAX, 0), (1, 0), budget));
+        // Moving allocated packet bytes into staged GPU ownership must still
+        // reserve the rest of the complete transaction; cancellation releases it.
+        assert!(within_surface_budget((600, 400), (400, 300), budget));
+        assert!(within_surface_budget(old, (0, 0), budget));
+    }
+
+    #[test]
+    fn physical_material_phase_matches_coincident_sloping_parent_child_triangles() {
+        let project = |point: DVec3, anchor: DVec3, radius: f64| {
+            let frame = noise_frame(anchor, radius);
+            let high = point.as_vec3();
+            let low = (point - high.as_dvec3()).as_vec3();
+            let ah = Vec3::from_array(frame.anchor_high[..3].try_into().unwrap());
+            let al = Vec3::from_array(frame.anchor_low[..3].try_into().unwrap());
+            let delta = ((high - ah) + (low - al)) * radius as f32;
+            let scale = frame.anchor_high[3];
+            let u = (ah + al) * scale;
+            let inv_radius = scale / radius as f32;
+            let z = 2.0 * u.dot(delta) + delta.dot(delta) * inv_radius;
+            let norm = (1.0 + z * inv_radius).sqrt();
+            (delta - u * (z / (norm + 1.0))) * (scale / norm)
+        };
+        for origin in [DVec3::Z, DVec3::Y, -DVec3::Y] {
+            let east = DVec3::X;
+            let north = origin.cross(east);
+            for radius in [6371000.0, 100000000.0] {
+                for exag in [1.0, 4.0, 30.0] {
+                    let points = [
+                        (-0.2, -0.13, 1000.0),
+                        (0.2, -0.1, 1000.12),
+                        (0.0, 0.2, 999.92),
+                    ]
+                    .map(|(x, y, h)| {
+                        (origin + (east * x + north * y) / radius).normalize()
+                            * (1.0 + h * exag / radius)
+                    });
+                    let fragment = points[0] * 0.2 + points[1] * 0.35 + points[2] * 0.45;
+                    let anchor = fragment.normalize() * (fragment.length() + 5.0 / radius);
+                    let phase = project(fragment, anchor, radius);
+                    let rebased = project(
+                        fragment,
+                        (anchor + east * (2000.0 / radius)).normalize() * anchor.length(),
+                        radius,
+                    );
+                    let expected = (fragment.normalize() - anchor.normalize()) * radius;
+                    assert!((phase.as_dvec3() - expected).length() < 0.004);
+                    let rebase_shift = (anchor.normalize()
+                        - (anchor + east * (2000.0 / radius)).normalize())
+                        * radius;
+                    assert!(
+                        (rebased.as_dvec3() - phase.as_dvec3() - rebase_shift).length() < 0.004
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn twenty_centimetre_material_phase_preserves_global_cells_at_poles_and_after_rebasing() {
+        assert_eq!(std::mem::size_of::<NoiseFrame>(), 288);
+        let shader_phase = |direction: DVec3, frame: NoiseFrame, radius: f64| {
+            let vertex = vertex(
+                &Sample {
+                    direction: direction.to_array(),
+                    ..Default::default()
+                },
+                radius,
+                1.0,
+                false,
+            );
+            let high = Vec3::from_array(vertex.normal_height[..3].try_into().unwrap());
+            let low = Vec3::from_array(vertex.direction_low);
+            let anchor_high = Vec3::from_array(frame.anchor_high[..3].try_into().unwrap());
+            let anchor_low = Vec3::from_array(frame.anchor_low[..3].try_into().unwrap());
+            let delta = ((high - anchor_high) + (low - anchor_low)) * radius as f32;
+            let rotated = Vec3::new(
+                delta.dot(Vec3::new(0.36, 0.48, 0.8)),
+                delta.dot(Vec3::new(-0.8, 0.6, 0.0)),
+                delta.dot(Vec3::new(-0.48, -0.64, 0.6)),
+            );
+            let band = frame.bands[7];
+            DVec3::new(
+                band.cell[0] as f64,
+                band.cell[1] as f64,
+                band.cell[2] as f64,
+            ) + (rotated / band.phase_scale[3]
+                + Vec3::from_array(band.phase_scale[..3].try_into().unwrap()))
+            .as_dvec3()
+        };
+        for anchor in [
+            DVec3::new(0.31, -0.42, 0.852).normalize(),
+            DVec3::Y,
+            -DVec3::Y,
+        ] {
+            let tangent = if anchor.cross(DVec3::Y).length_squared() > 1e-9 {
+                anchor.cross(DVec3::Y).normalize()
+            } else {
+                DVec3::X
+            };
+            for radius in [6_371_000.0, 100_000_000.0] {
+                let point = (anchor + tangent * (500.0 / radius)).normalize();
+                let next = (point + tangent * (0.02 / radius)).normalize();
+                let other = (anchor + tangent * (2000.0 / radius)).normalize();
+                let frame = noise_frame(anchor, radius);
+                let phase = shader_phase(point, frame, radius);
+                let rebased = shader_phase(point, noise_frame(other, radius), radius);
+                let expected = noise_axes(point) * (radius / 0.2);
+                assert!((phase - expected).length() < 0.01);
+                assert!((rebased - phase).length() < 0.02);
+                let step = shader_phase(next, frame, radius) - phase;
+                let expected_step = noise_axes(next - point) * (radius / 0.2);
+                assert!((step - expected_step).length() < 0.01);
+                assert!(step.length() > 0.075);
+            }
+        }
+    }
+
+    #[test]
     fn water_palette_retains_opaque_flags_real_depth_and_river_markers() {
         let marine = Sample {
             direction: DVec3::Z.to_array(),
@@ -5172,6 +6578,113 @@ mod tests {
         extra.push(0);
         assert!(decode_prepared_tile(&extra).is_err());
     }
+    #[test]
+    fn hybrid_packet_preserves_procedural_reference_and_rejects_truncated_base_heights() {
+        let raw = prepared_test_tile();
+        let reference: Vec<_> = raw.vertices.iter().map(|sample| sample.height_m).collect();
+        let radius = 1_737_000.0;
+        let sample = &raw.vertices[44];
+        let [x, y] = world_core::hybrid::chart_plane(4, sample.direction, radius);
+        let field = world_core::hybrid::HybridField::new(
+            "test-world".into(),
+            1,
+            radius,
+            vec![world_core::hybrid::HybridPatch {
+                face: 4,
+                level: 0,
+                x: (x / 7680.0).floor() as i32,
+                y: (y / 7680.0).floor() as i32,
+                values: vec![40.0; 258 * 258],
+            }],
+        )
+        .unwrap();
+        let packet = prepare_hybrid_tile(raw, radius, 1.0, Some(&field)).unwrap();
+        let hybrid = decode_prepared_tile(&packet).unwrap();
+        assert_eq!(hybrid.base_heights, reference);
+        assert!(hybrid
+            .tile
+            .vertices
+            .iter()
+            .zip(&reference)
+            .any(|(sample, base)| (sample.height_m - base).abs() > 0.00001));
+        for (sample, base) in hybrid.tile.vertices.iter().zip(&reference) {
+            if *base <= 0.0 {
+                assert_eq!(sample.height_m, *base);
+            }
+        }
+        assert!(decode_prepared_tile(&packet[..packet.len() - 8]).is_err());
+        // Mode changes never reuse an already modified sample as a source.
+        let restored = decode_prepared_tile(
+            &prepare_hybrid_tile(prepared_test_tile(), radius, 1.0, None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.base_heights, reference);
+        assert_eq!(
+            restored
+                .tile
+                .vertices
+                .iter()
+                .map(|sample| sample.height_m)
+                .collect::<Vec<_>>(),
+            reference
+        );
+    }
+
+    #[test]
+    fn worker_packets_retain_hydraulic_feather_and_legacy_packets_default_to_one() {
+        let mut tile = prepared_test_tile();
+        for sample in &mut tile.vertices {
+            sample.hybrid_weight = 0.125;
+        }
+        let packet = prepare_hybrid_tile(tile, 1_737_000.0, 1.0, None).unwrap();
+        let decoded = decode_prepared_tile(&packet).unwrap();
+        assert!(decoded
+            .tile
+            .vertices
+            .iter()
+            .all(|sample| sample.hybrid_weight == 0.125));
+        let json: Sample = serde_json::from_str("{\"height_m\":42}").unwrap();
+        assert_eq!(json.hybrid_weight, 1.0);
+        assert_eq!(Sample::default().hybrid_weight, 1.0);
+
+        let mut header: PreparedHeader =
+            bytemuck::pod_read_unaligned(&packet[..std::mem::size_of::<PreparedHeader>()]);
+        let hsize = std::mem::size_of::<PreparedHeader>();
+        let current_samples_end =
+            hsize + header.counts[0] as usize * std::mem::size_of::<PackedSample>();
+        let mut legacy = Vec::new();
+        header.magic = *b"WVP2";
+        header.counts[5] = 0;
+        legacy.extend_from_slice(bytemuck::bytes_of(&header));
+        for bytes in
+            packet[hsize..current_samples_end].chunks_exact(std::mem::size_of::<PackedSample>())
+        {
+            let sample: PackedSample = bytemuck::pod_read_unaligned(bytes);
+            let old = LegacyPackedSample {
+                direction: sample.direction,
+                height: sample.height,
+                water: sample.water,
+                level: sample.level,
+                body: sample.body,
+                fields: sample.fields,
+                mix: sample.mix,
+                biome: sample.biome,
+                flags: sample.flags,
+            };
+            legacy.extend_from_slice(bytemuck::bytes_of(&old));
+        }
+        legacy.extend_from_slice(
+            &packet[current_samples_end..packet.len() - decoded.base_heights.len() * 8],
+        );
+        let restored = decode_prepared_tile(&legacy).unwrap();
+        assert!(restored
+            .tile
+            .vertices
+            .iter()
+            .all(|sample| sample.hybrid_weight == 1.0));
+        assert_eq!(restored.base_heights, decoded.base_heights);
+    }
+
     #[test]
     fn border_normal_lookup_uses_original_direction_not_gpu_roundtrip() {
         let direction = DVec3::new(0.1234567800015, 0.5, 0.8571805081029673);
@@ -6076,7 +7589,9 @@ mod tests {
         };
         let mut last = 1;
         for frame in 1..32 {
-            let time = start + frame as f64 / 240.0;
+            // Wrap the ring while the first visible morph is still running,
+            // independently of the configured transition duration.
+            let time = start + MORPH_DURATION_SECONDS * frame as f64 / 64.0;
             let id = next_morph_epoch(last, time, &epochs).unwrap();
             epochs[id as usize % 32] = MorphEpoch {
                 id,
@@ -6088,7 +7603,7 @@ mod tests {
                 morph_progress(time, start)
             );
         }
-        let time = start + 32.0 / 240.0;
+        let time = start + MORPH_DURATION_SECONDS * 0.5;
         let visible_progress = epoch_progress(-1.0, time, &epochs);
         assert!(visible_progress < 1.0);
         assert_eq!(next_morph_epoch(last, time, &epochs), None);

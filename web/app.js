@@ -1,11 +1,14 @@
-import init, * as viewer from '/pkg/world_viewer.js';
 import { TileStream } from './tile-stream.js';
+import { HybridStream } from './hybrid-stream.js';
 import { CameraPredictor } from './camera-predictor.js';
 import { setupSettings } from './settings.js';
+import { startupDiagnostics, startupFailureMessage, startRenderer, attachNavigation, applyRendererControls } from './renderer-startup.js';
+import { terrainStatus, reliefSummary } from './relief-status.js';
 const predictor = new CameraPredictor();
 
 const $ = (id) => document.getElementById(id);
-const canvas = $('planet');
+let canvas = $('planet');
+let viewer;
 $('conservative-refinement').checked = false;
 let activeWorld;
 let frameCount = 0;
@@ -13,13 +16,35 @@ let lastFps = performance.now();
 let lastTile;
 const loadedTiles = new Map();
 let tileStream;
-const renderMetrics = { frames: 0, max_render_ms: 0, render_ms: 0 };
+let hybridStream;
+const renderMetrics = { frames: 0, active_ms: 0, max_render_ms: 0, render_ms: 0 };
+let previousFrameTime;
 let generationBusy = false;
 let rendererFailed = false;
+let rendererReady = false;
 let riverData;
 let seasonPhase;
 let renderEpoch = 0;
 const destinations = new Map();
+let lastReliefProbe = -Infinity;
+
+function updateReliefLegend(info) {
+  const colored = Number($('layer').value) === 5;
+  $('relief-legend').hidden = !colored;
+  $('relief-measure').hidden = !colored && $('terrain-mode').value !== 'hybrid';
+  if ((!colored && $('terrain-mode').value !== 'hybrid') || performance.now() - lastReliefProbe < 500) return;
+  lastReliefProbe = performance.now();
+  try {
+    const probe = JSON.parse(viewer.surface_probe(JSON.stringify(info.direction)));
+    const text = reliefSummary(probe);
+    $('relief-summary').textContent = text;
+    $('relief-overlay-summary').textContent = text;
+    window.worldBuilderRelief = { layer: Number($('layer').value), probe, summary: text };
+  } catch {
+    $('relief-summary').textContent = 'Mesure au centre en attente du maillage.';
+    $('relief-overlay-summary').textContent = $('relief-summary').textContent;
+  }
+}
 
 function message(text) {
   $('message').textContent = text;
@@ -49,10 +74,16 @@ function addMetric(label, value) {
   $('stats').append(row);
 }
 
-function loadWorld(world) {
+function loadWorld(world, generationMode) {
+  if (!rendererReady) return;
   viewer.set_world(JSON.stringify(world));
-  viewer.set_overlays($('show-rivers').checked, false);
+  applyControls(true);
   activeWorld = world;
+  hybridStream?.reset(world);
+  if (generationMode) {
+    $('terrain-mode').value = generationMode;
+    hybridStream?.setMode(generationMode);
+  }
   destinations.clear();
   predictor.reset();
   $('destination').replaceChildren(new Option('Choisir un lieu', ''));
@@ -70,6 +101,9 @@ function loadWorld(world) {
   if (peak) addDestination('peak', 'Sommet · continent', peak.position ?? peak.direction, 15000);
   if (barePeak) addDestination('relief', 'Relief · sans glace', barePeak.position ?? barePeak.direction, 5000);
   if (coast) addDestination('coast', 'Côte', coast.position ?? coast.direction, 1500);
+  if (String(world.id) === '00f74e61d937739d5424') {
+    addDestination('nn-demo', 'Situation démo NN', [-0.1392381651514895, 0.015470907239054392, 0.9901380632994811], 30000);
+  }
   lastTile = undefined;
   loadedTiles.clear();
   renderEpoch += 1; tileStream?.reset(renderEpoch);
@@ -116,7 +150,7 @@ function addDestination(id, label, direction, altitude_m = 30000, kind = 'terrai
 async function loadOverlays(worldId) {
   const results = await Promise.allSettled([
     api(`/api/worlds/${worldId}/rivers`).then((data) => {
-      if (activeWorld?.id !== worldId) return;
+      if (!rendererReady || activeWorld?.id !== worldId) return;
       riverData = JSON.stringify(data); viewer.set_rivers(riverData);
       // Canonical interior points are verified wet by the server. An atlas cell
       // or the start of a segment can lie beside the visible, warped channel.
@@ -140,13 +174,14 @@ async function loadOverlays(worldId) {
 }
 
 async function changeSeason() {
-  if (!activeWorld) return;
+  if (!rendererReady || !activeWorld) return;
   const month = Number($('season').value);
   const worldId = activeWorld.id;
   try {
     const world = await api(month === 0 ? `/api/worlds/${worldId}/preview?resolution=128` : `/api/worlds/${worldId}/preview?resolution=128&phase=${(month - 1) / 12}`);
-    if (activeWorld?.id !== worldId || Number($('season').value) !== month) return;
+    if (!rendererReady || activeWorld?.id !== worldId || Number($('season').value) !== month) return;
     viewer.set_world(JSON.stringify(world));
+    hybridStream?.reset(world);
     if (riverData) viewer.set_rivers(riverData);
     seasonPhase = month === 0 ? undefined : (month - 1) / 12;
     renderEpoch += 1; tileStream?.reset(renderEpoch);
@@ -156,7 +191,10 @@ async function changeSeason() {
 }
 
 async function generate() {
-  if (generationBusy) return;
+  if (!rendererReady || generationBusy) return;
+  // Capture the next-world setting without changing the planet being explored.
+  // A failed request must preserve its existing selected and committed modes.
+  const generationMode = $('generation-mode').value;
   generationBusy = true;
   $('generate').disabled = true;
   $('generate').firstElementChild.textContent = 'Calcul en cours…';
@@ -167,7 +205,7 @@ async function generate() {
     $('status').textContent = 'Calcul du relief, du climat et de l’hydrologie…';
     const result = await api('/api/worlds', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(config) });
     if (result.cells) {
-      loadWorld(result);
+      loadWorld(result, generationMode);
     } else {
       const id = result.job_id ?? result.id;
       for (;;) {
@@ -176,7 +214,7 @@ async function generate() {
         $('status').textContent = job.message ?? (job.status === 'queued' ? 'Génération dans la file…' : 'Calcul du monde…');
         if (job.status === 'failed') throw new Error(job.error ?? 'La génération a échoué');
         if (job.status === 'ready' || job.status === 'complete' || job.status === 'completed') {
-          loadWorld(await api(job.world_id ? `/api/worlds/${job.world_id}/preview?resolution=128` : '/api/world/latest/preview?resolution=128'));
+          loadWorld(await api(job.world_id ? `/api/worlds/${job.world_id}/preview?resolution=128` : '/api/world/latest/preview?resolution=128'), generationMode);
           break;
         }
       }
@@ -193,7 +231,7 @@ async function generate() {
 }
 
 function updateDetail() {
-  if (!activeWorld || !tileStream || rendererFailed) return;
+  if (!rendererReady || !activeWorld || !tileStream || rendererFailed) return;
   const info = JSON.parse(viewer.view_info());
   const altitude = info.altitude_m;
   $('camera').textContent = altitude >= 1000 ? `Altitude ${number(altitude / 1000, 1)} km` : `Altitude ${number(altitude)} m`;
@@ -225,37 +263,35 @@ function updateDetail() {
     }
     renderMetrics.forecast_requests = added;
   }
-  tileStream.update(requests, {
+  const tileContext = {
     epoch: renderEpoch, keyOf, critical, residentKeys: info.resident_keys, radius: activeWorld.config.radius_m,
-    exaggeration: Number($('exaggeration').value), format: conservative ? 'json' : 'postcard',
+    exaggeration: info.exaggeration, format: conservative ? 'json' : 'postcard',
     urlOf: (tile) => new URL(`/api/worlds/${worldId}/tiles/${tile.face}/${tile.level}/${tile.x}/${tile.y}?segments=${conservative || tile.level <= 2 ? 64 : 32}&format=${conservative ? 'json' : 'postcard'}${phase === undefined ? '' : `&phase=${phase}`}${conservative ? '&generator=contracts' : '&generator=coherent'}&surface_revision=${activeWorld.surface_revision ?? 'spherical-coast-10'}`, location.origin).href,
-  });
+  };
+  tileContext.height = canvas.clientHeight;
+  tileContext.activeMs = renderMetrics.active_ms;
+  tileContext.aspect = Math.max(0.1, canvas.clientWidth / Math.max(1, canvas.clientHeight));
+  tileStream.update(requests, tileContext);
+  hybridStream?.update(info, tileContext);
+  const hybrid = hybridStream?.snapshot();
+  const spacing = info.grid_spacing_m ?? activeWorld.config.radius_m * 2 / ((info.active_level <= 2 ? 64 : 32) * 2 ** (info.active_level ?? 0));
+  $('terrain-resolution').textContent = terrainStatus(hybrid, spacing, activeWorld.config.surface_detail_min_spacing_m ?? 0.2);
+  updateReliefLegend(info);
   if (info.level >= 0) {
     $('status').textContent = `Exploration · niveau ${info.active_level ?? '…'} / ${info.level} · ${loadedTiles.size} tuiles en cache`;
   }
 }
 
-let pointer;
-canvas.addEventListener('pointerdown', (event) => {
-  pointer = { x: event.clientX, y: event.clientY };
-  canvas.setPointerCapture(event.pointerId);
-});
-canvas.addEventListener('pointermove', (event) => {
-  if (!pointer) return;
-  viewer.rotate(event.clientX - pointer.x, event.clientY - pointer.y);
-  pointer = { x: event.clientX, y: event.clientY };
-});
-for (const event of ['pointerup', 'pointercancel']) canvas.addEventListener(event, () => { pointer = undefined; });
-canvas.addEventListener('wheel', (event) => { event.preventDefault(); viewer.zoom(event.deltaY); }, { passive: false });
 $('generator').addEventListener('submit', (event) => { event.preventDefault(); generate(); });
 $('reset').addEventListener('click', () => {
+  if (!rendererReady) return;
   viewer.reset_view();
   predictor.reset();
   $('view-tilt').value = '0';
   $('view-tilt-value').value = '0°';
 });
 function visit(direction) {
-  if (!activeWorld || !direction) return;
+  if (!rendererReady || !activeWorld || !direction) return;
   const altitude = Number($('visit-altitude').value);
   if (!Number.isFinite(altitude) || altitude < 1 || altitude > activeWorld.config.radius_m * 7) {
     message(`L’altitude doit être comprise entre 1 et ${number(activeWorld.config.radius_m * 7)} m.`);
@@ -267,6 +303,7 @@ function visit(direction) {
   $('status').textContent = `Arrivée à ${number(altitude)} m au-dessus du terrain`;
 }
 function selectDestination() {
+  if (!rendererReady) return;
   const place = destinations.get($('destination').value);
   $('fly').disabled = !place;
   if (place) {
@@ -279,6 +316,7 @@ function selectDestination() {
 }
 $('destination').addEventListener('change', selectDestination);
 $('fly').addEventListener('click', () => {
+  if (!rendererReady) return;
   const place = destinations.get($('destination').value);
   if (place?.kind === 'river') {
     $('show-rivers').checked = true;
@@ -287,14 +325,48 @@ $('fly').addEventListener('click', () => {
   visit(place?.direction);
 });
 $('go-altitude').addEventListener('click', () => {
-  if (!activeWorld) return;
+  if (!rendererReady || !activeWorld) return;
   visit(JSON.parse(viewer.view_info()).direction);
 });
-$('layer').addEventListener('change', () => viewer.set_mode(Number($('layer').value)));
+$('terrain-mode').addEventListener('change', () => { if (!rendererReady) return; hybridStream?.setMode($('terrain-mode').value); updateDetail(); });
+function zoomToSpacing(mpp) {
+  if (!rendererReady || !activeWorld) return;
+  const direction = JSON.parse(viewer.view_info()).direction;
+  // Match the checkpoint's native pixels instead of magnifying each30m
+  // sample over dozens of screen pixels. The viewer refines the centre first.
+  const altitude = mpp === 30 ? Math.max(1000, 30 * canvas.clientHeight / (2 * Math.tan(Math.PI / 8))) : Math.max(5, mpp * canvas.clientHeight / (2 * Math.tan(Math.PI / 8)));
+  if (mpp === 30) {
+    $('terrain-mode').value = 'hybrid'; hybridStream?.setMode('hybrid');
+  }
+  viewer.fly_to(JSON.stringify(direction), altitude); predictor.reset();
+  $('visit-altitude').value = String(altitude); updateDetail();
+}
+$('zoom-native').addEventListener('click', () => zoomToSpacing(30));
+$('show-nn-relief').addEventListener('click', () => {
+  if (!rendererReady || !activeWorld) return;
+  $('layer').value = '5'; viewer.set_mode(5);
+  $('terrain-mode').value = 'hybrid'; hybridStream?.setMode('hybrid');
+  $('view-tilt').value = '25'; $('view-tilt-value').value = '25°'; viewer.set_view_tilt(25);
+  // The known dry point belongs only to the demo world; other planets retain
+  // their current location. This explicit action never changes mode implicitly.
+  const direction = String(activeWorld.id) === '00f74e61d937739d5424'
+    ? [-0.1392381651514895, 0.015470907239054392, 0.9901380632994811]
+    : JSON.parse(viewer.view_info()).direction;
+  viewer.fly_to(JSON.stringify(direction), 18000); predictor.reset();
+  $('visit-altitude').value = '18000'; lastReliefProbe = -Infinity; updateDetail();
+});
+// The five-metre camera bound is CPU/browser-tested to deliver20cm geometry;
+// a pixel-footprint estimate alone cannot account for the cut's memory limit.
+$('zoom-fine').addEventListener('click', () => zoomToSpacing(0));
+$('layer').addEventListener('change', () => {
+  if (rendererReady) { viewer.set_mode(Number($('layer').value)); lastReliefProbe = -Infinity; updateDetail(); }
+});
 $('season').addEventListener('input', () => { $('season-value').value = Number($('season').value) === 0 ? 'Moyenne annuelle' : `Saison ${$('season').value} / 12`; });
 $('season').addEventListener('change', changeSeason);
-$('show-rivers').addEventListener('change', () => viewer.set_overlays($('show-rivers').checked, false));
+$('show-rivers').addEventListener('change', () => { if (rendererReady) viewer.set_overlays($('show-rivers').checked, false); });
 $('conservative-refinement').addEventListener('change', () => {
+  if (!rendererReady) return;
+  hybridStream?.cancelTransaction();
   renderEpoch += 1; tileStream?.reset(renderEpoch);
   viewer.clear_tiles();
   loadedTiles.clear();
@@ -302,17 +374,21 @@ $('conservative-refinement').addEventListener('change', () => {
   $('contract-status').textContent = 'Conservation des altitudes uniquement. Descendre pour vérifier le raffinement.';
 });
 $('exaggeration').addEventListener('input', () => { $('exaggeration-value').value = `×${$('exaggeration').value}`; });
-$('exaggeration').addEventListener('change', () => { viewer.set_exaggeration(Number($('exaggeration').value)); viewer.clear_tiles(); loadedTiles.clear(); renderEpoch += 1; tileStream?.reset(renderEpoch); lastTile = undefined; updateDetail(); });
-$('view-tilt').addEventListener('input', () => { $('view-tilt-value').value = `${$('view-tilt').value}°`; viewer.set_view_tilt(Number($('view-tilt').value)); });
+$('exaggeration').addEventListener('change', () => { if (!rendererReady || !activeWorld) return; hybridStream?.cancelTransaction(); viewer.set_exaggeration(Number($('exaggeration').value)); viewer.clear_tiles(); loadedTiles.clear(); renderEpoch += 1; tileStream?.reset(renderEpoch); lastTile = undefined; updateDetail(); });
+$('view-tilt').addEventListener('input', () => { $('view-tilt-value').value = `${$('view-tilt').value}°`; if (rendererReady) viewer.set_view_tilt(Number($('view-tilt').value)); });
 
 function frame(now) {
+  if (!rendererReady || rendererFailed) return;
+  if (previousFrameTime !== undefined) renderMetrics.active_ms += Math.min(100, Math.max(0, now-previousFrameTime));
+  previousFrameTime = now;
   const ratio = Math.min(devicePixelRatio || 1, 2);
   const width = Math.round(canvas.clientWidth * ratio);
   const height = Math.round(canvas.clientHeight * ratio);
   if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
   const renderStarted = performance.now();
   tileStream?.installNext();
-  try { viewer.render(width, height); } catch (error) { rendererFailed = true; tileStream?.worker.terminate(); message(`Rendu : ${error}`); return; }
+  hybridStream?.installNext();
+  try { viewer.render(width, height); } catch (error) { rendererFailed = true; rendererReady = false; tileStream?.worker.terminate(); message(`Rendu : ${error}`); return; }
   renderMetrics.render_ms = performance.now() - renderStarted;
   renderMetrics.max_render_ms = Math.max(renderMetrics.max_render_ms, renderMetrics.render_ms);
   renderMetrics.frames += 1;
@@ -321,24 +397,44 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+function applyControls(worldReady = false) {
+  applyRendererControls(viewer, { layer: Number($('layer').value), rivers: $('show-rivers').checked,
+    tilt: Number($('view-tilt').value), exaggeration: Number($('exaggeration').value) }, worldReady);
+}
+
+window.worldBuilderStartup = startupDiagnostics(new URLSearchParams(location.search).get('backend'));
 try {
-  await init();
-  const backend = await viewer.start('planet', new URLSearchParams(location.search).get('backend') === 'webgl');
+  viewer = await import('/pkg/world_viewer.js');
+  window.worldBuilderStartup.phase = 'wasm-init';
+  await viewer.default();
+  const started = await startRenderer({ viewer, canvas, diagnostics: window.worldBuilderStartup });
+  canvas = started.canvas;
+  rendererReady = true;
+  applyControls();
+  attachNavigation(canvas, viewer, () => rendererReady);
+  window.worldBuilderStartup.phase = 'stream-init';
+  const backend = started.backend;
   const worker = new Worker(new URL('./tile-worker.js', import.meta.url), { type: 'module' });
-  tileStream = new TileStream(worker, (packet) => viewer.install_prepared_tile(packet), (keys) => {
+  tileStream = new TileStream(worker, (packet, version) => viewer.install_prepared_tile_versioned(packet, version), (keys) => {
     loadedTiles.clear();
     for (const tile of keys) loadedTiles.set(`${activeWorld.id}/${tile.face}/${tile.level}/${tile.x}/${tile.y}`, true);
   });
-  window.worldBuilderPerf = () => ({ ...renderMetrics, ...tileStream.metrics,
+  const surfaceWorker = new Worker(new URL('./tile-worker.js?role=surface', import.meta.url), { type: 'module' });
+  const bridge = new URL(location.href); bridge.port = '8767';
+  hybridStream = new HybridStream({ viewer, tileStream, worker: surfaceWorker, endpoint: bridge.origin });
+  hybridStream.setMode($('terrain-mode').value);
+  window.worldBuilderPerf = () => ({ ...renderMetrics, ...tileStream.metrics, hybrid: hybridStream.snapshot(),
     view: JSON.parse(viewer.view_info()), in_flight: tileStream.jobs.size, queued: tileStream.ready.length });
   $('backend').textContent = `Rust / WASM · ${backend}`;
   $('runtime-dot').classList.add('ready');
   $('generate').disabled = false;
+  window.worldBuilderStartup.phase = 'ready';
   requestAnimationFrame(frame);
   setInterval(updateDetail, 50);
   try { loadWorld(await api('/api/world/latest/preview?resolution=128')); } catch { await generate(); }
 } catch (error) {
-  $('backend').textContent = 'Moteur indisponible';
-  $('status').textContent = 'Initialisation impossible';
-  message(`Le moteur Rust/WebAssembly ne démarre pas : ${error}. Lancez scripts/build-web.sh, puis utilisez un navigateur récent avec WebGPU ou WebGL2 sur localhost.`);
+  rendererReady = false;
+  $('backend').textContent = window.worldBuilderStartup.selected ? `Rust / WASM · ${window.worldBuilderStartup.selected} · interface indisponible` : 'Moteur indisponible';
+  $('status').textContent = window.worldBuilderStartup.selected ? 'Moteur initialisé · interface indisponible' : 'Initialisation impossible';
+  message(startupFailureMessage(error, window.worldBuilderStartup));
 }

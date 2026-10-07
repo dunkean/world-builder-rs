@@ -1,10 +1,10 @@
-//! Shared versioned tile transport. WBT1 identifies the current serde Tile
+//! Shared versioned tile transport. WBT2 identifies the current serde Tile
 //! schema; changing that schema requires a new magic/version on both ends.
 
 use crate::Tile;
 use anyhow::{anyhow, ensure, Result};
 
-pub const MAGIC: &[u8; 4] = b"WBT1";
+pub const MAGIC: &[u8; 4] = b"WBT2";
 pub const CONTENT_TYPE: &str = "application/vnd.world-builder.tile+postcard";
 
 pub fn encode_tile(tile: &Tile) -> Result<Vec<u8>> {
@@ -116,9 +116,9 @@ mod tests {
         let mut encoded = encode_tile(&tile).unwrap();
         assert!(decode_tile(&encoded[..3]).is_err());
         assert!(decode_tile(&encoded[..encoded.len() - 1]).is_err());
-        encoded[3] = b'2';
-        assert!(decode_tile(&encoded).is_err());
         encoded[3] = b'1';
+        assert!(decode_tile(&encoded).is_err());
+        encoded[3] = b'2';
         encoded.push(0);
         assert!(decode_tile(&encoded).is_err());
     }

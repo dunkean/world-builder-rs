@@ -3,7 +3,7 @@ struct NoiseBand { cell: vec4<i32>, phase_scale: vec4<f32> };
 struct NoiseFrame {
     anchor_high: vec4<f32>,
     anchor_low: vec4<f32>,
-    bands: array<NoiseBand, 6>,
+    bands: array<NoiseBand, 8>,
 };
 struct Uniforms {
     view_projection: mat4x4<f32>,
@@ -50,19 +50,26 @@ struct VertexOut {
     if start<0.0 {let id=u32(-start);let record=scene.clips[id%32u].bounds;start=select(-1e9,record.y,record.x==f32(id));}
     let progress=smoothstep(0.0,MORPH_DURATION_SECONDS,scene.light.w-start);
     let offset=mix(v.morph.x,v.morph.w,progress);
-    let relative=(v.position-scene.eye.xyz)+(v.position_low-scene.eye_low.xyz)+v.normal_height.xyz*offset;
+    let relative=(v.position-scene.eye.xyz)+(v.position_low-scene.eye_low.xyz)
+        + v.normal_height.xyz*offset + v.direction_low*offset;
     out.clip = scene.view_projection * vec4<f32>(relative, 1.0);
     out.position = relative;
     out.normal_height = v.normal_height;
+    // The relief legend describes the morphed physical surface, in kilometres,
+    // rather than its exaggeration or the final height before a LOD transition.
+    if scene.options.x > 4.5 {
+        out.normal_height.w += offset * scene.options.y / (1000.0 * scene.surface.x);
+    }
     out.color = v.color;
     out.fields = v.fields;
     out.fields.w=mix(v.morph.z,v.water_depth,progress);
     out.flags = u32(v.color.a + 0.5);
     out.shading_normal = normalize(mix(v.parent_normal, v.shading_normal, progress));
-    // Surface ink is independent of rendered height, relief exaggeration and
-    // morph. Subtract the split unit-sphere anchor before converting to metres.
-    out.surface_delta = ((v.normal_height.xyz - scene.noise.anchor_high.xyz)
-        + (v.direction_low - scene.noise.anchor_low.xyz)) * scene.options.y;
+    // Interpolate the same morphed physical position used by clip-space.
+    // The split camera anchor keeps planetary coordinates out of f32 sums.
+    out.surface_delta = ((v.position - scene.noise.anchor_high.xyz)
+        + (v.position_low - scene.noise.anchor_low.xyz)
+        + v.normal_height.xyz * offset + v.direction_low * offset) * scene.options.y;
     out.biome_a = v.biome_a;
     out.biome_b = v.biome_b;
     return out;
@@ -70,6 +77,42 @@ struct VertexOut {
 
 fn ramp(x: f32, low: vec3<f32>, high: vec3<f32>) -> vec3<f32> {
     return mix(low, high, clamp(x, 0.0, 1.0));
+}
+
+fn relief_palette(height_m: f32) -> vec3<f32> {
+    // Fixed metre stops are also printed in the HTML legend. Hillshade and
+    // steep-slope accents supplement height; no biome/material noise is used.
+    let low = vec3(0.92, 0.76, 0.53);
+    let orange = vec3(0.88, 0.34, 0.12);
+    let red = vec3(0.65, 0.12, 0.085);
+    let summit = vec3(0.98, 0.88, 0.76);
+    if height_m < 0.0 { return ramp((height_m + 6000.0) / 6000.0, vec3(0.025, 0.095, 0.16), low); }
+    if height_m < 500.0 { return ramp(height_m / 500.0, low, orange); }
+    if height_m < 2000.0 { return ramp((height_m - 500.0) / 1500.0, orange, red); }
+    return ramp((height_m - 2000.0) / 4000.0, red, summit);
+}
+
+fn colored_relief(v: VertexOut, radial: vec3<f32>, water: bool) -> vec3<f32> {
+    if water { return vec3(0.035, 0.20, 0.30); }
+    let height_m = v.normal_height.w * 1000.0;
+    let normal = normalize(v.shading_normal);
+    let cosine = clamp(dot(normal, radial), 0.0001, 1.0);
+    let correction = (scene.options.y + scene.surface.x * height_m)
+        / max(1.0, scene.options.y + height_m);
+    // Undo vertical exaggeration for physical slope, as surface_probe does.
+    let tangent = (normal - radial * cosine) * correction
+        / (cosine * max(1.0, scene.surface.x));
+    let physical_normal = normalize(radial + tangent);
+    let slope_degrees = atan(length(tangent)) * 57.2957795;
+    var light_tangent = vec3(0.4, 0.8, -0.5) - radial * dot(radial, vec3(0.4, 0.8, -0.5));
+    if dot(light_tangent, light_tangent) < 0.0001 { light_tangent = cross(radial, vec3(1.0, 0.0, 0.0)); }
+    let light = normalize(radial * 0.55 + normalize(light_tangent) * 0.84);
+    let departure = dot(physical_normal, light) - dot(radial, light);
+    let shade = clamp(0.88 + 3.2 * departure, 0.24, 1.38);
+    var color = relief_palette(height_m);
+    color = mix(color, vec3(0.68, 0.065, 0.035), 0.45 * smoothstep(20.0, 55.0, slope_degrees));
+    color *= shade;
+    return mix(color, vec3(0.99, 0.92, 0.78), clamp(departure * 1.2, 0.0, 0.38));
 }
 
 fn ink_hash(value: u32) -> u32 {
@@ -120,17 +163,35 @@ fn noise_axes(p: vec3<f32>) -> vec3<f32> {
 }
 
 fn surface_delta(delta: vec3<f32>) -> vec3<f32> {
-    // Interpolated directions lie on a triangle chord. Project back onto the
-    // sphere with a cancellation-safe local expression, avoiding f32 planetary
-    // coordinates and preventing a noise phase change when a tile subdivides.
-    let radius = scene.options.y;
-    let anchor = scene.noise.anchor_high.xyz + scene.noise.anchor_low.xyz;
-    let t = (2.0 * dot(anchor, delta) + dot(delta, delta) / radius) / radius;
-    let norm = sqrt(max(1e-12, 1.0 + t));
-    return (delta - anchor * (radius * t / (norm + 1.0))) / norm;
+    // R*(normalize(physical_point)-normalize(anchor)), without subtracting
+    // planetary f32 positions. This also preserves phase on sloping chords.
+    let inverse_length = scene.noise.anchor_high.w;
+    let anchor = (scene.noise.anchor_high.xyz + scene.noise.anchor_low.xyz) * inverse_length;
+    let inv_radius = inverse_length / scene.options.y;
+    let z = 2.0 * dot(anchor, delta) + dot(delta, delta) * inv_radius;
+    let norm = sqrt(max(1e-12, 1.0 + z * inv_radius));
+    return (delta - anchor * (z / (norm + 1.0))) * (inverse_length / norm);
 }
 
-struct Facies { regional: vec3<f32>, local: vec3<f32>, fine: vec3<f32> };
+// Two small scalar bands avoid expanding the six original three-channel
+// domain-warped bands into eight copies in WebGL shader translation.
+fn scalar_corner(lattice: vec3<i32>, displacement: vec3<f32>, seed: u32) -> f32 {
+    let p = bitcast<vec3<u32>>(lattice);
+    let h = ink_hash((p.x * 0x8da6b343u) ^ (p.y * 0xd8163841u) ^ (p.z * 0xcb1ab31fu) ^ seed);
+    return ink_gradient(h, displacement);
+}
+fn scalar_noise(q: vec3<f32>, origin: vec3<i32>, seed: u32) -> f32 {
+    let base = origin + vec3<i32>(floor(q));
+    let f = fract(q);
+    let t = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let a = mix(mix(scalar_corner(base, f, seed), scalar_corner(base + vec3<i32>(1,0,0), f-vec3(1.0,0.0,0.0), seed), t.x),
+        mix(scalar_corner(base + vec3<i32>(0,1,0), f-vec3(0.0,1.0,0.0), seed), scalar_corner(base+vec3<i32>(1,1,0),f-vec3(1.0,1.0,0.0),seed),t.x),t.y);
+    let b = mix(mix(scalar_corner(base+vec3<i32>(0,0,1),f-vec3(0.0,0.0,1.0),seed), scalar_corner(base+vec3<i32>(1,0,1),f-vec3(1.0,0.0,1.0),seed),t.x),
+        mix(scalar_corner(base+vec3<i32>(0,1,1),f-vec3(0.0,1.0,1.0),seed), scalar_corner(base+vec3<i32>(1,1,1),f-vec3(1.0,1.0,1.0),seed),t.x),t.y);
+    return mix(a,b,t.z)*1.8;
+}
+
+struct Facies { regional: vec3<f32>, local: vec3<f32>, fine: vec3<f32>, grain: f32 };
 
 fn map_facies(delta: vec3<f32>, footprint_m: f32, band_count: u32) -> Facies {
     let q = noise_axes(delta);
@@ -138,7 +199,7 @@ fn map_facies(delta: vec3<f32>, footprint_m: f32, band_count: u32) -> Facies {
     let regional_weight = array<f32, 6>(0.55, 0.45, 0.28, 0.15, 0.09, 0.05);
     let local_weight = array<f32, 6>(0.0, 0.0, 0.35, 0.40, 0.32, 0.24);
     let fine_weight = array<f32, 6>(0.0, 0.0, 0.0, 0.28, 0.38, 0.48);
-    var field = Facies(vec3(0.0), vec3(0.0), vec3(0.0));
+    var field = Facies(vec3(0.0), vec3(0.0), vec3(0.0), 0.0);
     var warp = vec3(0.0);
     for (var band = 0u; band < band_count; band += 1u) {
         let record = scene.noise.bands[band];
@@ -154,6 +215,35 @@ fn map_facies(delta: vec3<f32>, footprint_m: f32, band_count: u32) -> Facies {
             field.local += raw * (local_weight[band] * visible);
             field.fine += raw * (fine_weight[band] * visible);
             warp = raw.yzx * 0.72;
+        }
+    }
+    if band_count == 6u {
+        let mid = scene.noise.bands[6];
+        if footprint_m < 0.25 {
+            let raw = scalar_noise(q / 0.5 + mid.phase_scale.xyz, mid.cell.xyz, seed ^ 0x121475cdu);
+            let visible = 1.0 - smoothstep(0.0625, 0.25, footprint_m);
+            field.local += vec3(raw, raw * 0.7, -raw * 0.45) * (0.10 * visible);
+            field.fine += vec3(raw, raw * 0.7, -raw * 0.45) * (0.16 * visible);
+            field.grain += raw * (0.05 * visible);
+        }
+        let micro = scene.noise.bands[7];
+        if footprint_m < 0.1 {
+            let raw = scalar_noise(q / 0.2 + micro.phase_scale.xyz, micro.cell.xyz, seed ^ 0x872bf623u);
+            let visible = 1.0 - smoothstep(0.025, 0.1, footprint_m);
+            field.local += vec3(raw, -raw * 0.5, raw * 0.8) * (0.05 * visible);
+            field.fine += vec3(raw, -raw * 0.5, raw * 0.8) * (0.12 * visible);
+            field.grain += raw * (0.14 * visible);
+            if footprint_m < 0.0125 {
+                // Small material grains remain readable when the camera is
+                // much closer than the 20cm terrain sampling. Derive their
+                // world lattice modulo32 from the same anchored band.
+                let origin = bitcast<vec3<i32>>(
+                    bitcast<vec3<u32>>(micro.cell.xyz) * vec3<u32>(8u));
+                let raw_grain = scalar_noise((q / 0.2 + micro.phase_scale.xyz) * 8.0,
+                    origin, seed ^ 0x183bc409u);
+                let grain_visible = 1.0 - smoothstep(0.003125, 0.0125, footprint_m);
+                field.grain += raw_grain * (0.24 * grain_visible);
+            }
         }
     }
     return field;
@@ -323,6 +413,7 @@ fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
     if water && v.fields.z < -1.5 && scene.options.z < 0.5 { discard; }
     var color = v.color.rgb;
     let mode = u32(scene.options.x);
+    if mode == 5u { return vec4(colored_relief(v, radial, water), 1.0); }
     if mode == 0u {
         let facies = map_facies(ink_delta, footprint_m, select(6u, 3u, water));
         if water {
@@ -333,6 +424,9 @@ fn water_ink(depth: f32, style: f32, marine: bool, grain: f32) -> vec3<f32> {
             color = water_ink(v.fields.w, v.fields.z, marine, facies.regional.x * 0.5);
         } else {
             color = land_ink(v, radial, facies);
+            // Fine albedo remains visible inside uniform biome patches, where
+            // the broader smoothstep transitions have already saturated.
+            color *= clamp(1.0 + facies.grain, 0.80, 1.20);
         }
     } else if mode == 1u {
         color = ramp((v.normal_height.w + 2.0) / 8.0, vec3(0.08, 0.20, 0.34), vec3(0.96, 0.91, 0.75));

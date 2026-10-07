@@ -5,3 +5,26 @@
 /.playwright-cli/
 /output/
 *.tmp
+
+# Local secrets and generated files
+dunk_token
+dunk_token.*
+.env
+.env.*
+!.env.example
+/models/
+/checkpoints/
+/runs/
+/reports/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.tif
+*.tiff
+*.zip
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/

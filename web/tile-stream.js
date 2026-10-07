@@ -12,6 +12,8 @@ export class TileStream {
     this.failures = new Map();
     this.sequence = 0;
     this.epoch = undefined;
+    this.surfaceVersion = 0;
+    this.surfaceReadyVersion = 0;
     this.metrics = { installed: 0, stale: 0, max_install_ms: 0, ready_bytes: 0 };
     worker.onmessage = ({ data }) => this.receive(data);
     worker.onerror = (error) => { console.error('Worker de terrain', error.message); };
@@ -23,6 +25,15 @@ export class TileStream {
     this.loaded.clear(); this.ready.length = 0; this.failures.clear();
     this.desired.clear(); this.context = undefined;
     this.metrics.ready_bytes = 0; this.epoch = epoch;
+  }
+
+  setSurface(version, field = '', world, options = {}) {
+    this.surfaceVersion = version;
+    this.surfacePaused = Boolean(options.paused);
+    this.surfaceReadyVersion = undefined;
+    for (const [id] of this.jobs) this.worker.postMessage({ type: 'cancel', id });
+    this.jobs.clear(); this.ready.length = 0; this.metrics.ready_bytes = 0;
+    this.worker.postMessage({ type: 'set-surface', version, field, world, snapshot: Boolean(options.snapshot) });
   }
 
   update(requests, context) {
@@ -50,7 +61,7 @@ export class TileStream {
   }
 
   dispatch() {
-    if (!this.context) return;
+    if (!this.context || this.surfacePaused || this.surfaceReadyVersion !== this.surfaceVersion) return;
     const queued = new Set([...this.jobs.values()].filter((job) => !job.cancelled && job.epoch === this.epoch).map((job) => job.key));
     for (const tile of this.ready) queued.add(tile.key);
     const critical = this.context.critical;
@@ -62,19 +73,27 @@ export class TileStream {
       // detail is loading. Camera reprioritization does not cancel useful jobs.
       if (critical && !critical.has(key) && speculative >= 2) continue;
       const id = ++this.sequence;
-      const job = { key, epoch: this.epoch, cancelled: false };
+      const job = { key, epoch: this.epoch, surfaceVersion: this.surfaceVersion, cancelled: false };
       this.jobs.set(id, job); queued.add(key);
       if (critical && !critical.has(key)) speculative += 1;
       this.worker.postMessage({ type: 'load', id, key, epoch: this.epoch,
         url: this.context.urlOf(tile), radius: this.context.radius, exaggeration: this.context.exaggeration,
-        format: this.context.format });
+        format: this.context.format, surfaceVersion: this.surfaceVersion,
+        rootFace: tile.level === 0 ? tile.face : undefined });
     }
   }
 
   receive(data) {
+    if (data.type === 'surface-ready') {
+      if (data.version === this.surfaceVersion) this.surfaceReadyVersion = data.version;
+      this.dispatch(); return;
+    }
+    if (data.type === 'surface-error' || data.type === 'patch-error') {
+      this.onSurfaceError?.(data.error); return;
+    }
     const job = this.jobs.get(data.id);
     this.jobs.delete(data.id);
-    if (!job || job.cancelled || data.epoch !== this.epoch || !this.desired.has(job.key) || this.loaded.has(job.key)) {
+    if (!job || job.cancelled || job.surfaceVersion !== this.surfaceVersion || data.epoch !== this.epoch || !this.desired.has(job.key) || this.loaded.has(job.key)) {
       this.metrics.stale += 1;
     } else if (data.type === 'tile') {
       this.ready.push(data); this.metrics.ready_bytes += data.packet.byteLength;
@@ -88,13 +107,23 @@ export class TileStream {
   }
 
   installNext() {
+    const started = performance.now();
+    let installed = 0;
+    while (this.ready.length && installed < 8 && performance.now() - started < 2) {
+      this.installOne(); installed += 1;
+    }
+    this.metrics.last_install_count = installed;
+    this.metrics.max_install_count = Math.max(this.metrics.max_install_count ?? 0, installed);
+  }
+
+  installOne() {
     const tile = this.ready.shift();
     if (!tile) return;
     this.metrics.ready_bytes -= tile.packet.byteLength;
     if (tile.epoch !== this.epoch || !this.desired.has(tile.key) || this.loaded.has(tile.key)) { this.dispatch(); return; }
     const started = performance.now();
     try {
-      const keys = JSON.parse(this.install(new Uint8Array(tile.packet)));
+      const keys = JSON.parse(this.install(new Uint8Array(tile.packet), tile.surfaceVersion ?? 0));
       this.loaded = new Set(keys.map(this.context.keyOf));
       this.onCache(keys);
       this.metrics.installed += 1;

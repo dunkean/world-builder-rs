@@ -20,13 +20,14 @@ use tokio::sync::{RwLock, Semaphore};
 use tower_http::{compression::CompressionLayer, services::ServeDir};
 use world_core::{TileKey, World, WorldConfig};
 
+mod diffusion;
 mod families;
 mod hierarchy;
 mod preview;
 mod regions;
 
 // Render-field revision changes tile caches without rewriting physical atlases.
-const SURFACE_REVISION: &str = "spherical-coast-10";
+const SURFACE_REVISION: &str = "spherical-coast-11-hybrid-water";
 
 #[derive(Parser)]
 #[command(
@@ -83,6 +84,7 @@ enum Command {
 struct App {
     data: PathBuf,
     world: Arc<RwLock<Option<Arc<World>>>>,
+    archived_worlds: Arc<tokio::sync::Mutex<VecDeque<Arc<World>>>>,
     jobs: Arc<RwLock<HashMap<String, Job>>>,
     generation: Arc<Semaphore>,
     counter: Arc<AtomicU64>,
@@ -244,6 +246,7 @@ async fn main() -> Result<()> {
             let app = App {
                 data: args.data,
                 world: Arc::new(RwLock::new(loaded)),
+                archived_worlds: Default::default(),
                 jobs: Default::default(),
                 generation: Arc::new(Semaphore::new(1)),
                 counter: Arc::new(AtomicU64::new(1)),
@@ -262,6 +265,7 @@ async fn main() -> Result<()> {
                 .route("/api/worlds/{id}", get(by_id))
                 .route("/api/worlds/{id}/preview", get(world_preview))
                 .route("/api/worlds/{id}/manifest", get(manifest))
+                .route("/api/worlds/{id}/diffusion-input", get(diffusion_input))
                 .route("/api/worlds/{id}/season", get(season))
                 .route("/api/worlds/{id}/tiles/{face}/{level}/{x}/{y}", get(tile))
                 .route("/api/worlds/{id}/families/{face}/{level}/{x}/{y}", get(family))
@@ -409,6 +413,9 @@ async fn create_world(
             let world = World::generate(config)?;
             validate_world(&world)?;
             save_world(&data, &world)?;
+            // Compile immutable geographic catalogues before publishing the new planet.
+            // The previous planet remains navigable throughout this generation job.
+            let _ = world.sample([1.0, 0.0, 0.0]);
             Ok(world)
         })
         .await;
@@ -464,12 +471,27 @@ async fn find_world(app: &App, id: &str) -> Result<Arc<World>, ApiError> {
             return Ok(world);
         }
     }
+    let mut archive = app.archived_worlds.clone().lock_owned().await;
+    if let Some(index) = archive.iter().position(|world| world.id == id) {
+        let world = archive.remove(index).unwrap();
+        archive.push_back(world.clone());
+        return Ok(world);
+    }
     let data = app.data.clone();
     let id = id.to_owned();
-    let world = tokio::task::spawn_blocking(move || load_world(&data, Some(&id)))
-        .await
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
-    Ok(Arc::new(world))
+    // The owned lock stays with the task even if its HTTP waiter is cancelled.
+    // This coalesces disk loads and retains expensive immutable geographic caches.
+    let world = tokio::task::spawn_blocking(move || -> Result<Arc<World>> {
+        let world = Arc::new(load_world(&data, Some(&id))?);
+        archive.push_back(world.clone());
+        while archive.len() > 2 {
+            archive.pop_front();
+        }
+        Ok(world)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(world)
 }
 async fn latest(State(app): State<App>) -> Result<Json<World>, ApiError> {
     Ok(Json((*current(&app).await?).clone()))
@@ -508,8 +530,33 @@ async fn manifest(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let w = find_world(&app, &id).await?;
     Ok(Json(
-        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":32,"coarse_tile_segments":64,"coarse_tile_max_level":2,"api_default_tile_segments":64,"max_tile_level":24,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION}),
+        serde_json::json!({"id":w.id,"config":w.config,"stats":w.stats,"sea_level_m":w.sea_level_m,"tile_segments":32,"coarse_tile_segments":64,"coarse_tile_max_level":2,"api_default_tile_segments":64,"max_tile_level":24,"numeric_profile":"cpu-f64-global/cuda-or-cpu-f32-regional-v1","generator_version":world_core::GENERATOR_VERSION,"regional_erosion_levels":[],"experimental_spatial_erosion_levels":[6,10],"viewer_generator":"coherent","surface_revision":SURFACE_REVISION,"config_fingerprint":diffusion::fingerprint(&w),"conditioning_revision":diffusion::REVISION,"diffusion_projection":diffusion::PROJECTION,"learned_native_mpp":30.0,"procedural_min_spacing_m":w.config.surface_detail_min_spacing_m}),
     ))
+}
+static CONDITIONING_WORKERS: Semaphore = Semaphore::const_new(2);
+
+async fn diffusion_input(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(q): Query<diffusion::InputQuery>,
+) -> Result<Json<diffusion::InputWindow>, ApiError> {
+    q.validate()
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // Independent of tile_workers: the model can fetch inputs while procedural tiles render.
+    let permit = CONDITIONING_WORKERS.try_acquire().map_err(|_| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "conditioning capacity busy; retry".into(),
+        )
+    })?;
+    let world = find_world(&app, &id).await?;
+    let window = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        diffusion::build(&world, q)
+    })
+    .await
+    .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    Ok(Json(window))
 }
 #[derive(Deserialize)]
 struct TileQuery {
@@ -1055,6 +1102,45 @@ fn validate_world(w: &World) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn archival_world_loads_coalesce_and_retain_geographic_caches() {
+        let world = World::generate(WorldConfig {
+            seed: 7317,
+            resolution: 8,
+            erosion_steps: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let data =
+            std::env::temp_dir().join(format!("world-archive-{}-{}", std::process::id(), world.id));
+        save_world(&data, &world).unwrap();
+        let app = App {
+            data: data.clone(),
+            world: Default::default(),
+            archived_worlds: Default::default(),
+            jobs: Default::default(),
+            generation: Arc::new(Semaphore::new(1)),
+            counter: Default::default(),
+            tiles: Default::default(),
+            tile_workers: Arc::new(Semaphore::new(4)),
+            tile_flights: Default::default(),
+            tile_metrics: Default::default(),
+        };
+        let (first, second) =
+            tokio::join!(find_world(&app, &world.id), find_world(&app, &world.id));
+        let first = first.unwrap_or_else(|_| panic!("first archive load failed"));
+        let second = second.unwrap_or_else(|_| panic!("second archive load failed"));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(app.archived_worlds.lock().await.len(), 1);
+        // Immutable content has already been verified; later input windows keep this Arc.
+        std::fs::remove_file(data.join("worlds").join(&world.id).join("atlas.json")).unwrap();
+        let again = find_world(&app, &world.id)
+            .await
+            .unwrap_or_else(|_| panic!("archive cache not retained"));
+        assert!(Arc::ptr_eq(&first, &again));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
     #[test]
     fn tile_cache_keeps_recently_used_entries_and_rejects_corrupt_disk_data() {
         let mut cache = TileCache {
@@ -1100,6 +1186,7 @@ mod tests {
         let app = App {
             data: data.clone(),
             world: Arc::new(RwLock::new(Some(world.clone()))),
+            archived_worlds: Default::default(),
             jobs: Default::default(),
             generation: Arc::new(Semaphore::new(1)),
             counter: Default::default(),
@@ -1192,6 +1279,7 @@ mod tests {
         let app = App {
             data: data.clone(),
             world: Arc::new(RwLock::new(Some(world.clone()))),
+            archived_worlds: Default::default(),
             jobs: Default::default(),
             generation: Arc::new(Semaphore::new(1)),
             counter: Default::default(),
@@ -1256,6 +1344,7 @@ mod tests {
         let app = App {
             data: data.clone(),
             world: Arc::new(RwLock::new(Some(world.clone()))),
+            archived_worlds: Default::default(),
             jobs: Default::default(),
             generation: Arc::new(Semaphore::new(1)),
             counter: Default::default(),
@@ -1313,6 +1402,7 @@ mod tests {
         let app = App {
             data: std::env::temp_dir(),
             world: Arc::new(RwLock::new(Some(world.clone()))),
+            archived_worlds: Default::default(),
             jobs: Arc::new(RwLock::new(HashMap::new())),
             generation: Arc::new(Semaphore::new(1)),
             counter: Arc::new(AtomicU64::new(0)),

@@ -4,6 +4,7 @@
 mod coast;
 pub mod erosion;
 pub mod geometry;
+pub mod hybrid;
 pub mod hydrology;
 mod lake_geometry;
 pub mod landforms;
@@ -26,7 +27,7 @@ use std::{
     sync::OnceLock,
 };
 
-pub const GENERATOR_VERSION: &str = "prototype-0.10.0";
+pub const GENERATOR_VERSION: &str = "prototype-0.11.0-hybrid";
 
 /// Optional native diagnostic; it never changes the generated data.
 #[derive(Default)]
@@ -68,6 +69,14 @@ pub struct WorldConfig {
     pub ocean_fraction: f64,
     pub relief_m: f64,
     pub detail_m: f64,
+    /// Number of seeded tectonic plates; continental geography is independent of the camera.
+    pub plate_count: u32,
+    /// Multiplier of continental noise frequency: larger values produce smaller land masses.
+    pub continent_scale: f64,
+    /// Continental noise amplitude, controlling fragmentation around plate-defined land masses.
+    pub continent_fragmentation: f64,
+    /// Finest procedural relief wavelength in metres, separate from learned model resolution.
+    pub surface_detail_min_spacing_m: f64,
     /// Strength of the invertible spherical coastline twists, independent of detail_m.
     pub coast_detail_ratio: f64,
     /// Smallest wavelength used to displace the canonical coastline, in metres.
@@ -102,6 +111,10 @@ impl Default for WorldConfig {
             ocean_fraction: 0.58,
             relief_m: 6_000.0,
             detail_m: 140.0,
+            plate_count: 14,
+            continent_scale: 1.0,
+            continent_fragmentation: 0.8,
+            surface_detail_min_spacing_m: 0.2,
             coast_detail_ratio: 0.30,
             coast_reference_spacing_m: 0.25,
             fjord_strength: 0.65,
@@ -138,7 +151,23 @@ impl WorldConfig {
         if !self.detail_m.is_finite() || !(0.0..=self.relief_m).contains(&self.detail_m) {
             bail!("detail_m must be finite and between zero and relief_m");
         }
+        if !(3..=64).contains(&self.plate_count) {
+            bail!("plate_count must be between 3 and 64");
+        }
         for (name, value, min, max) in [
+            ("continent_scale", self.continent_scale, 0.25, 4.0),
+            (
+                "continent_fragmentation",
+                self.continent_fragmentation,
+                0.0,
+                2.0,
+            ),
+            (
+                "surface_detail_min_spacing_m",
+                self.surface_detail_min_spacing_m,
+                0.2,
+                30.0,
+            ),
             ("coast_detail_ratio", self.coast_detail_ratio, 0.0, 1.0),
             ("fjord_strength", self.fjord_strength, 0.0, 1.0),
             ("archipelago_density", self.archipelago_density, 0.0, 1.0),
@@ -151,7 +180,7 @@ impl WorldConfig {
             (
                 "coast_reference_spacing_m",
                 self.coast_reference_spacing_m,
-                0.25,
+                0.2,
                 10_000.0,
             ),
             (
@@ -354,6 +383,13 @@ pub struct Sample {
     pub ocean: bool,
     pub lake: bool,
     pub river: f32,
+    /// Continuous permission for external relief: zero over waters and their protected banks.
+    #[serde(default = "default_hybrid_weight")]
+    pub hybrid_weight: f32,
+}
+
+pub fn default_hybrid_weight() -> f32 {
+    1.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,11 +491,11 @@ fn atlas_fbm(seed: u64, p: [f64; 3], frequency: f64, octaves: u32, resolution: u
     value
 }
 
-fn plates(seed: u64) -> Vec<Plate> {
-    (0..14)
+fn plates(seed: u64, count: u32) -> Vec<Plate> {
+    (0..count)
         .map(|i| {
             // Fibonacci sites with seeded rotation avoids tiny random Voronoi plates.
-            let z = 1.0 - 2.0 * (f64::from(i) + 0.5) / 14.0;
+            let z = 1.0 - 2.0 * (f64::from(i) + 0.5) / f64::from(count);
             let angle = f64::from(i) * 2.399963229728653 + random(seed) * 6.283185307179586;
             let r = (1.0 - z * z).sqrt();
             Plate {
@@ -505,8 +541,9 @@ fn raw_height(config: &WorldConfig, plates: &[Plate], p: [f64; 3]) -> f64 {
         boundary_direction,
     );
     let boundary = (-((nearest[0].0 - nearest[1].0) / 0.065).powi(2)).exp();
-    let continent =
-        1.4 * (continental / weights - 0.5) + 0.8 * fbm(config.seed ^ 0xabc1, p, 2.8, 4);
+    let continent = 1.4 * (continental / weights - 0.5)
+        + config.continent_fragmentation
+            * fbm(config.seed ^ 0xabc1, p, 2.8 * config.continent_scale, 4);
     // The global atlas must not sample detail below its Nyquist scale: doing so
     // created isolated one-cell pits that were subsequently mistaken for lakes.
     let texture = atlas_fbm(config.seed ^ 0x9832, p, 18.0, 4, config.resolution);
@@ -880,7 +917,7 @@ impl World {
         hasher.update(&fingerprint);
         let id = hasher.finalize().to_hex()[..20].to_string();
         let n = config.resolution;
-        let plate_sites = plates(config.seed);
+        let plate_sites = plates(config.seed, config.plate_count);
         let mut cells: Vec<Cell> = (0..6usize * n as usize * n as usize)
             .into_par_iter()
             .map(|i| {
@@ -1164,6 +1201,66 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continental_controls_change_the_fixed_geography_and_validate_bounds() {
+        let defaults = WorldConfig::default();
+        let sites = plates(defaults.seed, defaults.plate_count);
+        assert_eq!(sites.len(), 14);
+        let points: Vec<_> = (0..6)
+            .flat_map(|face| {
+                [-0.7, 0.0, 0.7]
+                    .into_iter()
+                    .map(move |u| direction(face, u, 0.2))
+            })
+            .collect();
+        for (scale, fragmentation, count) in [(2.0, 0.8, 14), (1.0, 0.0, 14), (1.0, 0.8, 27)] {
+            let config = WorldConfig {
+                continent_scale: scale,
+                continent_fragmentation: fragmentation,
+                plate_count: count,
+                ..defaults.clone()
+            };
+            config.validate().unwrap();
+            let changed = plates(config.seed, config.plate_count);
+            let rms = (points
+                .iter()
+                .map(|&p| {
+                    (raw_height(&config, &changed, p) - raw_height(&defaults, &sites, p)).powi(2)
+                })
+                .sum::<f64>()
+                / points.len() as f64)
+                .sqrt();
+            assert!(
+                rms > 100.0,
+                "continental control failed to change physical terrain"
+            );
+            assert_eq!(
+                raw_height(&config, &changed, points[0]),
+                raw_height(&config, &changed, points[0])
+            );
+        }
+        for config in [
+            WorldConfig {
+                plate_count: 2,
+                ..defaults.clone()
+            },
+            WorldConfig {
+                continent_scale: f64::NAN,
+                ..defaults.clone()
+            },
+            WorldConfig {
+                continent_fragmentation: 3.0,
+                ..defaults.clone()
+            },
+            WorldConfig {
+                surface_detail_min_spacing_m: 0.1,
+                ..defaults
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
+    }
 
     fn small_world() -> World {
         World::generate(WorldConfig {
